@@ -587,6 +587,12 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 /// create journals when no recovery companion is present. If a non-empty
 /// rollback journal or WAL exists, the later normal open must recover it before
 /// the authoritative schema validation can inspect a coherent database image.
+///
+/// On the bypass path the main database is still never mutated before
+/// validation, but `SQLite` may replay *or discard* the companion itself: a
+/// stray non-hot journal is removed during open even when validation then
+/// rejects the database. Companion replay and removal are the only permitted
+/// pre-validation filesystem mutations.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -615,11 +621,17 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
 /// only when the main database header itself is in WAL mode. A stray WAL next
 /// to a rollback-mode database is an artifact, not recoverable state, and must
 /// not bypass the immutable preflight.
+///
+/// Companion names are derived from the fully resolved path because `SQLite`
+/// names its journal after the link target, not the link. Deriving them from an
+/// unresolved symlink would miss a genuine hot journal and reject a recoverable
+/// database.
 fn has_nonempty_recovery_companion(path: &Path) -> Result<bool> {
-    if nonempty_companion(path, "-journal")? {
+    let resolved = fs::canonicalize(path).map_err(|_| LabError::Storage)?;
+    if nonempty_companion(&resolved, "-journal")? {
         return Ok(true);
     }
-    if nonempty_companion(path, "-wal")? && database_header_uses_wal(path)? {
+    if nonempty_companion(&resolved, "-wal")? && database_header_uses_wal(&resolved)? {
         return Ok(true);
     }
     Ok(false)
