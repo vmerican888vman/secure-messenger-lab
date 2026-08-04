@@ -8,6 +8,7 @@ publish = false
 description = "Disposable Phase 0 harness for testing an end-to-end encrypted mailbox relay"
 
 [dependencies]
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 rand = "=0.8.7"
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -16,6 +17,7 @@ sha2 = "=0.10.9"
 tempfile = "=3.27.0"
 thiserror = "=2.0.19"
 vodozemac = { version = "=0.10.0", default-features = false }
+zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
 [profile.release]
 overflow-checks = true

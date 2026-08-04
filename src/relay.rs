@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use vodozemac::{Ed25519PublicKey, Ed25519Signature};
 
 use crate::capability::{
@@ -76,6 +79,7 @@ impl Relay {
     /// Returns [`LabError::Storage`] if `SQLite` cannot open, initialize, or
     /// sweep the database.
     pub fn open_at(path: &Path, now: u64) -> Result<Self> {
+        preflight_existing_database(path)?;
         let connection = Connection::open(path)?;
         Self::initialize(connection, now)
     }
@@ -92,6 +96,9 @@ impl Relay {
 
     fn initialize(mut connection: Connection, now: u64) -> Result<Self> {
         connection.busy_timeout(Duration::from_secs(2))?;
+        // Do not change journal mode or begin a migration until the opened
+        // database has passed the exact schema/version preflight.
+        validate_schema_for_open(&connection)?;
         connection.execute_batch(
             "
             PRAGMA secure_delete = ON;
@@ -99,6 +106,7 @@ impl Relay {
             PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
             PRAGMA auto_vacuum = FULL;
+            PRAGMA trusted_schema = OFF;
             ",
         )?;
 
@@ -511,33 +519,117 @@ impl Relay {
 }
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
+    validate_schema_for_open(connection)?;
+
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    let current = schema_manifest(connection)?;
+    let expected_empty = SchemaManifest::default();
+    let expected_legacy = reference_manifest(LEGACY_SCHEMA_DDL)?;
+    let expected_current = reference_manifest(CURRENT_SCHEMA_DDL)?;
+
+    match (
+        version,
+        classify_schema(
+            &current,
+            &expected_empty,
+            &expected_legacy,
+            &expected_current,
+        ),
+    ) {
+        (CURRENT_SCHEMA_VERSION, SchemaKind::Current) => Ok(()),
+        (0 | 1, SchemaKind::Empty) => {
+            create_current_schema(connection)?;
+            connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+            validate_current_schema(connection, &expected_current)
+        }
+        (0 | 1, SchemaKind::Legacy) => {
+            // Legacy envelopes cannot satisfy the sender-authentication invariant.
+            // secure_delete is enabled before this transaction begins.
+            connection.execute("DELETE FROM messages", [])?;
+            connection.execute_batch("DROP TABLE messages;")?;
+            connection.execute_batch(CURRENT_MESSAGES_DDL)?;
+            connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+            validate_current_schema(connection, &expected_current)
+        }
+        _ => Err(LabError::Storage),
+    }
+}
+
+fn validate_schema_for_open(connection: &Connection) -> Result<()> {
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if !(0..=CURRENT_SCHEMA_VERSION).contains(&version) {
         return Err(LabError::Storage);
     }
 
-    let messages_exist = table_exists(connection, "messages")?;
-    let has_sender_signature = !messages_exist || table_has_column(connection, "sender_signature")?;
-    if version == CURRENT_SCHEMA_VERSION && !has_sender_signature {
+    let current = schema_manifest(connection)?;
+    let expected_empty = SchemaManifest::default();
+    let expected_legacy = reference_manifest(LEGACY_SCHEMA_DDL)?;
+    let expected_current = reference_manifest(CURRENT_SCHEMA_DDL)?;
+
+    match (
+        version,
+        classify_schema(
+            &current,
+            &expected_empty,
+            &expected_legacy,
+            &expected_current,
+        ),
+    ) {
+        (CURRENT_SCHEMA_VERSION, SchemaKind::Current)
+        | (0 | 1, SchemaKind::Empty | SchemaKind::Legacy) => {
+            validate_database_integrity(connection)
+        }
+        _ => Err(LabError::Storage),
+    }
+}
+
+/// Inspect an existing main database without allowing `SQLite` to replay or
+/// create journals. A later normal open may recover a valid hot journal; that
+/// is the sole permitted pre-validation filesystem mutation.
+fn preflight_existing_database(path: &Path) -> Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(LabError::Storage),
+    };
+    if !metadata.is_file() {
         return Err(LabError::Storage);
     }
-
-    if messages_exist && !has_sender_signature {
-        // Legacy envelopes cannot satisfy the sender-authentication invariant.
-        // secure_delete is enabled before this transaction begins.
-        connection.execute("DELETE FROM messages", [])?;
-        connection.execute_batch("DROP TABLE messages;")?;
+    if metadata.len() == 0 {
+        return Ok(());
     }
 
-    create_current_schema(connection)?;
-    connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
-    Ok(())
+    let connection = Connection::open_with_flags(
+        immutable_uri(path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    validate_schema_for_open(&connection)
+}
+
+fn immutable_uri(path: &Path) -> Result<String> {
+    let path = path.to_str().ok_or(LabError::Storage)?;
+    let mut uri = String::from("file:");
+    for byte in path.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'.' | b'-' | b'_' | b':') {
+            uri.push(char::from(*byte));
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            uri.push('%');
+            uri.push(char::from(HEX[usize::from(*byte >> 4)]));
+            uri.push(char::from(HEX[usize::from(*byte & 0x0f)]));
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    Ok(uri)
 }
 
 fn create_current_schema(connection: &Connection) -> Result<()> {
-    connection.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS mailboxes (
+    connection.execute_batch(CURRENT_SCHEMA_DDL)?;
+    Ok(())
+}
+
+const CURRENT_SCHEMA_DDL: &str = "
+        CREATE TABLE mailboxes (
             queue_id BLOB PRIMARY KEY NOT NULL CHECK(length(queue_id) = 32),
             send_key BLOB NOT NULL CHECK(length(send_key) = 32),
             receive_key BLOB NOT NULL CHECK(length(receive_key) = 32),
@@ -545,7 +637,7 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
             created_at INTEGER NOT NULL
         ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS messages (
+        CREATE TABLE messages (
             queue_id BLOB NOT NULL,
             message_id BLOB NOT NULL CHECK(length(message_id) = 16),
             ciphertext BLOB NOT NULL,
@@ -555,7 +647,7 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
             FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
         ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS tombstones (
+        CREATE TABLE tombstones (
             queue_id BLOB NOT NULL,
             message_id BLOB NOT NULL CHECK(length(message_id) = 16),
             delete_after INTEGER NOT NULL,
@@ -563,7 +655,7 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
             FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
         ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS request_nonces (
+        CREATE TABLE request_nonces (
             queue_id BLOB NOT NULL,
             role TEXT NOT NULL,
             nonce BLOB NOT NULL CHECK(length(nonce) = 16),
@@ -572,39 +664,229 @@ fn create_current_schema(connection: &Connection) -> Result<()> {
             FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
         ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS registration_nonces (
+        CREATE TABLE registration_nonces (
             queue_id BLOB NOT NULL CHECK(length(queue_id) = 32),
             nonce BLOB NOT NULL CHECK(length(nonce) = 16),
             delete_after INTEGER NOT NULL,
             PRIMARY KEY (queue_id, nonce)
         ) STRICT;
 
-        CREATE TABLE IF NOT EXISTS retired_queues (
+        CREATE TABLE retired_queues (
             queue_hash BLOB PRIMARY KEY NOT NULL CHECK(length(queue_hash) = 32),
             retired_at INTEGER NOT NULL
         ) STRICT;
-        ",
-    )?;
+        ";
+
+const CURRENT_MESSAGES_DDL: &str = "
+        CREATE TABLE messages (
+            queue_id BLOB NOT NULL,
+            message_id BLOB NOT NULL CHECK(length(message_id) = 16),
+            ciphertext BLOB NOT NULL,
+            expires_at INTEGER NOT NULL,
+            sender_signature BLOB NOT NULL CHECK(length(sender_signature) = 64),
+            PRIMARY KEY (queue_id, message_id),
+            FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
+        ) STRICT;
+        ";
+
+const LEGACY_SCHEMA_DDL: &str = "
+        CREATE TABLE mailboxes (
+            queue_id BLOB PRIMARY KEY NOT NULL CHECK(length(queue_id) = 32),
+            send_key BLOB NOT NULL CHECK(length(send_key) = 32),
+            receive_key BLOB NOT NULL CHECK(length(receive_key) = 32),
+            manage_key BLOB NOT NULL CHECK(length(manage_key) = 32),
+            created_at INTEGER NOT NULL
+        ) STRICT;
+
+        CREATE TABLE messages (
+            queue_id BLOB NOT NULL,
+            message_id BLOB NOT NULL CHECK(length(message_id) = 16),
+            ciphertext BLOB NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (queue_id, message_id),
+            FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE TABLE tombstones (
+            queue_id BLOB NOT NULL,
+            message_id BLOB NOT NULL CHECK(length(message_id) = 16),
+            delete_after INTEGER NOT NULL,
+            PRIMARY KEY (queue_id, message_id),
+            FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE TABLE request_nonces (
+            queue_id BLOB NOT NULL,
+            role TEXT NOT NULL,
+            nonce BLOB NOT NULL CHECK(length(nonce) = 16),
+            delete_after INTEGER NOT NULL,
+            PRIMARY KEY (queue_id, role, nonce),
+            FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE TABLE registration_nonces (
+            queue_id BLOB NOT NULL CHECK(length(queue_id) = 32),
+            nonce BLOB NOT NULL CHECK(length(nonce) = 16),
+            delete_after INTEGER NOT NULL,
+            PRIMARY KEY (queue_id, nonce)
+        ) STRICT;
+
+        CREATE TABLE retired_queues (
+            queue_hash BLOB PRIMARY KEY NOT NULL CHECK(length(queue_hash) = 32),
+            retired_at INTEGER NOT NULL
+        ) STRICT;
+        ";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SchemaManifest {
+    objects: Vec<SchemaObject>,
+    tables: BTreeMap<String, TableShape>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SchemaObject(String, String, String, Option<String>);
+
+type TableColumn = (i64, String, String, i64, Option<String>, i64, i64);
+type ForeignKey = (i64, i64, String, String, String, String, String, String);
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableShape {
+    table_list: (String, String, String, i64, i64, i64),
+    columns: Vec<TableColumn>,
+    indexes: Vec<IndexShape>,
+    foreign_keys: Vec<ForeignKey>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IndexShape {
+    list: (i64, String, i64, String, i64),
+    columns: Vec<(i64, i64, Option<String>, i64, String, i64)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchemaKind {
+    Empty,
+    Legacy,
+    Current,
+    Unknown,
+}
+
+fn reference_manifest(ddl: &str) -> Result<SchemaManifest> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;")?;
+    connection.execute_batch(ddl)?;
+    schema_manifest(&connection)
+}
+
+fn classify_schema(
+    actual: &SchemaManifest,
+    empty: &SchemaManifest,
+    legacy: &SchemaManifest,
+    current: &SchemaManifest,
+) -> SchemaKind {
+    if actual == empty {
+        SchemaKind::Empty
+    } else if actual == legacy {
+        SchemaKind::Legacy
+    } else if actual == current {
+        SchemaKind::Current
+    } else {
+        SchemaKind::Unknown
+    }
+}
+
+fn validate_current_schema(connection: &Connection, expected: &SchemaManifest) -> Result<()> {
+    if schema_manifest(connection)? != *expected {
+        return Err(LabError::Storage);
+    }
+    validate_database_integrity(connection)
+}
+
+fn validate_database_integrity(connection: &Connection) -> Result<()> {
+    let foreign_key_problem = connection
+        .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+        .optional()?;
+    if foreign_key_problem.is_some() {
+        return Err(LabError::Storage);
+    }
+    let integrity = connection
+        .prepare("PRAGMA integrity_check")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if integrity.as_slice() != ["ok"] {
+        return Err(LabError::Storage);
+    }
     Ok(())
 }
 
-fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
-    Ok(connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            params![table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
+fn schema_manifest(connection: &Connection) -> Result<SchemaManifest> {
+    let mut objects = connection
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")?
+        .query_map([], |row| {
+            Ok(SchemaObject(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    objects.sort();
+
+    let table_names = objects
+        .iter()
+        .filter(|object| object.0 == "table")
+        .map(|object| object.1.clone())
+        .collect::<Vec<_>>();
+    let mut tables = BTreeMap::new();
+    for table in table_names {
+        tables.insert(table.clone(), table_shape(connection, &table)?);
+    }
+    Ok(SchemaManifest { objects, tables })
 }
 
-fn table_has_column(connection: &Connection, column: &str) -> Result<bool> {
-    let mut statement = connection.prepare("PRAGMA table_info(messages)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
+fn table_shape(connection: &Connection, table: &str) -> Result<TableShape> {
+    let table_list = connection.query_row(
+        "SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE schema = 'main' AND name = ?1",
+        params![table],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+    )?;
+    let columns = connection
+        .prepare("SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo(?1) ORDER BY cid")?
+        .query_map(params![table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(columns.iter().any(|existing| existing == column))
+    let index_rows = connection
+        .prepare(
+            "SELECT seq, name, \"unique\", origin, partial FROM pragma_index_list(?1) ORDER BY seq",
+        )?
+        .query_map(params![table], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<(i64, String, i64, String, i64)>, _>>()?;
+    let mut indexes = Vec::with_capacity(index_rows.len());
+    for list in index_rows {
+        let columns = connection
+            .prepare("SELECT seqno, cid, name, \"desc\", coll, key FROM pragma_index_xinfo(?1) ORDER BY seqno")?
+            .query_map(params![list.1], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        indexes.push(IndexShape { list, columns });
+    }
+    let foreign_keys = connection
+        .prepare("SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\" FROM pragma_foreign_key_list(?1) ORDER BY id, seq")?
+        .query_map(params![table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(TableShape {
+        table_list,
+        columns,
+        indexes,
+        foreign_keys,
+    })
 }
 
 fn mailbox_key(

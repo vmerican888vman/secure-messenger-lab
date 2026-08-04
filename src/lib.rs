@@ -8,6 +8,7 @@ pub mod capability;
 pub mod client;
 pub mod error;
 pub mod ids;
+pub mod persistence;
 pub mod relay;
 
 pub use capability::{
@@ -19,6 +20,7 @@ pub use client::{
 };
 pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
+pub use persistence::{ClientStateStore, ProfileBinding, ProtectionLevel, StateKeyProtector};
 pub use relay::{AckOutcome, EnqueueOutcome, Relay, StoredEnvelope};
 
 /// Protocol-domain label used by every signed relay command.

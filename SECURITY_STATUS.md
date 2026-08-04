@@ -29,6 +29,10 @@ unaudited, and unsuitable for sensitive or production messaging.
       signatures while preserving other relay state.
 - [x] Equality/future request-expiry bounds and invalid message-retention bounds fail closed under
       direct regression tests.
+- [x] Relay startup compares the complete current/legacy schema manifest, rejects hostile hybrids
+      without application mutation, and recovers a real valid hot rollback journal.
+- [x] The opaque local-state foundation authenticates one bounded encrypted snapshot against an
+      independently obtained profile/key binding and survives forced death as a complete old/new row.
 
 ## Blocking any app or public-security claim
 
@@ -40,7 +44,7 @@ unaudited, and unsuitable for sensitive or production messaging.
 - [ ] Encrypted, atomic persistence of every mutated Olm account and ratchet state.
 - [ ] Hardware-backed local wrapping key where available plus a safe fallback policy.
 - [ ] Crash/restart tests at every send, fetch, decrypt, persistence, and ACK boundary.
-- [ ] Exact fail-closed SQLite schema-shape validation for current and documented legacy schemas.
+- [x] Exact fail-closed SQLite schema-shape validation for current and documented legacy schemas.
 - [ ] Real authenticated network protocol, TLS configuration, request limits, and traffic/log capture.
 - [ ] Periodic expiry scheduler and a measured wall-clock deletion SLA for an otherwise idle relay.
 - [ ] Offline ordering, retry, migration, relay failover, duplicate delivery, and deletion across relays.
@@ -67,5 +71,6 @@ or replace a funded independent audit.
 [`docs/persistence-spike-design.md`](docs/persistence-spike-design.md) defines the encrypted local-state
 and forced-crash experiment. Kimi and Fable independently returned `RETURN` on exact head
 `3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e`; their blocking items are reconciled in the amended
-design. This is still not implementation or security clearance. Both must return `PASS` on the same
-exact amended head before implementation begins.
+design. Both independently returned `PASS` on exact amended head
+`04cd037f21cb37604b0a7d7cc5cfd9e86a04d70a`, authorizing only the disposable implementation spike.
+This is not production or public-security clearance; every unchecked blocker above remains open.

@@ -1,10 +1,10 @@
 # Encrypted client persistence and crash-recovery spike
 
-> **Status: INITIAL RETURN ITEMS RECONCILED; AWAITING TWO DELTA PASSES.** Kimi and Fable independently
-> reviewed exact head `3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e` and both returned `RETURN`.
-> This revision reconciles their blocking items, but it remains a design and acceptance contract—not
-> authorization to implement or ship. Implementation stays blocked until both reviewers pass this
-> exact amended head. The repository remains an unaudited disposable lab.
+> **Status: TWO DELTA PASSES RECEIVED; DISPOSABLE SPIKE IMPLEMENTATION AUTHORIZED.** Kimi and Fable
+> independently returned `PASS` on exact amended head
+> `04cd037f21cb37604b0a7d7cc5cfd9e86a04d70a`. This remains a design and acceptance contract for the
+> bounded persistence experiment—not authorization to ship, serve real users, or make a public
+> security claim. The repository remains an unaudited disposable lab.
 
 ## Question this spike must answer
 
@@ -531,8 +531,10 @@ delivery-unknown outcomes, terminal-expiry dedup reclamation, and structural log
 Generation-derived nonces are intentionally **not** adopted because authentic snapshot rollback can
 repeat a generation under the same DEK; the fresh-random-nonce continuation test covers that case.
 
-These amendments still do not authorize implementation. Both independent reviewers must return
-`PASS` on the same exact amended head.
+Both independent reviewers returned `PASS` on exact amended head
+`04cd037f21cb37604b0a7d7cc5cfd9e86a04d70a`. Those passes authorize only implementation of this
+disposable persistence spike under the acceptance gate above; they do not authorize a production app,
+public network relay, or public security claim.
 
 ## Decisions required from delta review
 
