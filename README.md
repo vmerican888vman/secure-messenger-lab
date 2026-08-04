@@ -30,14 +30,18 @@ shippable messenger is secure.
   tombstone.
 - Tests inspect the live relay database and relay event stream for plaintext, serialized private
   capabilities, and post-ACK ciphertext residue.
+- Relay startup now validates the complete current/legacy `SQLite` manifest and exercises real hot
+  rollback-journal recovery before accepting or migrating a database.
+- The persistence implementation has an opaque-state foundation: one XChaCha20-Poly1305 snapshot,
+  platform-expected profile binding, exact generation CAS, and forced-death old/new recovery tests.
 
 ## What this does **not** prove
 
 - There is no Android or iOS app, network server, TLS layer, notification path, or public deployment.
 - Contact bundles are exchanged directly in the test. There is no QR verification UI, key directory,
   or transactional one-time-key claim service.
-- Ratchet and identity state are not persisted. Encrypted local storage, hardware-backed key wrapping,
-  crash recovery, and atomic session-state updates remain blockers.
+- Ratchet, identity, capabilities, and outboxes are not yet wired into the encrypted snapshot.
+  Hardware-backed platform adapters and atomic session/outbox state machines remain blockers.
 - IP addresses, packet timing, ciphertext size, and traffic correlation are not hidden.
 - A malicious relay can copy ciphertext before deletion. Filesystem snapshots, host logs, backups,
   memory, and storage-device remanence are outside the current proof.
@@ -79,8 +83,8 @@ PASS: two clients exchanged encrypted messages; relay queue is empty after authe
 - `SECURITY_STATUS.md` — current security gate and unresolved blockers.
 - `docs/architecture.md` — exact prototype flow and trust boundaries.
 - `docs/acceptance-tests.md` — what is automated now and what still needs a real network/device lab.
-- `docs/persistence-spike-design.md` — proposed encrypted-state/crash-recovery contract awaiting two
-  independent delta passes; no implementation is authorized yet.
+- `docs/persistence-spike-design.md` — independently passed encrypted-state/crash-recovery contract;
+  only its disposable implementation spike is authorized.
 
 ## Phase boundary
 

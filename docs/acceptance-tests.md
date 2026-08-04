@@ -63,10 +63,16 @@ release claim.
 Any mandatory failure is a NO-GO. “Deleted” must always name the storage surfaces and timing tested; it
 can never promise that a recipient or malicious relay did not make a copy.
 
-## Proposed encrypted-persistence spike — not implemented
+## Independently passed encrypted-persistence contract — implementation in progress
 
 The next design gate is specified in [`persistence-spike-design.md`](persistence-spike-design.md).
-No item below is currently claimed as passing:
+The implemented foundation already covers the exact relay/local schema manifests, the outer
+XChaCha20-Poly1305 envelope, expected profile/key substitution defense, exact-row CAS, 8 MiB boundary,
+fresh-nonce/rollback limitation, coarse redaction, and real process-abort recovery for creation and
+opaque-state commits. It deliberately stores opaque serialized bytes: the semantic Account, Session,
+capability, deduplication, registration, send, inbound, and ACK state machines below remain open.
+
+No end-to-end item below is currently claimed as passing:
 
 - restore the same Account, Session, peer/conversation binding, private capabilities, deduplication
   records, and outboxes after clean restart;
@@ -101,6 +107,7 @@ No item below is currently claimed as passing:
   one column name.
 
 The initial independent Kimi and Fable reviews both returned `RETURN` on
-`3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e`. Their blocking items are reconciled in this revision,
-but this checklist becomes authoritative only after both reviewers return `PASS` on the same exact
-amended head.
+`3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e`. Their blocking items were reconciled, and both reviewers
+then returned `PASS` on exact amended head `04cd037f21cb37604b0a7d7cc5cfd9e86a04d70a`.
+This checklist is therefore authoritative for the disposable persistence spike, but it is not a
+production-app or public-security gate.
