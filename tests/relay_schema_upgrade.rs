@@ -648,6 +648,69 @@ fn hot_journal_from_aborted_legacy_migration_recovers_then_migrates() -> Result<
 }
 
 #[test]
+fn symlinked_database_recovers_its_hot_journal_from_the_resolved_path() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let target = directory.path().join("symlink-target.sqlite");
+    let link = directory.path().join("symlink-link.sqlite");
+    seed_current_large_messages(&target)?;
+    std::os::unix::fs::symlink(&target, &link)?;
+
+    // The child opens through the link; SQLite names the journal after the
+    // resolved target, which is exactly the case an unresolved suffix append
+    // would miss.
+    run_hot_journal_child(&link, "bulk-delete")?;
+
+    let target_journal = directory.path().join("symlink-target.sqlite-journal");
+    let link_journal = directory.path().join("symlink-link.sqlite-journal");
+    assert!(target_journal.is_file());
+    assert!(fs::metadata(&target_journal)?.len() > 0);
+    assert!(!link_journal.exists());
+    assert!(!immutable_integrity_is_ok(&target)?);
+
+    // Opening through the link must still find and recover that journal.
+    drop(Relay::open_at(&link, NOW)?);
+
+    assert!(immutable_integrity_is_ok(&target)?);
+    let recovered = Connection::open(&target)?;
+    let messages = recovered.query_row("SELECT COUNT(*) FROM messages", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    assert_eq!(messages, i64::try_from(LARGE_MESSAGE_COUNT)?);
+    drop(recovered);
+    assert!(!target_journal.exists());
+    Ok(())
+}
+
+/// Documents accepted behavior: on the companion-bypass path `SQLite` may discard
+/// a stray non-hot journal even when validation then rejects the database. The
+/// main database itself must still be byte-identical.
+#[test]
+fn stray_journal_is_discarded_but_target_database_is_never_mutated() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("stray-journal.sqlite");
+    let connection = create_current_database_with_messages(
+        &database,
+        "CREATE TABLE messages(queue_id BLOB, sender_signature BLOB);",
+    )?;
+    drop(connection);
+    let companion = directory.path().join("stray-journal.sqlite-journal");
+    fs::write(&companion, vec![0xEE_u8; 4096])?;
+    let database_before = fs::read(&database)?;
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+
+    // The rejection must not have touched the database the caller named.
+    assert_eq!(fs::read(&database)?, database_before);
+    // The stray companion, by contrast, is consumed by SQLite during the open.
+    assert!(!companion.exists());
+    Ok(())
+}
+
+#[test]
 fn malformed_schema_with_wal_artifact_is_rejected_without_target_mutation()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
