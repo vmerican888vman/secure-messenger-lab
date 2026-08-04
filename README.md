@@ -79,6 +79,8 @@ PASS: two clients exchanged encrypted messages; relay queue is empty after authe
 - `SECURITY_STATUS.md` — current security gate and unresolved blockers.
 - `docs/architecture.md` — exact prototype flow and trust boundaries.
 - `docs/acceptance-tests.md` — what is automated now and what still needs a real network/device lab.
+- `docs/persistence-spike-design.md` — proposed encrypted-state/crash-recovery contract awaiting
+  independent review; no implementation is authorized yet.
 
 ## Phase boundary
 
