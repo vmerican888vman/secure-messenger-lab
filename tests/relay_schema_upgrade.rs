@@ -682,6 +682,44 @@ fn symlinked_database_recovers_its_hot_journal_from_the_resolved_path() -> Resul
     Ok(())
 }
 
+/// Pins the true bypass-path behavior: replaying a genuine hot journal writes
+/// recovered pages into the main database BEFORE validation runs, and does so
+/// even when validation then rejects the schema. Recovery restores only the
+/// last committed state, so this is accepted rather than fixed, but it must
+/// never be silently reduced to "the main database is never mutated".
+#[test]
+fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("replay-then-reject.sqlite");
+    seed_current_large_messages(&database)?;
+    // Make the schema unacceptable so validation must reject after recovery.
+    let connection = Connection::open(&database)?;
+    connection.execute_batch("CREATE TABLE extra_hostile(x);")?;
+    drop(connection);
+
+    run_hot_journal_child(&database, "bulk-delete")?;
+    let journal = directory.path().join("replay-then-reject.sqlite-journal");
+    assert!(fs::metadata(&journal)?.len() > 0);
+
+    let before = fs::read(&database)?;
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    let after = fs::read(&database)?;
+
+    // Recovery ran before validation, so the main database is NOT byte-identical.
+    assert_ne!(before, after);
+    // And recovery restored the committed state rather than inventing one.
+    let recovered = Connection::open(&database)?;
+    let messages = recovered.query_row("SELECT COUNT(*) FROM messages", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    assert_eq!(messages, i64::try_from(LARGE_MESSAGE_COUNT)?);
+    Ok(())
+}
+
 /// Documents accepted behavior: on the companion-bypass path `SQLite` may discard
 /// a stray non-hot journal even when validation then rejects the database. The
 /// main database itself must still be byte-identical.
