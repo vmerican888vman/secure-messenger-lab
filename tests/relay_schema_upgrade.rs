@@ -148,3 +148,45 @@ fn upgrade_discards_unverifiable_legacy_messages_and_preserves_relay_state()
     assert!(!contains(&fs::read(&database)?, &legacy_ciphertext));
     Ok(())
 }
+
+#[test]
+fn future_schema_version_fails_closed() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("future.sqlite");
+    let connection = Connection::open(&database)?;
+    connection.pragma_update(None, "user_version", 3_i64)?;
+    drop(connection);
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    Ok(())
+}
+
+#[test]
+fn current_schema_version_without_sender_signatures_fails_closed() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("malformed-current.sqlite");
+    let queue_id = vec![0x11_u8; 32];
+    let legacy_message_id = vec![0x22_u8; 16];
+    let tombstone_message_id = vec![0x33_u8; 16];
+    let legacy_ciphertext = b"must-not-migrate-as-current".to_vec();
+    create_legacy_database(
+        &database,
+        &queue_id,
+        &legacy_message_id,
+        &tombstone_message_id,
+        &legacy_ciphertext,
+    )?;
+    let connection = Connection::open(&database)?;
+    connection.pragma_update(None, "user_version", 2_i64)?;
+    drop(connection);
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    assert!(contains(&fs::read(&database)?, &legacy_ciphertext));
+    Ok(())
+}

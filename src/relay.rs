@@ -671,7 +671,7 @@ fn record_nonce(
 }
 
 fn validate_request_time(valid_until: u64, now: u64) -> Result<()> {
-    if valid_until < now || valid_until > now.saturating_add(5 * 60) {
+    if valid_until <= now || valid_until > now.saturating_add(5 * 60) {
         return Err(LabError::RequestExpired);
     }
     Ok(())

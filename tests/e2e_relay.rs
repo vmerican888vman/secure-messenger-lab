@@ -119,7 +119,16 @@ fn wrong_capabilities_cannot_send_fetch_or_manage() -> Result<(), Box<dyn Error>
     let mut relay = Relay::open_in_memory()?;
     let target = MailboxOwner::new();
     let attacker = MailboxOwner::new();
-    relay.register(&target.registration(NOW + 60), NOW)?;
+    let target_registration = target.registration(NOW + 60);
+    assert!(relay.register(&target_registration, NOW)?);
+    assert!(!relay.register(&target_registration, NOW)?);
+
+    let mut unauthorized_registration = attacker.registration(NOW + 60);
+    unauthorized_registration.queue_id = target.queue_id();
+    assert!(matches!(
+        relay.register(&unauthorized_registration, NOW),
+        Err(LabError::Unauthorized)
+    ));
 
     let fake_packet = EncryptedPacket::from_untrusted(b"opaque-test-packet".to_vec());
     let mut unauthorized_send =
@@ -169,6 +178,14 @@ fn tamper_wrong_recipient_and_missing_session_all_fail_closed() -> Result<(), Bo
     let envelope = fetched.first().ok_or("missing fetched envelope")?;
     let receiver = mailbox.receiver_capability();
 
+    let other_mailbox = MailboxOwner::new();
+    assert!(matches!(
+        other_mailbox
+            .receiver_capability()
+            .verify_envelope(envelope, NOW),
+        Err(LabError::Unauthorized)
+    ));
+
     let mut tampered = envelope.clone();
     let mut tampered_bytes = tampered.packet.as_bytes().to_vec();
     let index = tampered_bytes.len() / 2;
@@ -186,6 +203,13 @@ fn tamper_wrong_recipient_and_missing_session_all_fail_closed() -> Result<(), Bo
     changed_outer_id.message_id = MessageId::random();
     assert!(matches!(
         receiver.verify_envelope(&changed_outer_id, NOW),
+        Err(LabError::Unauthorized)
+    ));
+
+    let mut changed_expiry = envelope.clone();
+    changed_expiry.expires_at += 1;
+    assert!(matches!(
+        receiver.verify_envelope(&changed_expiry, NOW),
         Err(LabError::Unauthorized)
     ));
 
@@ -225,7 +249,7 @@ fn forged_curve_prekey_bundle_is_rejected_by_pinned_signing_identity() -> Result
 }
 
 #[test]
-fn ack_is_bound_to_message_and_ciphertext_and_replay_is_harmless() -> Result<(), Box<dyn Error>> {
+fn ack_binding_and_lost_request_or_response_retries_are_safe() -> Result<(), Box<dyn Error>> {
     let mut relay = Relay::open_in_memory()?;
     let (mut alice, mut bob, verified_alice) = paired_clients()?;
     let bob_inbox = MailboxOwner::new();
@@ -251,9 +275,9 @@ fn ack_is_bound_to_message_and_ciphertext_and_replay_is_harmless() -> Result<(),
         .find(|envelope| envelope.message_id == first_id)
         .ok_or("missing first envelope")?;
     let opened = bob.open_initial(receiver.verify_envelope(first, NOW)?, &verified_alice, NOW)?;
-    let valid = receiver.authorize_ack(&opened, NOW + 60);
+    let retained_ack = receiver.authorize_ack(&opened, NOW + 60);
 
-    let mut substituted = valid.clone();
+    let mut substituted = retained_ack.clone();
     substituted.message_id = second_id;
     assert!(matches!(
         relay.acknowledge(&substituted, NOW),
@@ -261,14 +285,20 @@ fn ack_is_bound_to_message_and_ciphertext_and_replay_is_harmless() -> Result<(),
     ));
     assert_eq!(relay.queued_message_count()?, 2);
 
-    let mut changed_digest = valid.clone();
+    let mut changed_digest = retained_ack.clone();
     changed_digest.packet_hash = [0_u8; 32];
     assert!(matches!(
         relay.acknowledge(&changed_digest, NOW),
         Err(LabError::Unauthorized)
     ));
-    assert_eq!(relay.acknowledge(&valid, NOW)?, AckOutcome::Deleted);
-    assert_eq!(relay.acknowledge(&valid, NOW)?, AckOutcome::AlreadyDeleted);
+    // The signed request was retained but its first transmission was lost.
+    assert_eq!(relay.acknowledge(&retained_ack, NOW)?, AckOutcome::Deleted);
+    // The deletion committed but its response was lost, so the same request
+    // reaches the tombstone and confirms the prior result.
+    assert_eq!(
+        relay.acknowledge(&retained_ack, NOW)?,
+        AckOutcome::AlreadyDeleted
+    );
     assert_eq!(relay.queued_message_count()?, 1);
     Ok(())
 }
@@ -396,6 +426,68 @@ fn concurrent_identical_sends_resolve_to_stored_plus_duplicate() -> Result<(), B
         matches!(first, EnqueueOutcome::Stored) && matches!(second, EnqueueOutcome::Duplicate)
             || matches!(first, EnqueueOutcome::Duplicate)
                 && matches!(second, EnqueueOutcome::Stored)
+    );
+    let mut verification = Relay::open_at(&database, NOW)?;
+    assert_eq!(verification.queued_message_count_at(NOW)?, 1);
+    Ok(())
+}
+
+#[test]
+fn concurrent_conflicting_sends_resolve_to_stored_plus_conflict() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("relay.sqlite");
+    let mailbox = MailboxOwner::new();
+    let mut setup_relay = Relay::open_at(&database, NOW)?;
+    setup_relay.register(&mailbox.registration(NOW + 60), NOW)?;
+    drop(setup_relay);
+
+    let sender = mailbox.sender_capability();
+    let message_id = MessageId::random();
+    let request_one = sender.authorize(
+        message_id,
+        EncryptedPacket::from_untrusted(b"concurrent-conflict-one".to_vec()),
+        NOW + 60,
+    );
+    let request_two = sender.authorize(
+        message_id,
+        EncryptedPacket::from_untrusted(b"concurrent-conflict-two".to_vec()),
+        NOW + 60,
+    );
+    let mut relay_one = Relay::open_at(&database, NOW)?;
+    let mut relay_two = Relay::open_at(&database, NOW)?;
+    let barrier = Arc::new(Barrier::new(3));
+
+    let (first, second) = thread::scope(|scope| {
+        let barrier_one = Arc::clone(&barrier);
+        let barrier_two = Arc::clone(&barrier);
+        let one = scope.spawn(move || {
+            barrier_one.wait();
+            relay_one.enqueue(&request_one, NOW)
+        });
+        let two = scope.spawn(move || {
+            barrier_two.wait();
+            relay_two.enqueue(&request_two, NOW)
+        });
+        barrier.wait();
+        let first = one.join().map_err(|_| LabError::Storage)?;
+        let second = two.join().map_err(|_| LabError::Storage)?;
+        Ok::<_, LabError>((first, second))
+    })?;
+
+    let outcomes = [first, second];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(EnqueueOutcome::Stored)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(LabError::MessageConflict)))
+            .count(),
+        1
     );
     let mut verification = Relay::open_at(&database, NOW)?;
     assert_eq!(verification.queued_message_count_at(NOW)?, 1);

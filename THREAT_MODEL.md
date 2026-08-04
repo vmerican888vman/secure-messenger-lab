@@ -56,8 +56,9 @@ repository.
 6. Send retries with the same message ID and ciphertext are idempotent. A different ciphertext under
    the same ID is rejected.
 7. The fetched outer envelope retains the sender capability signature over queue ID, message ID,
-   ciphertext digest, and expiry. The recipient verifies it before Olm can consume a one-time key or
-   advance a ratchet.
+   ciphertext digest, and expiry. The recipient verifies it before Olm runs. Inbound account and
+   ratchet changes then occur on staged copies and become authoritative only after the decrypted
+   conversation/message binding succeeds.
 8. The recipient ACK signature binds the queue ID, message ID, ciphertext digest, action domain, and
    expiry. The client API creates it only from a successfully opened envelope.
 9. Fetch alone never deletes. A valid ACK deletes ciphertext in one SQLite transaction.
