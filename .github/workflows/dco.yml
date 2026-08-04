@@ -1,0 +1,34 @@
+name: DCO
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  signoff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - name: Verify commit sign-offs
+        if: github.event_name == 'pull_request'
+        env:
+          DCO_RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+        run: scripts/check-dco.sh "$DCO_RANGE"
+      - name: Verify pushed commit sign-offs
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          case "$BEFORE" in
+            0000000000000000000000000000000000000000) range="$AFTER" ;;
+            *) range="$BEFORE..$AFTER" ;;
+          esac
+          scripts/check-dco.sh "$range"

@@ -1,0 +1,33 @@
+[package]
+name = "secure-messenger-lab"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+description = "Disposable Phase 0 harness for testing an end-to-end encrypted mailbox relay"
+
+[dependencies]
+rand = "=0.8.7"
+rusqlite = { version = "=0.39.0", features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+tempfile = "=3.27.0"
+thiserror = "=2.0.19"
+vodozemac = { version = "=0.10.0", default-features = false }
+
+[profile.release]
+overflow-checks = true
+panic = "abort"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

@@ -1,0 +1,6 @@
+Secure Messenger Lab
+Copyright 2026 Secure Messenger Lab contributors
+
+This experimental project uses vodozemac, Copyright The Matrix.org Foundation C.I.C. and
+contributors, under the Apache License 2.0. `Cargo.lock` records the resolved dependency graph;
+dependencies remain subject to their own license terms.
