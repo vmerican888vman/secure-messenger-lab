@@ -588,20 +588,24 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 /// rollback journal or WAL exists, the later normal open must recover it before
 /// the authoritative schema validation can inspect a coherent database image.
 ///
-/// The two paths differ in what may be written before validation, and the
-/// distinction is deliberate:
+/// The two paths differ in what may be written, and the distinction is
+/// deliberate. Both statements below describe the *end state* of a rejected
+/// open, not merely what precedes validation:
 ///
 /// - No-companion path: the immutable inspection cannot write anything, so a
 ///   rejected database and its companions are left byte-identical.
-/// - Bypass path: `SQLite`'s own crash recovery runs first and *does* write.
-///   Replaying a hot journal restores pre-transaction pages into the main
-///   database, a stray non-hot journal is discarded, and a WAL-mode open
-///   creates a `-shm` file. All of this happens even when validation then
-///   rejects the database.
+/// - Bypass path: a rejected open is *not* byte-preserving. `SQLite`'s crash
+///   recovery runs before validation — replaying a hot journal restores
+///   pre-transaction pages into the main database, and a stray non-hot journal
+///   is discarded. Closing the connection afterwards writes again: a WAL-mode
+///   database is checkpointed into the main database and both the `-wal` and
+///   `-shm` files are removed. A rejected WAL-mode open has been measured
+///   rewriting the main database by megabytes and deleting both companions.
 ///
-/// What the bypass never permits is a *relay-initiated* write: recovery only
-/// restores the last committed state, and `validate_schema_for_open` still runs
-/// on the recovered image before any migration, purge, or application write.
+/// What the bypass never permits is a *relay-initiated* write. Recovery and
+/// checkpointing only ever materialize the last committed state, and
+/// `validate_schema_for_open` still runs on the recovered image before any
+/// migration, purge, or application write.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
