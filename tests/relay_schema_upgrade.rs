@@ -87,6 +87,23 @@ fn hot_rollback_journal_child() -> Result<(), Box<dyn Error>> {
                 ",
             )?;
         }
+        "wal-crash" => {
+            // Leave a genuine crashed WAL: committed content, no clean close.
+            connection.execute_batch(
+                "COMMIT;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 BEGIN IMMEDIATE;",
+            )?;
+            let changed = connection.execute("DELETE FROM messages WHERE expires_at > 0", [])?;
+            if changed != LARGE_MESSAGE_COUNT {
+                return Err(std::io::Error::other(
+                    "wal-crash child did not delete every seeded message",
+                )
+                .into());
+            }
+            connection.execute_batch("COMMIT;")?;
+        }
         _ => return Err(std::io::Error::other("unknown hot-journal child operation").into()),
     }
 
@@ -717,6 +734,48 @@ fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Resul
         row.get::<_, i64>(0)
     })?;
     assert_eq!(messages, i64::try_from(LARGE_MESSAGE_COUNT)?);
+    Ok(())
+}
+
+/// Exercises the WAL arm of the companion bypass, which no other test reaches,
+/// and pins the fact that a rejected open on this path is NOT byte-preserving:
+/// closing the connection checkpoints the recovered WAL into the main database
+/// and removes both companions. Recovery still only materializes committed
+/// state, so this is accepted rather than fixed, but it must not be described
+/// as leaving the database untouched.
+#[test]
+fn rejected_wal_open_checkpoints_and_removes_both_companions() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("wal-reject.sqlite");
+    seed_current_large_messages(&database)?;
+    // Make the schema unacceptable so validation must reject after recovery.
+    let connection = Connection::open(&database)?;
+    connection.execute_batch("CREATE TABLE extra_hostile(x);")?;
+    drop(connection);
+
+    run_hot_journal_child(&database, "wal-crash")?;
+
+    let wal = directory.path().join("wal-reject.sqlite-wal");
+    let shm = directory.path().join("wal-reject.sqlite-shm");
+    assert!(fs::metadata(&wal)?.len() > 0);
+    // The main header must actually be in WAL mode, or the bypass arm under
+    // test is not the one being exercised.
+    let header = fs::read(&database)?;
+    assert_eq!(&header[..16], b"SQLite format 3\0");
+    assert_eq!((header[18], header[19]), (2, 2));
+    let before = fs::read(&database)?;
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+
+    // Rejection on this path rewrites the main database and consumes both
+    // companions. Asserted explicitly so it cannot regress into a silent
+    // "companions are left byte-identical" claim.
+    assert_ne!(fs::read(&database)?, before);
+    assert!(!wal.exists());
+    assert!(!shm.exists());
     Ok(())
 }
 
