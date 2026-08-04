@@ -291,16 +291,22 @@ impl OlmClient {
         let OlmMessage::PreKey(pre_key) = olm_message else {
             return Err(LabError::ExpectedPreKey);
         };
-        let inbound = self
-            .account
+        // Stage account mutation so a successfully authenticated Olm packet
+        // cannot consume a one-time key unless its application binding also
+        // succeeds. The candidate becomes authoritative only after every
+        // plaintext check passes.
+        let mut candidate_account = Account::from_pickle(self.account.pickle());
+        let inbound = candidate_account
             .create_inbound_session(
                 SessionConfig::version_1(),
                 expected_sender.curve_identity,
                 &pre_key,
             )
             .map_err(|_| LabError::Crypto)?;
-        let plaintext = self.accept_plaintext(&inbound.plaintext, envelope.message_id())?;
+        let plaintext = self.validate_plaintext(&inbound.plaintext, envelope.message_id())?;
+        self.account = candidate_account;
         self.session = Some(inbound.session);
+        self.displayed_messages.insert(plaintext.message_id);
         Ok(OpenedMessage {
             message: plaintext,
             envelope,
@@ -320,18 +326,23 @@ impl OlmClient {
         }
         let olm_message: OlmMessage =
             serde_json::from_slice(envelope.packet().as_bytes()).map_err(|_| LabError::Encoding)?;
-        let plaintext = self
-            .session
-            .as_mut()
-            .ok_or(LabError::MissingSession)?
+        // Decrypt against a staged ratchet. Rejected application bindings do
+        // not consume message keys or advance the authoritative session.
+        let mut candidate_session = {
+            let session = self.session.as_ref().ok_or(LabError::MissingSession)?;
+            Session::from_pickle(session.pickle())
+        };
+        let plaintext = candidate_session
             .decrypt(&olm_message)
             .map_err(|_| LabError::Crypto)?;
-        let message = self.accept_plaintext(&plaintext, envelope.message_id())?;
+        let message = self.validate_plaintext(&plaintext, envelope.message_id())?;
+        self.session = Some(candidate_session);
+        self.displayed_messages.insert(message.message_id);
         Ok(OpenedMessage { message, envelope })
     }
 
-    fn accept_plaintext(
-        &mut self,
+    fn validate_plaintext(
+        &self,
         plaintext: &[u8],
         outer_message_id: MessageId,
     ) -> Result<PlainMessage> {
@@ -346,7 +357,7 @@ impl OlmClient {
         if message.message_id != outer_message_id {
             return Err(LabError::MessageIdMismatch);
         }
-        if !self.displayed_messages.insert(message.message_id) {
+        if self.displayed_messages.contains(&message.message_id) {
             return Err(LabError::DuplicateMessage);
         }
         Ok(message)

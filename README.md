@@ -22,6 +22,8 @@ shippable messenger is secure.
   capabilities authorize operations.
 - A missing session, altered ciphertext, wrong recipient, wrong capability, expired request, expired
   verified pre-key/envelope, or mismatched acknowledgement fails closed.
+- Inbound account and ratchet mutations are staged in memory and committed only after the encrypted
+  conversation/message binding succeeds.
 - Fetching does not delete. A recipient-signed ACK binds the queue, message ID, and ciphertext hash;
   the client API can create it only after verifying the sender-signed outer envelope and successfully
   decrypting its inner binding. One transaction then deletes ciphertext and adds a bounded replay
@@ -72,7 +74,7 @@ PASS: two clients exchanged encrypted messages; relay queue is empty after authe
 - `src/client.rs` — peer-scoped Olm session and fail-closed encrypted payload handling.
 - `src/capability.rs` — separate signed mailbox capabilities and canonical command binding.
 - `src/relay.rs` — minimal opaque SQLite store, authenticated ACK, TTL, and replay tombstones.
-- `tests/` — adversarial end-to-end, expiry-revalidation, and legacy-schema migration checks.
+- `tests/` — adversarial end-to-end, state-staging, boundary, concurrency, expiry, and migration checks.
 - `THREAT_MODEL.md` — adversaries, guarantees, non-goals, and the metadata budget.
 - `SECURITY_STATUS.md` — current security gate and unresolved blockers.
 - `docs/architecture.md` — exact prototype flow and trust boundaries.

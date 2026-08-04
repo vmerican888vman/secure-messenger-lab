@@ -40,9 +40,11 @@ if a session is missing. The inner encrypted JSON binds:
 The relay sees the Olm packet bytes and an outer copy of the random message ID. A recipient compares
 the authenticated inner ID with the outer ID before display or ACK. The relay also retains the
 sender-capability signature over the outer ID and ciphertext digest; the recipient verifies that
-signature before it invokes Olm, preventing relay-only metadata changes from consuming ratchet state.
-Previously verified pre-key bundles and envelopes are rechecked against the current time at the exact
-session-creation/decryption boundary, so retaining a verified wrapper does not bypass expiry.
+signature before it invokes Olm. Account/session changes are then computed on in-memory staged copies
+and committed only after the authenticated inner conversation/message binding succeeds. Relay-only or
+binding-invalid metadata therefore cannot consume the authoritative one-time key or ratchet state.
+Previously verified pre-key bundles and envelopes are also rechecked against the current time at the
+exact session-creation/decryption boundary, so retaining a verified wrapper does not bypass expiry.
 
 The spike uses the high-level `vodozemac` Olm API, not low-level primitives. It uses a separate Olm
 account per peer and assumes the complete pre-key bundle was verified directly. This does not solve a
@@ -75,6 +77,11 @@ encryption. Ed25519 and Olm operations come from `vodozemac`.
 - Schema versioning runs in the same immediate startup transaction. A legacy message table without
   sender signatures is securely emptied and rebuilt because those queued packets cannot satisfy the
   current recipient-verification invariant.
+- If an ACK request is lost before reaching the relay, the caller can retry the retained signed
+  `AckRequest` (or mint another while retaining `OpenedMessage`) until the earlier of its request expiry
+  and the message-retention expiry. If deletion committed but the response was lost, retry returns
+  `AlreadyDeleted` from the tombstone while the ACK request remains valid. A real client still needs a
+  durable ACK outbox so process loss cannot discard that proof.
 - If ACK does not commit, the ciphertext remains available. If it commits, the current database has no
   live ciphertext row.
 

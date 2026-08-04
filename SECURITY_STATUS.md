@@ -15,6 +15,8 @@ unaudited, and unsuitable for sensitive or production messaging.
 - [x] Sender-signed outer envelope is verified before ratchet mutation; ACK creation requires a
       successfully decrypted envelope.
 - [x] Previously verified pre-keys and envelopes are rechecked for expiry at the point of use.
+- [x] Binding-invalid authenticated payloads cannot burn the authoritative one-time key or advance
+      the authoritative ratchet; candidate crypto state commits only after inner validation.
 - [x] Authenticated recipient ACK is required before early deletion.
 - [x] ACK substitution, ciphertext tampering, wrong-recipient, unauthorized-capability, replay, retry,
       duplicate, conflict, and TTL tests.
@@ -25,12 +27,16 @@ unaudited, and unsuitable for sensitive or production messaging.
       idempotency are covered by file-backed restart/contention tests.
 - [x] A transactional schema migration securely discards legacy queued messages that lack sender
       signatures while preserving other relay state.
+- [x] Equality/future request-expiry bounds and invalid message-retention bounds fail closed under
+      direct regression tests.
 
 ## Blocking any app or public-security claim
 
 - [ ] Independently reviewed protocol and complete formal threat model.
 - [ ] Verified QR/contact ceremony that binds stable identity to peer-scoped session keys.
 - [ ] Transactional one-time-key publication and single claim without relay key substitution.
+- [ ] Identity-bound envelope authentication before any mailbox send capability is shared or delegated
+      beyond the single verified peer assumed by this harness.
 - [ ] Encrypted, atomic persistence of every mutated Olm account and ratchet state.
 - [ ] Hardware-backed local wrapping key where available plus a safe fallback policy.
 - [ ] Crash/restart tests at every send, fetch, decrypt, persistence, and ACK boundary.
@@ -48,8 +54,9 @@ The crypto path uses the high-level Olm API from `vodozemac` 0.10.0 with default
 low-level features disabled. [Upstream's 0.10.0 documentation](https://docs.rs/vodozemac/0.10.0/vodozemac/)
 states that the crate received one security audit, but that does not establish coverage of version
 0.10.0, this integration, or the mailbox protocol. We therefore do not describe this project as
-audited. Olm session version 1 uses a truncated MAC; protocol selection must be revisited before any
-production design is accepted.
+audited. Olm session version 1 uses a truncated MAC. Version 2 in this dependency is gated behind its
+`experimental-session-config` feature, which this harness deliberately does not enable. Protocol
+selection must be revisited before any production design is accepted.
 
 Open source permits inspection. It does not certify security, guarantee review, stop malicious builds,
 or replace a funded independent audit.

@@ -13,22 +13,29 @@ release claim.
 | Verified pre-key expiry | A bundle verified before expiry cannot create a session after expiry |
 | Pre-decrypt envelope binding | Changed ciphertext or outer message ID fails sender-capability verification before Olm state mutation |
 | Verified envelope expiry | An envelope verified before expiry cannot mutate an initial or established session after expiry |
+| Initial state staging | Binding-invalid first plaintext is rejected without consuming the authoritative OTK; the next valid pre-key message succeeds |
+| Ratchet state staging | Binding-invalid established plaintext is repeatably rejected without advancing the authoritative ratchet; the next valid message succeeds |
 | Delete only after ACK | Fetch leaves one row; recipient-bound valid ACK deletes it |
 | Current-file deletion | Exact queued packet bytes present before ACK and absent after ACK |
 | ACK binding | ACK signed for message 2 with message 1 digest cannot delete either item |
-| ACK replay | Repeated valid ACK is harmless and cannot delete another item |
+| ACK request/response loss | Retained ACK retry deletes if the request was lost and returns `AlreadyDeleted` if the response was lost; retry is bounded by request and message-retention expiry |
 | Send retry | Identical signed retry stores one logical row and returns duplicate |
 | Message-ID conflict | Different encrypted packet under same ID is rejected |
 | No plaintext fallback | Missing Olm session returns `MissingSession`; no relay request exists |
 | Tamper rejection | Modified encrypted packet cannot establish/decrypt a session |
 | Wrong recipient | Account without the addressed one-time key cannot decrypt |
 | Capability separation | Retargeted requests signed by unrelated send/receive/manage keys fail |
+| Envelope mailbox/expiry binding | Cross-mailbox presentation and outer-expiry tampering fail before decrypt |
 | Request replay | Reusing an authenticated fetch nonce is rejected |
+| Request time bounds | Expired, equality-boundary, and over-five-minute register/fetch/ACK/delete requests fail closed |
+| Message time bounds | Already-expired and over-seven-day message retention requests fail closed |
 | Retention TTL | Expired ciphertext is purged |
 | Idle restart expiry | File-backed reopen runs a global sweep without recipient fetch |
 | Mailbox resurrection | Captured registration and send requests fail after management deletion |
 | Concurrent send | Two file-backed writers resolve an identical request to stored + duplicate, one row total |
+| Concurrent conflict | Two file-backed writers using one ID for different packets resolve to stored + conflict, one row total |
 | Legacy schema upgrade | Unverifiable queued packets are securely discarded while tombstones and retired queues survive |
+| Schema downgrade resistance | Unknown future versions and a malformed current unsigned schema fail closed |
 | Minimal schema | No user/contact/conversation/plaintext/phone/email/username schema terms |
 
 ## Required before adding a network relay
@@ -39,7 +46,8 @@ release claim.
   prove no pre-ACK loss and no post-commit resurrection.
 - Test request-size and queue-count limits, malformed encodings, timing differences for known/unknown
   mailboxes, enumeration, flooding, rate limits, and expired signatures under clock skew.
-- Define retry semantics for replay-protected fetch/manage requests whose responses are lost.
+- Persist ACKs before transmission and test request-loss, response-loss, process-death, and expiry
+  recovery; define retry semantics for replay-protected fetch/manage requests whose responses are lost.
 - Verify that no endpoint, proxy, WAF, telemetry SDK, notification system, or support bundle records
   plaintext, keys, capabilities, full identifiers, or ciphertext bodies.
 
