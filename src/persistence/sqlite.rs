@@ -408,8 +408,11 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     if application_id != APPLICATION_ID || user_version != USER_VERSION {
         return Err(LabError::Storage);
     }
+    // The complete schema listing must be exactly the one expected table. No
+    // name-based exemptions: a hostile `sqlite_`-prefixed trigger, view, or
+    // table injected via writable_schema must fail this comparison.
     let objects = connection
-        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name")
         .and_then(|mut statement| {
             statement
                 .query_map([], |row| {
@@ -476,33 +479,46 @@ fn validate_no_indexes_or_foreign_keys(connection: &Connection) -> Result<()> {
 }
 
 fn validate_table_list(connection: &Connection) -> Result<()> {
+    // Exact comparison of the main schema's complete table list: the store's
+    // one table plus the built-in sqlite_schema, nothing else, with no
+    // prefix-based exception. The temporary schema's built-in
+    // sqlite_temp_schema entry is excluded by querying only `schema = 'main'`.
     let tables = connection
-        .prepare("PRAGMA table_list")
+        .prepare(
+            "SELECT name, type, ncol, wr, strict FROM pragma_table_list \
+             WHERE schema = 'main' ORDER BY name",
+        )
         .and_then(|mut statement| {
             statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
                         row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
                     ))
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()
         })
         .map_err(|_| LabError::Storage)?;
-    let current = tables
-        .iter()
-        .find(|(schema, name, _, _, _, _)| schema == "main" && name == "client_state")
-        .ok_or(LabError::Storage)?;
-    if current.2 != "table" || current.3 != 10 || current.4 != 0 || current.5 != 1 {
-        return Err(LabError::Storage);
-    }
-    if tables.iter().any(|(schema, name, _, _, _, _)| {
-        schema == "main" && name != "client_state" && !name.starts_with("sqlite_")
-    }) {
+    let expected = vec![
+        (
+            String::from("client_state"),
+            String::from("table"),
+            10,
+            0,
+            1,
+        ),
+        (
+            String::from("sqlite_schema"),
+            String::from("table"),
+            5,
+            0,
+            0,
+        ),
+    ];
+    if tables != expected {
         return Err(LabError::Storage);
     }
     Ok(())
@@ -1144,6 +1160,217 @@ mod tests {
         connection.execute_batch("CREATE TABLE extra_state(value INTEGER) STRICT;")?;
         drop(connection);
         assert!(ClientStateStore::open(&path, TestProtector::new(13, 14)).is_err());
+        Ok(())
+    }
+
+    type FullRow = (
+        i64,
+        Vec<u8>,
+        i64,
+        i64,
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+    );
+
+    fn full_row(connection: &Connection) -> rusqlite::Result<FullRow> {
+        connection.query_row(
+            "SELECT slot, profile_id, generation, envelope_version, state_schema_version, \
+             crypto_suite, key_ref, wrapped_dek, nonce, ciphertext FROM client_state \
+             WHERE slot = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+    }
+
+    fn bump_schema_version(
+        connection: &Connection,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let version =
+            connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))?;
+        connection.pragma_update(None, "schema_version", version + 1)?;
+        Ok(())
+    }
+
+    fn inject_hostile_schema_row(
+        path: &Path,
+        kind: &str,
+        name: &str,
+        tbl_name: &str,
+        sql: &str,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let connection = Connection::open(path)?;
+        connection.execute_batch("PRAGMA writable_schema = ON;")?;
+        connection.execute(
+            "INSERT INTO sqlite_schema(type, name, tbl_name, rootpage, sql) \
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![kind, name, tbl_name, sql],
+        )?;
+        bump_schema_version(&connection)?;
+        connection.execute_batch("PRAGMA writable_schema = OFF;")?;
+        Ok(())
+    }
+
+    fn assert_open_rejects_and_row_is_intact(
+        path: &Path,
+        protector: TestProtector,
+        before: &FullRow,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            ClientStateStore::open(path, protector),
+            Err(LabError::Storage)
+        ));
+        let verifier = Connection::open(path)?;
+        assert_eq!(&full_row(&verifier)?, before);
+        let rows = verifier.query_row("SELECT COUNT(*) FROM client_state", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        assert_eq!(rows, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_sqlite_prefixed_delete_trigger_fails_closed_without_data_loss()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "evil-delete-trigger.sqlite");
+        let mut store = ClientStateStore::create(&path, TestProtector::new(41, 42), b"guarded")?;
+        let inspector = Connection::open(&path)?;
+        let before = full_row(&inspector)?;
+        drop(inspector);
+        inject_hostile_schema_row(
+            &path,
+            "trigger",
+            "sqlite_evil",
+            "client_state",
+            "CREATE TRIGGER sqlite_evil AFTER UPDATE ON client_state \
+             BEGIN DELETE FROM client_state; END",
+        )?;
+
+        assert_open_rejects_and_row_is_intact(&path, TestProtector::new(41, 42), &before)?;
+        // The pre-injection handle revalidates the whole schema inside its
+        // commit transaction, so the executable DELETE trigger can never ride
+        // a successful commit to an empty table.
+        assert!(store.commit(b"post-injection").is_err());
+        let verifier = Connection::open(&path)?;
+        assert_eq!(full_row(&verifier)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_sqlite_prefixed_raise_ignore_trigger_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "evil-ignore-trigger.sqlite");
+        drop(ClientStateStore::create(
+            &path,
+            TestProtector::new(43, 44),
+            b"guarded",
+        )?);
+        let inspector = Connection::open(&path)?;
+        let before = full_row(&inspector)?;
+        drop(inspector);
+        inject_hostile_schema_row(
+            &path,
+            "trigger",
+            "sqlite_evil",
+            "client_state",
+            "CREATE TRIGGER sqlite_evil BEFORE UPDATE ON client_state \
+             BEGIN SELECT RAISE(IGNORE); END",
+        )?;
+
+        assert_open_rejects_and_row_is_intact(&path, TestProtector::new(43, 44), &before)
+    }
+
+    #[test]
+    fn hostile_sqlite_prefixed_view_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "evil-view.sqlite");
+        drop(ClientStateStore::create(
+            &path,
+            TestProtector::new(45, 46),
+            b"guarded",
+        )?);
+        let inspector = Connection::open(&path)?;
+        let before = full_row(&inspector)?;
+        drop(inspector);
+        inject_hostile_schema_row(
+            &path,
+            "view",
+            "sqlite_evil_view",
+            "sqlite_evil_view",
+            "CREATE VIEW sqlite_evil_view AS SELECT slot FROM client_state",
+        )?;
+
+        assert_open_rejects_and_row_is_intact(&path, TestProtector::new(45, 46), &before)
+    }
+
+    #[test]
+    fn hostile_sqlite_prefixed_table_with_valid_root_page_fails_closed()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "evil-table.sqlite");
+        drop(ClientStateStore::create(
+            &path,
+            TestProtector::new(47, 48),
+            b"guarded",
+        )?);
+        let inspector = Connection::open(&path)?;
+        let before = full_row(&inspector)?;
+        drop(inspector);
+        // A reserved-name table cannot be created through DDL, so create an
+        // ordinary table first and rename its schema entry and SQL through
+        // writable_schema; it keeps a valid allocated root page.
+        let injector = Connection::open(&path)?;
+        injector.execute_batch("CREATE TABLE hostile_placeholder(payload INTEGER);")?;
+        injector.execute_batch("PRAGMA writable_schema = ON;")?;
+        injector.execute(
+            "UPDATE sqlite_schema SET name = 'sqlite_evil_table', \
+             tbl_name = 'sqlite_evil_table', \
+             sql = 'CREATE TABLE sqlite_evil_table(payload INTEGER)' \
+             WHERE name = 'hostile_placeholder'",
+            [],
+        )?;
+        bump_schema_version(&injector)?;
+        injector.execute_batch("PRAGMA writable_schema = OFF;")?;
+        drop(injector);
+
+        assert_open_rejects_and_row_is_intact(&path, TestProtector::new(47, 48), &before)
+    }
+
+    #[test]
+    fn strict_whole_schema_validation_accepts_the_clean_store()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "clean-control.sqlite");
+        drop(ClientStateStore::create(
+            &path,
+            TestProtector::new(49, 50),
+            b"first",
+        )?);
+        let mut store = ClientStateStore::open(&path, TestProtector::new(49, 50))?;
+        store.commit(b"second")?;
+        drop(store);
+        let store = ClientStateStore::open(&path, TestProtector::new(49, 50))?;
+        assert_eq!(store.state()?, b"second");
+        assert_eq!(store.generation()?, 2);
         Ok(())
     }
 
