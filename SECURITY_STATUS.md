@@ -65,5 +65,7 @@ or replace a funded independent audit.
 ## Next proposed gate
 
 [`docs/persistence-spike-design.md`](docs/persistence-spike-design.md) defines the encrypted local-state
-and forced-crash experiment. It is awaiting two independent design reviews and is not implementation
-or security clearance. Kimi and Fable must review it independently before implementation begins.
+and forced-crash experiment. Kimi and Fable independently returned `RETURN` on exact head
+`3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e`; their blocking items are reconciled in the amended
+design. This is still not implementation or security clearance. Both must return `PASS` on the same
+exact amended head before implementation begins.

@@ -74,14 +74,33 @@ No item below is currently claimed as passing:
   caller-visible success;
 - commit an inbound ratchet/OTK advance, one logical inbound record, and renewable ACK intent before
   application delivery or ACK transmission;
+- persist immutable mailbox-registration intent separately from its current signed request; retry the
+  exact request while valid, then atomically re-sign with a fresh nonce after the five-minute window
+  without changing the queue or owner keys; reject intent/request field or signature mismatches before
+  renewal or transmission;
 - force process death at every pre/post-commit, send-response, delivery, and ACK-response boundary and
   observe only a complete old or new state;
+- fill the 64 KiB body, 96 KiB packet, 32 inbound, 32 combined send-outbox, 32 ACK, 4,096 dedup, and
+  8 MiB ciphertext bounds; at each exact/one-over boundary prove refusal before authoritative Olm or
+  relay mutation, no pending eviction, forced-death recovery, and success after one valid drain;
+- keep a full ineligible deduplication set blocking before decrypt, then prove both observed-ACK and
+  terminal-message-expiry ageing paths reclaim only unreferenced records after seven days;
+- reject/discard an OTK-renewal candidate whenever pinned `vodozemac` reports any evicted key in
+  `OneTimeKeyGenerationResult.removed`, leaving the authoritative Account and bundle unchanged;
+- expose send expiry without confirmed storage as a durable body-free `DeliveryUnknown` outcome—not
+  proof of non-delivery—and never automatically re-encrypt or reuse its message key;
 - fail closed on missing keys, authentication failure, corruption, cross-profile swap, version
   downgrade, malformed/oversized state, write failure, or unsupported migration;
 - prove database, journal, temporary files, logs, and diagnostics contain no message canary, raw Olm
-  pickle, or private capability material; and
+  pickle, private capability material, or secret-bearing `Debug`/error rendering;
+- prove Android unknown/indeterminate protection evidence uses the lowest claim, platform-wrapped DEKs
+  bind the expected profile/key reference, and cleanup never deletes an expected/authenticated key;
+- preserve hostile schema-fixture source and companion files byte-for-byte while separately proving
+  valid normal SQLite hot-journal recovery on disposable working copies; and
 - validate complete relay and local SQLite schema manifests rather than trusting a version number or
   one column name.
 
-This checklist becomes authoritative only after independent Kimi and Fable reviews authorize
-implementation and every blocking return item is reconciled.
+The initial independent Kimi and Fable reviews both returned `RETURN` on
+`3f9c186c8f1aa34e5a03f45ef3621ac75a5b591e`. Their blocking items are reconciled in this revision,
+but this checklist becomes authoritative only after both reviewers return `PASS` on the same exact
+amended head.
