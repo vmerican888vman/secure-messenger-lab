@@ -40,6 +40,7 @@ unaudited, and unsuitable for sensitive or production messaging.
 - [ ] Encrypted, atomic persistence of every mutated Olm account and ratchet state.
 - [ ] Hardware-backed local wrapping key where available plus a safe fallback policy.
 - [ ] Crash/restart tests at every send, fetch, decrypt, persistence, and ACK boundary.
+- [ ] Exact fail-closed SQLite schema-shape validation for current and documented legacy schemas.
 - [ ] Real authenticated network protocol, TLS configuration, request limits, and traffic/log capture.
 - [ ] Periodic expiry scheduler and a measured wall-clock deletion SLA for an otherwise idle relay.
 - [ ] Offline ordering, retry, migration, relay failover, duplicate delivery, and deletion across relays.
@@ -60,3 +61,9 @@ selection must be revisited before any production design is accepted.
 
 Open source permits inspection. It does not certify security, guarantee review, stop malicious builds,
 or replace a funded independent audit.
+
+## Next proposed gate
+
+[`docs/persistence-spike-design.md`](docs/persistence-spike-design.md) defines the encrypted local-state
+and forced-crash experiment. It is awaiting two independent design reviews and is not implementation
+or security clearance. Kimi and Fable must review it independently before implementation begins.

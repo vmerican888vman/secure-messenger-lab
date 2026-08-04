@@ -62,3 +62,26 @@ release claim.
 
 Any mandatory failure is a NO-GO. “Deleted” must always name the storage surfaces and timing tested; it
 can never promise that a recipient or malicious relay did not make a copy.
+
+## Proposed encrypted-persistence spike — not implemented
+
+The next design gate is specified in [`persistence-spike-design.md`](persistence-spike-design.md).
+No item below is currently claimed as passing:
+
+- restore the same Account, Session, peer/conversation binding, private capabilities, deduplication
+  records, and outboxes after clean restart;
+- commit an outbound ratchet advance and its exact signed send request before any relay call or
+  caller-visible success;
+- commit an inbound ratchet/OTK advance, one logical inbound record, and renewable ACK intent before
+  application delivery or ACK transmission;
+- force process death at every pre/post-commit, send-response, delivery, and ACK-response boundary and
+  observe only a complete old or new state;
+- fail closed on missing keys, authentication failure, corruption, cross-profile swap, version
+  downgrade, malformed/oversized state, write failure, or unsupported migration;
+- prove database, journal, temporary files, logs, and diagnostics contain no message canary, raw Olm
+  pickle, or private capability material; and
+- validate complete relay and local SQLite schema manifests rather than trusting a version number or
+  one column name.
+
+This checklist becomes authoritative only after independent Kimi and Fable reviews authorize
+implementation and every blocking return item is reconciled.
