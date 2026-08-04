@@ -1,0 +1,43 @@
+VERDICT: RETURN
+
+**Head reviewed:** `ea69c07071568cd9a826fd3c99b0bee11801f4a0` — verified with `git rev-parse HEAD` (exact match) and `git status --porcelain` (clean) both before and after the review. No tracked file was created, modified, or deleted; no git mutations were made. This review is my own independent work; I did not read or seek any other reviewer's output.
+
+**Commands actually run and verified:**
+
+| Command | Result |
+|---|---|
+| `cargo test --locked --all-targets` | PASS — 46 tests green (17 lib unit incl. 13 persistence, 12 e2e_relay, 11 relay_schema_upgrade, 2 expiry, 2 boundaries, 2 staging), 0 failed |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | PASS — re-run from a cold cache into a separate `target/clippy-review` dir (full re-check, 7.6s), zero warnings; scratch dir deleted afterward |
+| `cargo fmt --all -- --check` | PASS — exit 0 |
+| `cargo audit --deny warnings --file Cargo.lock` | PASS — 116 deps scanned, no advisories, exit 0 |
+
+**What passed review (evidence, briefly):** exact `=`-pins for `chacha20poly1305 0.10.1` (direct dep, alloc-only) and `vodozemac 0.10.0` (matching the AAD constant); canonical length-prefixed AAD binding domain/versions/profile_id/generation/key_ref/SHA-256(wrapped_dek)/protocol_domain; fresh OsRng nonce per commit with RNG-failure-aborts-before-write proven by file-byte equality; envelope unit tests flipping every authenticated field; independent `expected_binding` obtained before any DB byte is trusted, row-vs-binding compare plus AAD (profile-A/B swap and wrapped-key/mask substitution fail); full-row CAS including wrapped_dek/nonce/ciphertext in the WHERE clause with poison-on-any-failure and stale-handle lockout (tested); seal-before-transaction and candidate-install-only-after-COMMIT ordering; subprocess `abort()` failpoints at every create/commit substep with old/new/nothing oracles; authentic-rollback documented as an explicit accepted limitation with a divergent-commit fresh-nonce test; lengths-first `read_row` refusing cap+1 wrapped_dek/ciphertext before materialization (tested via `ignore_check_constraints` + `zeroblob`); redacted `Debug`/coarse errors and a 3-canary on-disk scan; test-only XOR `TestProtector` under `#[cfg(test)]` (not production-selectable); relay manifest classification (in-memory reference manifests, full object/table-list/xinfo/index/fk compare, `foreign_key_check`, `integrity_check`), immutable-URI hostile-fixture preflight preserving source bytes, legacy v0/v1 exact-shape migration discarding unverifiable messages, fail-closed hybrids (v2-minus-signature, v1-with-current-shape, extra trigger, stripped constraints, WAL artifact, future version), and a real aborted-subprocess hot rollback-journal recovery test.
+
+## Blocking defect
+
+**B1 — Local-store schema validation silently admits `sqlite_`-prefixed hostile objects, including executable triggers; `commit()` then reports success for a candidate that is not durable.**
+
+- **Affected code:** `src/persistence/sqlite.rs:412` — the objects query filters `WHERE name NOT LIKE 'sqlite_%'` (SQLite `LIKE` is case-insensitive and `_` is a wildcard); and `src/persistence/sqlite.rs:503-507` — `validate_table_list` exempts any object whose name `starts_with("sqlite_")`, and `PRAGMA table_list` never lists triggers at all. The exact one-row schema has *zero* legitimate `sqlite_`-prefixed objects (INTEGER PRIMARY KEY aliases rowid; no AUTOINCREMENT, no indexes), so the carve-out is pure attack surface. The relay-side manifest (`src/relay.rs:822-846`) correctly compares the *unfiltered* `sqlite_schema` listing — this gap exists only in the local secret-state store, the component whose threat model is "detects arbitrary modification of the client database."
+
+- **Exact failure sequence (reproduced against the pinned `rusqlite =0.39.0` bundled SQLite in a /tmp scratch crate replicating `validate_schema` and the commit path statement-for-statement):**
+  1. Attacker with offline access to `state.sqlite` runs `PRAGMA writable_schema=ON` and inserts `('trigger','sqlite_evil','client_state',0,'CREATE TRIGGER sqlite_evil AFTER UPDATE ON client_state BEGIN DELETE FROM client_state; END')` into `sqlite_schema`. The `client_state` row, SQL text, constraints, and data stay byte-identical; `PRAGMA integrity_check` still returns `ok`.
+  2. App calls `ClientStateStore::open` → every `validate_schema` check passes (objects query excludes the trigger; `table_list` omits triggers; xinfo/index/fk/integrity clean). The row authenticates; the profile opens normally.
+  3. App calls `commit(new_state)` → the UPDATE fires the trigger inside the transaction; `execute()` returns `changed == 1` because `sqlite3_changes()` excludes trigger side effects; `transaction.commit()` succeeds; the handle installs generation N+1 in memory and returns `Ok(())`.
+  4. The durable file now contains **zero rows** — neither the old nor the new snapshot — while the caller was told the candidate is durable. The next leg's design exposes relay sends, ACKs, and deliveries precisely in this window ("only then install… / no caller-visible success from an uncommitted candidate"). A `BEFORE UPDATE … RAISE(IGNORE)` variant instead silently turns the CAS UPDATE into a 0-row no-op (that one at least fails closed via `changed != 1`).
+
+- **Violated reviewed invariants:** (a) design "Local transaction model": "no application-defined SQL functions, loadable extensions, triggers, views, or additional schema objects are allowed"; (b) "A conflict, storage error, authentication failure, or uncertain commit fails closed" and "A crash must reveal either the complete old snapshot or the complete new one, never a mixture" — here commit signals success and crash reveals *neither*; (c) threat boundary: "detects arbitrary modification of the client database" — this modification is not detected at open *or* at commit; (d) acceptance gate: "Complete relay and local schema-shape negative fixtures fail with no application migration or state write." It also hands a one-time offline file attacker persistent influence over *future* commits, which plain file corruption cannot achieve.
+
+- **Minimum correction:** in `validate_schema`, drop the `NOT LIKE 'sqlite_%'` filter and require the complete `sqlite_schema` listing to equal exactly the single expected `client_state` row (no internal objects exist for this DDL), and in `validate_table_list` permit only `client_state` plus the exact built-in `sqlite_schema` entry in `main`. No storage-format change; existing clean databases pass unchanged (verified: a clean store has exactly one `sqlite_schema` row).
+
+- **Regression oracle:** build a valid store, then inject via `writable_schema` (i) an `AFTER UPDATE … DELETE` trigger named `sqlite_evil`, (ii) a `BEFORE UPDATE … RAISE(IGNORE)` variant, (iii) a view and (iv) a table named `sqlite_x`; assert `ClientStateStore::open` returns `Err(LabError::Storage)` for each, the on-disk row stays byte-identical, and a clean created store still opens and commits (no false positive). Committing over fixture (i) must never return `Ok` with zero durable rows.
+
+## Optional hardening (non-blocking)
+
+1. **AAD version drift:** `VODOZEMAC_VERSION` in `src/persistence/envelope.rs:21` is a hand-maintained copy of the `Cargo.toml` pin. Add a test/build-time assertion tying it to the locked `vodozemac` version so a future bump can't silently diverge from the authenticated AAD.
+2. **Relay validates before `trusted_schema=OFF`:** `Relay::initialize` (`src/relay.rs:97-111`) runs `validate_schema_for_open` before the pragma batch that sets `trusted_schema = OFF` (unlike `open_connection` in the persistence layer, which sets it first). Current validation uses only pragma/schema introspection, so no exploit is known, but setting it at open time would match the design text literally.
+3. **No `busy_timeout` on `ClientStateStore` connections:** a concurrent opener fails closed with the coarse error (acceptable for the one-writer model), but a short timeout or an explicit doc note would make the behavior less surprising.
+4. **Pre-copy size gate:** `commit`/`create` copy caller state into a `Zeroizing<Vec>` before the 8 MiB check inside `seal`. Only the app itself can oversize the input, so this is not an attacker surface, but checking length before the copy would be tidier.
+5. **Nonce-corpus test size:** 128 generations is a fine smoke oracle; a comment noting the per-commit 2⁻⁹⁶ random-collision bound (rather than corpus uniqueness) as the actual freshness argument would prevent over-reading the test.
+
+This RETURN blocks authorization of the next semantic persistence leg until B1 is corrected and re-reviewed.
+

@@ -9,6 +9,9 @@ use secure_messenger_lab::Relay;
 
 const NOW: u64 = 1_800_000_000;
 const HOT_JOURNAL_CHILD_PATH: &str = "SECURE_MESSENGER_HOT_JOURNAL_CHILD_PATH";
+const HOT_JOURNAL_CHILD_OPERATION: &str = "SECURE_MESSENGER_HOT_JOURNAL_CHILD_OPERATION";
+const LARGE_MESSAGE_COUNT: usize = 64;
+const LARGE_CIPHERTEXT_BYTES: usize = 40 * 1024;
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
@@ -22,6 +25,8 @@ fn hot_rollback_journal_child() -> Result<(), Box<dyn Error>> {
     let Ok(path) = env::var(HOT_JOURNAL_CHILD_PATH) else {
         return Ok(());
     };
+    let operation =
+        env::var(HOT_JOURNAL_CHILD_OPERATION).unwrap_or_else(|_| String::from("mailbox-update"));
 
     let connection = Connection::open(path)?;
     connection.execute_batch(
@@ -33,19 +38,161 @@ fn hot_rollback_journal_child() -> Result<(), Box<dyn Error>> {
         BEGIN IMMEDIATE;
         ",
     )?;
-    let changed = connection.execute(
-        "UPDATE mailboxes SET created_at = created_at + 1 WHERE queue_id = ?1",
-        params![vec![0x11_u8; 32]],
-    )?;
-    if changed != 1 {
-        return Err(
-            std::io::Error::other("hot-journal child did not update its benign row").into(),
-        );
+    match operation.as_str() {
+        "mailbox-update" => {
+            let changed = connection.execute(
+                "UPDATE mailboxes SET created_at = created_at + 1 WHERE queue_id = ?1",
+                params![vec![0x11_u8; 32]],
+            )?;
+            if changed != 1 {
+                return Err(std::io::Error::other(
+                    "hot-journal child did not update its benign row",
+                )
+                .into());
+            }
+        }
+        "bulk-delete" => {
+            let changed = connection.execute(
+                "DELETE FROM messages WHERE expires_at <= ?1",
+                params![i64::try_from(NOW + 60)?],
+            )?;
+            if changed != LARGE_MESSAGE_COUNT {
+                return Err(std::io::Error::other(
+                    "hot-journal child did not delete every seeded message",
+                )
+                .into());
+            }
+        }
+        "legacy-migration" => {
+            let changed = connection.execute("DELETE FROM messages", [])?;
+            if changed != LARGE_MESSAGE_COUNT {
+                return Err(std::io::Error::other(
+                    "hot-journal child did not delete every legacy message",
+                )
+                .into());
+            }
+            connection.execute_batch(
+                "
+                DROP TABLE messages;
+                CREATE TABLE messages (
+                    queue_id BLOB NOT NULL,
+                    message_id BLOB NOT NULL CHECK(length(message_id) = 16),
+                    ciphertext BLOB NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    sender_signature BLOB NOT NULL CHECK(length(sender_signature) = 64),
+                    PRIMARY KEY (queue_id, message_id),
+                    FOREIGN KEY (queue_id) REFERENCES mailboxes(queue_id) ON DELETE CASCADE
+                ) STRICT;
+                PRAGMA user_version = 2;
+                ",
+            )?;
+        }
+        _ => return Err(std::io::Error::other("unknown hot-journal child operation").into()),
     }
 
     // Intentionally leave SQLite's real rollback journal hot. This test only
     // invokes the helper through the parent subprocess below.
     std::process::abort();
+}
+
+fn message_id(index: usize) -> Result<[u8; 16], Box<dyn Error>> {
+    let mut message_id = [0_u8; 16];
+    message_id[..8].copy_from_slice(b"msg-id-v");
+    message_id[8..].copy_from_slice(&u64::try_from(index)?.to_be_bytes());
+    Ok(message_id)
+}
+
+fn seed_current_large_messages(database: &Path) -> Result<(), Box<dyn Error>> {
+    drop(Relay::open_at(database, NOW)?);
+    let mut connection = Connection::open(database)?;
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO mailboxes(queue_id, send_key, receive_key, manage_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            vec![0x11_u8; 32],
+            vec![0x22_u8; 32],
+            vec![0x33_u8; 32],
+            vec![0x44_u8; 32],
+            i64::try_from(NOW)?,
+        ],
+    )?;
+    let ciphertext = vec![0xA5_u8; LARGE_CIPHERTEXT_BYTES];
+    for index in 0..LARGE_MESSAGE_COUNT {
+        transaction.execute(
+            "INSERT INTO messages(queue_id, message_id, ciphertext, expires_at, sender_signature)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                vec![0x11_u8; 32],
+                message_id(index)?.as_slice(),
+                &ciphertext,
+                i64::try_from(NOW + 60)?,
+                vec![0x66_u8; 64],
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn seed_legacy_large_messages(database: &Path) -> Result<(), Box<dyn Error>> {
+    let queue_id = vec![0x11_u8; 32];
+    let first_message_id = message_id(0)?;
+    let tombstone_message_id = vec![0x33_u8; 16];
+    let ciphertext = vec![0xB6_u8; LARGE_CIPHERTEXT_BYTES];
+    create_legacy_database(
+        database,
+        &queue_id,
+        &first_message_id,
+        &tombstone_message_id,
+        &ciphertext,
+    )?;
+    let mut connection = Connection::open(database)?;
+    let transaction = connection.transaction()?;
+    for index in 1..LARGE_MESSAGE_COUNT {
+        transaction.execute(
+            "INSERT INTO messages(queue_id, message_id, ciphertext, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                &queue_id,
+                message_id(index)?.as_slice(),
+                &ciphertext,
+                i64::try_from(NOW + 60)?,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn run_hot_journal_child(database: &Path, operation: &str) -> Result<(), Box<dyn Error>> {
+    let status = Command::new(env::current_exe()?)
+        .arg("--exact")
+        .arg("hot_rollback_journal_child")
+        .arg("--nocapture")
+        .env(HOT_JOURNAL_CHILD_PATH, database)
+        .env(HOT_JOURNAL_CHILD_OPERATION, operation)
+        .status()?;
+    assert!(!status.success());
+    Ok(())
+}
+
+fn immutable_integrity_is_ok(database: &Path) -> Result<bool, Box<dyn Error>> {
+    let uri = format!("file:{}?mode=ro&immutable=1", database.display());
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    let Ok(mut statement) = connection.prepare("PRAGMA integrity_check") else {
+        return Ok(false);
+    };
+    let Ok(integrity) = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .and_then(Iterator::collect::<std::result::Result<Vec<_>, _>>)
+    else {
+        return Ok(false);
+    };
+    Ok(integrity.as_slice() == ["ok"])
 }
 
 fn create_legacy_database(
@@ -423,6 +570,80 @@ fn valid_hot_rollback_journal_recovers_complete_pretransaction_state() -> Result
     assert_eq!(created_at, i64::try_from(NOW)?);
     assert_eq!(version, 2);
     assert!(messages_sql.contains("sender_signature"));
+    Ok(())
+}
+
+#[test]
+fn hot_journal_from_aborted_bulk_delete_recovers_all_current_messages() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("bulk-delete.sqlite");
+    seed_current_large_messages(&database)?;
+
+    run_hot_journal_child(&database, "bulk-delete")?;
+
+    let journal = directory.path().join("bulk-delete.sqlite-journal");
+    assert!(journal.is_file());
+    assert!(fs::metadata(&journal)?.len() > 0);
+    assert!(!immutable_integrity_is_ok(&database)?);
+
+    drop(Relay::open_at(&database, NOW)?);
+
+    assert!(immutable_integrity_is_ok(&database)?);
+    let recovered = Connection::open(&database)?;
+    let messages = recovered.query_row("SELECT COUNT(*) FROM messages", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    assert_eq!(messages, i64::try_from(LARGE_MESSAGE_COUNT)?);
+    drop(recovered);
+    assert!(!journal.exists());
+    Ok(())
+}
+
+#[test]
+fn hot_journal_from_aborted_legacy_migration_recovers_then_migrates() -> Result<(), Box<dyn Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("legacy-migration.sqlite");
+    seed_legacy_large_messages(&database)?;
+
+    run_hot_journal_child(&database, "legacy-migration")?;
+
+    let journal = directory.path().join("legacy-migration.sqlite-journal");
+    assert!(journal.is_file());
+    assert!(fs::metadata(&journal)?.len() > 0);
+    assert!(!immutable_integrity_is_ok(&database)?);
+
+    drop(Relay::open_at(&database, NOW)?);
+
+    assert!(immutable_integrity_is_ok(&database)?);
+    let recovered = Connection::open(&database)?;
+    let version = recovered.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    assert_eq!(version, 2);
+    let messages_sql = recovered.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'messages'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    assert!(messages_sql.contains("sender_signature"));
+    let counts = recovered.query_row(
+        "SELECT (SELECT COUNT(*) FROM messages),
+                (SELECT COUNT(*) FROM mailboxes),
+                (SELECT COUNT(*) FROM tombstones),
+                (SELECT COUNT(*) FROM retired_queues)",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        },
+    )?;
+    assert_eq!(counts, (0, 1, 1, 1));
+    drop(recovered);
+    assert!(!journal.exists());
     Ok(())
 }
 

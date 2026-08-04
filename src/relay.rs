@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -584,8 +584,9 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 }
 
 /// Inspect an existing main database without allowing `SQLite` to replay or
-/// create journals. A later normal open may recover a valid hot journal; that
-/// is the sole permitted pre-validation filesystem mutation.
+/// create journals when no recovery companion is present. If a non-empty
+/// rollback journal or WAL exists, the later normal open must recover it before
+/// the authoritative schema validation can inspect a coherent database image.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -598,12 +599,51 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
     if metadata.len() == 0 {
         return Ok(());
     }
+    if has_nonempty_recovery_companion(path)? {
+        return Ok(());
+    }
 
     let connection = Connection::open_with_flags(
         immutable_uri(path)?,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
     validate_schema_for_open(&connection)
+}
+
+/// A non-empty exact-suffix companion only counts as a recovery companion when
+/// `SQLite` would actually replay it: a hot rollback journal always, but a WAL
+/// only when the main database header itself is in WAL mode. A stray WAL next
+/// to a rollback-mode database is an artifact, not recoverable state, and must
+/// not bypass the immutable preflight.
+fn has_nonempty_recovery_companion(path: &Path) -> Result<bool> {
+    if nonempty_companion(path, "-journal")? {
+        return Ok(true);
+    }
+    if nonempty_companion(path, "-wal")? && database_header_uses_wal(path)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn nonempty_companion(path: &Path, suffix: &str) -> Result<bool> {
+    let mut companion = path.as_os_str().to_os_string();
+    companion.push(suffix);
+    match fs::metadata(Path::new(&companion)) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(LabError::Storage),
+    }
+}
+
+fn database_header_uses_wal(path: &Path) -> Result<bool> {
+    let mut file = fs::File::open(path).map_err(|_| LabError::Storage)?;
+    let mut header = [0_u8; 20];
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(false),
+        Err(_) => return Err(LabError::Storage),
+    }
+    Ok(header[..16] == *b"SQLite format 3\0" && header[18] == 2 && header[19] == 2)
 }
 
 fn immutable_uri(path: &Path) -> Result<String> {
