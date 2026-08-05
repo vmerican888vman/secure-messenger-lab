@@ -354,8 +354,18 @@ impl Account {
     // (docs/phase2-design-decisions.md section 3, "Upstream blocker").
     // Review status: UNREVIEWED. Do not rely on this method outside that
     // project, and do not submit it upstream as-is.
-    /// Check whether the given public key belongs to a one-time key whose
-    /// private part is still held by this [`Account`]'s one-time key store.
+    //
+    // Amended after Sol's review of df53995 (RETURN): the first
+    // implementation consulted the derived `key_ids_by_key` reverse map,
+    // which collapses duplicate public keys. A hand-edited pickle holding
+    // the same private key under two key IDs then produced an inconsistent
+    // oracle: after one alias was consumed, membership reported `false`
+    // while a private copy was still stored. The method now derives its
+    // answer only from the authoritative `private_keys` store, so
+    // membership is true if and only if ANY held one-time private key
+    // corresponds to `key`.
+    /// Check whether any one-time private key still held by this
+    /// [`Account`]'s one-time key store corresponds to the given public key.
     ///
     /// This inspects only the one-time key store. Fallback keys are a
     /// separate store and are never consulted, so a fallback key always
@@ -365,8 +375,21 @@ impl Account {
     /// their private part has not been removed by
     /// [`Account::create_inbound_session()`] or discarded to make space for
     /// newly generated keys.
+    ///
+    /// Note: membership answers "does a matching private key exist", which
+    /// is exactly what the Phase-2 load validation asks. It does not detect
+    /// the pathological duplicate-secret pickle state itself (the same
+    /// secret under two key IDs), which upstream's unpickling tolerates and
+    /// which leaves an unconsumable copy behind after one alias is used;
+    /// validators that care must check for duplicate public keys separately.
+    ///
+    /// This is an O(n) scan over the stored one-time keys, intended for
+    /// validation-time rather than hot-path use.
     pub fn contains_one_time_key(&self, key: Curve25519PublicKey) -> bool {
-        self.one_time_keys.key_ids_by_key.contains_key(&key)
+        self.one_time_keys
+            .private_keys
+            .values()
+            .any(|secret| Curve25519PublicKey::from(secret) == key)
     }
 
     /// Get the currently unpublished one-time keys.

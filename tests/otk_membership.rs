@@ -79,3 +79,66 @@ fn consumed_one_time_key_is_no_longer_found() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+/// Sol's blocking reproduction from the patch-0001 re-review: a hand-edited
+/// pickle holding the same private key under two key IDs. The derived reverse
+/// map collapses the aliases, so after one alias is consumed a map-based
+/// membership check reports `false` while a private copy is still stored.
+/// Membership must instead agree with the authoritative private-key store.
+#[test]
+fn duplicate_secret_pickle_membership_stays_consistent_with_held_keys(
+) -> Result<(), Box<dyn Error>> {
+    use vodozemac::olm::AccountPickle;
+
+    let mut account = Account::new();
+    let created = account.generate_one_time_keys(2).created;
+    let aliased_public = created[0];
+    let vanished_public = created[1];
+    account.mark_keys_as_published();
+
+    // Duplicate the first private key over the second key ID in the pickle.
+    let mut json: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&account.pickle())?)?;
+    let private_keys = json
+        .pointer_mut("/one_time_keys/private_keys")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| String::from("account pickle JSON shape changed"))?;
+    let entries: Vec<(String, serde_json::Value)> =
+        private_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let [(_, first_secret), (second_id, _)] = entries.as_slice() else {
+        return Err("expected exactly two one-time keys".into());
+    };
+    private_keys.insert(second_id.clone(), first_secret.clone());
+
+    let pickle: AccountPickle = serde_json::from_value(json)?;
+    let mut account = Account::from_pickle(pickle);
+    assert_eq!(account.stored_one_time_key_count(), 2);
+    assert!(account.contains_one_time_key(aliased_public));
+    assert!(!account.contains_one_time_key(vanished_public));
+
+    // Consume one alias through a real inbound session.
+    let alice = Account::new();
+    let mut alice_session = alice.create_outbound_session(
+        SessionConfig::version_1(),
+        account.curve25519_key(),
+        aliased_public,
+    )?;
+    let plaintext = b"alias probe";
+    let message = alice_session.encrypt(plaintext)?;
+    let pre_key_message = match message {
+        OlmMessage::PreKey(pre_key) => pre_key,
+        OlmMessage::Normal(_) => return Err("first message must be a pre-key message".into()),
+    };
+    let result = account.create_inbound_session(
+        SessionConfig::version_1(),
+        alice.curve25519_key(),
+        &pre_key_message,
+    )?;
+    assert_eq!(result.plaintext, plaintext);
+
+    // One aliased private copy remains stored (the reverse map removed the
+    // entry it pointed at). Membership must agree with the store: true.
+    assert_eq!(account.stored_one_time_key_count(), 1);
+    assert!(account.contains_one_time_key(aliased_public));
+
+    Ok(())
+}
