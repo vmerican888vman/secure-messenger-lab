@@ -588,30 +588,31 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 /// rollback journal or WAL exists, the later normal open must recover it before
 /// the authoritative schema validation can inspect a coherent database image.
 ///
-/// This function makes exactly one guarantee, and it is about *acceptance*,
-/// not about bytes on disk: `validate_schema_for_open` runs on whatever image
-/// the normal open produces, ahead of any migration, purge, or application
-/// write, so an image the relay would not otherwise accept is rejected.
+/// Two properties hold, each pinned by a test. Do not add a third without one:
 ///
-/// Every attempt to state a stronger byte-level property here has been measured
-/// false, so what follows is recorded as observed behavior rather than as a
-/// limit. Do not restate any of it as a guarantee without a test:
+/// - Acceptance: `validate_schema_for_open` runs on whatever image the normal
+///   open produces, ahead of any migration, purge, or application write, so an
+///   image the relay would not otherwise accept is rejected.
+/// - Refusal on an anomalous WAL is byte-preserving: `reject_anomalous_wal`
+///   runs before anything opens the database normally, so a planted `-wal`
+///   leaves the database untouched and removing it restores service.
+///
+/// Beyond those, recovery *does* write, and the writes are recorded here as
+/// observed behavior rather than as limits:
 ///
 /// - Recovery materializes whatever a companion records, which is not this
 ///   database's own history. Rollback journals are matched by header and page
 ///   checksums with no binding to the adjacent database, so a genuine journal
 ///   lifted from an unrelated database is replayed: measured rewriting a
-///   57344-byte victim to 2711552 bytes holding the source's pages.
-/// - Neither path preserves bytes on rejection, including the path this
-///   function takes when it finds no companion at all. `SQLite` opens a `-wal`
-///   on file existence alone, never consulting the main header, so a planted
-///   WAL is replayed and checkpointed even when the check below skipped it:
-///   measured turning a healthy relay into one rejected on every later open.
-///   Hot-journal replay and stray-journal discard write likewise.
-///
-/// That last case is a pre-existing availability weakness rather than anything
-/// the companion gating introduced — it reproduces identically at ea69c07, and
-/// is tracked separately rather than papered over here.
+///   57344-byte victim to 2711552 bytes holding the source's pages. No
+///   equivalent guard exists for rollback journals, which unlike a `-wal`
+///   beside a rollback-mode header cannot be distinguished from legitimate
+///   crash recovery by inspection.
+/// - A rejected open on the bypass path is not byte-preserving. Hot-journal
+///   replay writes recovered pages into the main database, and closing a
+///   WAL-mode database checkpoints it and removes both companions. Discarding
+///   a stray non-hot journal is the exception: it consumes the companion but
+///   leaves the main database byte-identical.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -651,9 +652,14 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
 /// does mean a planted file can stop the relay from starting, but a refusal
 /// that preserves the data is strictly better than an open that destroys it.
 ///
-/// A relay database is never in WAL mode — `initialize` sets
-/// `journal_mode = DELETE` — so a `-wal` beside a rollback-mode header is
-/// always anomalous and never legitimate recovery state.
+/// The relay never *leaves* a database in WAL mode: `initialize` sets
+/// `journal_mode = DELETE` on every open. It does accept one — a WAL-mode
+/// database opens successfully and is converted back — so this is not a claim
+/// that the header is always rollback-mode. What it does mean is that reaching
+/// rollback-mode is the last thing a relay open does, so a `-wal` that appears
+/// beside a rollback-mode header did not come from this crate and is not
+/// legitimate recovery state. A genuine WAL-mode database with a live `-wal`
+/// has a WAL-mode header and passes this check unharmed.
 ///
 /// The guard covers this crate's open path, not the filesystem. Any other
 /// `SQLite` client that opens the same path while the planted file exists still
