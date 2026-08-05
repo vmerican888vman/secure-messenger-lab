@@ -602,10 +602,20 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 ///   `-shm` files are removed. A rejected WAL-mode open has been measured
 ///   rewriting the main database by megabytes and deleting both companions.
 ///
-/// What the bypass never permits is a *relay-initiated* write. Recovery and
-/// checkpointing only ever materialize the last committed state, and
-/// `validate_schema_for_open` still runs on the recovered image before any
-/// migration, purge, or application write.
+/// Recovery materializes whatever the companion records, which is *not* the
+/// same as this database's own last committed state. A rollback journal is
+/// matched by header and page checksums, not by any binding to the database it
+/// sits beside, so a genuine journal lifted from an unrelated database is
+/// replayed just the same: transplanting one has been measured rewriting a
+/// 57344-byte victim to 2711552 bytes holding the source database's pages.
+/// This confers nothing on an attacker, who must already be able to write the
+/// directory and could overwrite the main database outright.
+///
+/// The guarantee is narrower and is about acceptance rather than bytes on
+/// disk. The bypass never permits a *relay-initiated* write, because
+/// `validate_schema_for_open` still runs on whatever image the normal open
+/// produces, before any migration, purge, or application write. A recovered
+/// image the relay would not otherwise accept is still rejected.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
