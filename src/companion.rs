@@ -95,15 +95,31 @@ pub(crate) fn reject_anomalous_wal(path: &Path) -> Result<()> {
 /// symlink therefore escapes the guard entirely: the guard tests the link name
 /// while `SQLite` uses the target name.
 ///
-/// That escape is a real gap, not a benign one, and an earlier version of this
-/// comment wrongly called it benign on the grounds that a planted WAL's salts
-/// could not match a fresh target. Salts are not consulted. `SQLite` discards a
-/// WAL only when the target has zero pages; once the target holds any page, a
-/// planted WAL is replayed into it — the same mechanism this guard exists to
-/// stop, and one already measured elsewhere in this crate. The escape also
-/// consumes the companion, so the byte-preservation property stated above does
-/// not hold on this path. Resolving the link before deriving companion names
-/// would close it; that is deferred with the wider recovery-boundary work.
+/// That escape is a real gap, but a narrow one, and two earlier versions of
+/// this comment described it wrongly in opposite directions. Measured, with a
+/// positive control proving the fixture replays elsewhere:
+///
+/// The escape needs `canonicalize` to fail AND the guard's companion name to
+/// differ from `SQLite`'s, which requires the *final* path component to be a
+/// symlink — `fs::metadata` resolves intermediate ones, so a symlinked parent
+/// directory diverges not at all. If that symlink's target exists,
+/// `canonicalize` succeeds and the guard resolves correctly. So reaching the
+/// escape implies the target is absent, `SQLite` creates it at zero pages, and
+/// `pagerOpenWalIfPresent` *deletes* a planted WAL rather than opening it. No
+/// foreign content is replayed; that outcome was measured, not assumed.
+///
+/// What is actually lost is the refusal: instead of failing closed, the open
+/// succeeds and silently consumes the orphan companion. The window is exactly
+/// the first create — afterwards the target exists, `canonicalize` succeeds and
+/// the guard applies. The byte-preservation property stated above is not
+/// violated so much as inapplicable, since nothing is refused and no database
+/// bytes exist yet to preserve.
+///
+/// Do not read this as "a planted WAL is replayed through a symlink". That is
+/// true of a target that already holds pages, which is why this guard exists,
+/// and it is not reachable by this escape. Resolving the link before deriving
+/// companion names would close the gap; deferred with the recovery-boundary
+/// work.
 ///
 /// # Errors
 ///

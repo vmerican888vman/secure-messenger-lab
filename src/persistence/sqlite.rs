@@ -924,6 +924,35 @@ mod tests {
         Ok(())
     }
 
+    /// The state-store half of the harmonized absent-database refusal. The
+    /// relay half is pinned by `planted_wal_beside_absent_database_is_refused`
+    /// in `tests/relay_schema_upgrade.rs`; this exists so the shared claim is
+    /// pinned on both routes rather than asserted for one and assumed for the
+    /// other.
+    #[test]
+    fn planted_wal_beside_absent_database_is_refused()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "absent.sqlite");
+        let companion = directory.path().join("absent.sqlite-wal");
+        fs::write(&companion, vec![0xEE_u8; 4096])?;
+        assert!(!path.exists());
+
+        assert!(matches!(
+            ClientStateStore::create(&path, TestProtector::new(57, 58), b"state"),
+            Err(LabError::Storage)
+        ));
+        // Refused without creating anything; the companion is untouched.
+        assert!(!path.exists());
+        assert_eq!(fs::read(&companion)?.len(), 4096);
+
+        // Removing the stray file restores the ability to create.
+        fs::remove_file(&companion)?;
+        let created = ClientStateStore::create(&path, TestProtector::new(57, 58), b"state")?;
+        assert_eq!(created.state()?, b"state");
+        Ok(())
+    }
+
     /// A WAL-mode store with a live `-wal` must still open, covering the state
     /// store's route through the shared guard's pass-through arm.
     ///
