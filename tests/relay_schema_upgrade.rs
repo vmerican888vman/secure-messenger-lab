@@ -783,6 +783,32 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
     Ok(())
 }
 
+/// The pass-through arm of `reject_anomalous_wal`: a genuine WAL-mode database
+/// must still open. Without this, every test reaching that arm goes on to
+/// reject for some other reason, so a guard that refused all WAL-mode databases
+/// would still look green. Also pins that the relay converts it back, which is
+/// what makes a `-wal` beside a rollback-mode header anomalous in the first
+/// place.
+#[test]
+fn wal_mode_database_opens_and_is_converted_back() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("wal-mode-ok.sqlite");
+    drop(Relay::open_at(&database, NOW)?);
+
+    let converter = Connection::open(&database)?;
+    converter.execute_batch("PRAGMA journal_mode = WAL;")?;
+    drop(converter);
+    let header = fs::read(&database)?;
+    assert_eq!((header[18], header[19]), (2, 2));
+
+    // Must open, not be refused by the anomalous-WAL guard.
+    drop(Relay::open_at(&database, NOW)?);
+
+    let after = fs::read(&database)?;
+    assert_eq!((after[18], after[19]), (1, 1));
+    Ok(())
+}
+
 /// Creating a single file beside a healthy relay — with no write access to the
 /// database itself — used to destroy it permanently: `SQLite` opens a `-wal` on
 /// existence alone, so the planted file was replayed and checkpointed in before
