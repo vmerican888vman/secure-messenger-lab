@@ -588,34 +588,30 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 /// rollback journal or WAL exists, the later normal open must recover it before
 /// the authoritative schema validation can inspect a coherent database image.
 ///
-/// The two paths differ in what may be written, and the distinction is
-/// deliberate. Both statements below describe the *end state* of a rejected
-/// open, not merely what precedes validation:
+/// This function makes exactly one guarantee, and it is about *acceptance*,
+/// not about bytes on disk: `validate_schema_for_open` runs on whatever image
+/// the normal open produces, ahead of any migration, purge, or application
+/// write, so an image the relay would not otherwise accept is rejected.
 ///
-/// - No-companion path: the immutable inspection cannot write anything, so a
-///   rejected database and its companions are left byte-identical.
-/// - Bypass path: a rejected open is *not* byte-preserving. `SQLite`'s crash
-///   recovery runs before validation — replaying a hot journal restores
-///   pre-transaction pages into the main database, and a stray non-hot journal
-///   is discarded. Closing the connection afterwards writes again: a WAL-mode
-///   database is checkpointed into the main database and both the `-wal` and
-///   `-shm` files are removed. A rejected WAL-mode open has been measured
-///   rewriting the main database by megabytes and deleting both companions.
+/// Every attempt to state a stronger byte-level property here has been measured
+/// false, so what follows is recorded as observed behavior rather than as a
+/// limit. Do not restate any of it as a guarantee without a test:
 ///
-/// Recovery materializes whatever the companion records, which is *not* the
-/// same as this database's own last committed state. A rollback journal is
-/// matched by header and page checksums, not by any binding to the database it
-/// sits beside, so a genuine journal lifted from an unrelated database is
-/// replayed just the same: transplanting one has been measured rewriting a
-/// 57344-byte victim to 2711552 bytes holding the source database's pages.
-/// This confers nothing on an attacker, who must already be able to write the
-/// directory and could overwrite the main database outright.
+/// - Recovery materializes whatever a companion records, which is not this
+///   database's own history. Rollback journals are matched by header and page
+///   checksums with no binding to the adjacent database, so a genuine journal
+///   lifted from an unrelated database is replayed: measured rewriting a
+///   57344-byte victim to 2711552 bytes holding the source's pages.
+/// - Neither path preserves bytes on rejection, including the path this
+///   function takes when it finds no companion at all. `SQLite` opens a `-wal`
+///   on file existence alone, never consulting the main header, so a planted
+///   WAL is replayed and checkpointed even when the check below skipped it:
+///   measured turning a healthy relay into one rejected on every later open.
+///   Hot-journal replay and stray-journal discard write likewise.
 ///
-/// The guarantee is narrower and is about acceptance rather than bytes on
-/// disk. The bypass never permits a *relay-initiated* write, because
-/// `validate_schema_for_open` still runs on whatever image the normal open
-/// produces, before any migration, purge, or application write. A recovered
-/// image the relay would not otherwise accept is still rejected.
+/// That last case is a pre-existing availability weakness rather than anything
+/// the companion gating introduced — it reproduces identically at ea69c07, and
+/// is tracked separately rather than papered over here.
 fn preflight_existing_database(path: &Path) -> Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -651,14 +647,20 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
 ///   would reject a database that was fully recoverable, so this arm is
 ///   deliberately permissive. `stray_journal_is_discarded_but_target_database_
 ///   is_never_mutated` pins that a non-hot journal really does take this path.
-/// - `-wal`: gated additionally on the main database header being in WAL mode.
-///   A stray WAL beside a rollback-mode database is an artifact rather than
-///   recoverable state, and letting it through would allow a planted file to
-///   turn a read-only inspection into a mutating open.
+/// - `-wal`: gated additionally on the main database header being in WAL mode,
+///   so a WAL beside a rollback-mode database does not route through the
+///   bypass. This gate decides only which path *this* function reports; it does
+///   not stop the file being used. `SQLite` opens a `-wal` on file existence
+///   alone and never consults the main header, so the subsequent normal open
+///   replays a planted WAL either way. Read this arm as bookkeeping, not as a
+///   defense — an earlier version of this comment claimed it prevented a
+///   planted file turning a read-only inspection into a mutating open, and
+///   measurement showed the opposite.
 ///
-/// Permissiveness here is safe because the bypass grants no capability:
+/// Deciding either arm differently changes no outcome the relay accepts:
 /// `validate_schema_for_open` still runs authoritatively on whatever image the
-/// normal open produces.
+/// normal open produces. It does not follow that the on-disk bytes are
+/// preserved; see `preflight_existing_database`.
 ///
 /// Companion names are derived from the fully resolved path because `SQLite`
 /// names its journal after the link target, not the link. Deriving them from an

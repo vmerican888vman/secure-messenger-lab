@@ -783,12 +783,77 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
     Ok(())
 }
 
+/// Pins a pre-existing availability weakness so it cannot be mistaken for a
+/// guarantee. Creating a single file beside a healthy relay — never writing the
+/// database itself — is enough to make every later open fail. The companion
+/// check reports "no companion" here, because the main header is rollback-mode,
+/// yet `SQLite` opens a `-wal` on existence alone, replays it, and checkpoints
+/// the foreign schema in. This reproduces identically at ea69c07, so it is not
+/// something the companion gating introduced.
+///
+/// This test asserts current behavior, not desired behavior. If the planted-WAL
+/// weakness is ever addressed, this test SHOULD fail and be rewritten.
+#[test]
+fn planted_wal_durably_rejects_a_previously_healthy_relay() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+
+    // Attacker prepares a WAL elsewhere carrying a schema the relay rejects.
+    let attacker = directory.path().join("attacker.sqlite");
+    drop(Relay::open_at(&attacker, NOW)?);
+    let staging = Connection::open(&attacker)?;
+    staging.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA wal_autocheckpoint = 0;
+         CREATE TABLE extra_hostile(x);",
+    )?;
+    let planted = fs::read(directory.path().join("attacker.sqlite-wal"))?;
+    // Leaked deliberately: closing would checkpoint and empty the WAL.
+    std::mem::forget(staging);
+    assert!(!planted.is_empty());
+
+    // Victim: a healthy rollback-mode relay that opens cleanly.
+    let victim = directory.path().join("victim.sqlite");
+    drop(Relay::open_at(&victim, NOW)?);
+    drop(Relay::open_at(&victim, NOW)?);
+    let before = fs::read(&victim)?;
+    assert_eq!((before[18], before[19]), (1, 1));
+
+    // The whole attack: create one file. The database is never written.
+    fs::write(directory.path().join("victim.sqlite-wal"), &planted)?;
+
+    assert!(matches!(
+        Relay::open_at(&victim, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+
+    let after = fs::read(&victim)?;
+    assert_ne!(after, before);
+    assert_eq!((after[18], after[19]), (2, 2));
+    let inspector = Connection::open(&victim)?;
+    let hostile = inspector.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'extra_hostile'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    drop(inspector);
+    assert_eq!(hostile, 1);
+
+    // Durable: removing the planted file does not restore service.
+    fs::remove_file(directory.path().join("victim.sqlite-wal")).ok();
+    assert!(Relay::open_at(&victim, NOW).is_err());
+    assert!(Relay::open_at(&victim, NOW).is_err());
+    Ok(())
+}
+
 /// Exercises the WAL arm of the companion bypass, which no other test reaches,
 /// and pins the fact that a rejected open on this path is NOT byte-preserving:
 /// closing the connection checkpoints the recovered WAL into the main database
-/// and removes both companions. Recovery still only materializes committed
-/// state, so this is accepted rather than fixed, but it must not be described
-/// as leaving the database untouched.
+/// and removes both companions. This is accepted rather than fixed, but it must
+/// not be described as leaving the database untouched. Recovery materializes
+/// what the companion records; that it is this database's own committed state
+/// is a property of this fixture, not a guarantee — the WAL case has the same
+/// foreign-content exposure as `foreign_journal_is_replayed_into_an_unrelated_
+/// database` pins for rollback journals.
 #[test]
 fn rejected_wal_open_checkpoints_and_removes_both_companions() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
