@@ -30,9 +30,11 @@ use crate::{LabError, Result};
 /// preserves the data is strictly better than an open that destroys it.
 ///
 /// Neither store *leaves* a database in WAL mode — both set
-/// `journal_mode = DELETE` on every open. Either will still accept one, and
-/// convert it back, so this is not a claim that the header is always
-/// rollback-mode. What it does mean is that an open never *ends* in WAL mode,
+/// `journal_mode = DELETE` on every open that succeeds. Either will still
+/// accept one, and convert it back, so this is not a claim that the header is
+/// always rollback-mode. A *failed* open does leave it: both stores validate
+/// before setting the pragma, so a rejected database keeps its WAL-mode header.
+/// What this does mean is that a SUCCESSFUL open never *ends* in WAL mode,
 /// so a `-wal` beside a rollback-mode header did not come from this crate and
 /// is not legitimate recovery state. That holds because `SQLite` checkpoints
 /// and unlinks the `-wal` before flipping the header out of WAL mode, so a
@@ -40,6 +42,13 @@ use crate::{LabError, Result};
 /// reverse: 1018 crash trials across both directions produced the refused
 /// combination zero times. A genuine WAL-mode database with a live `-wal`
 /// passes this check unharmed.
+///
+/// The two stores diverge on creation, because the relay reaches this guard
+/// through a preflight that returns early when the database is absent while
+/// the state store reaches it from `open_connection` unconditionally. So a
+/// stray non-empty `-wal` beside a path with no database refuses a state-store
+/// create and does not refuse a relay create. Both are fail-closed or harmless
+/// and neither is self-inflicted, since neither store ever enables WAL.
 ///
 /// The guard covers this crate's own open paths, not the filesystem. Any other
 /// `SQLite` client that opens the same path while the planted file exists still

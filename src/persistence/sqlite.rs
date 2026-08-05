@@ -918,9 +918,15 @@ mod tests {
         Ok(())
     }
 
-    /// A WAL-mode store with a live `-wal` must still open. Without this the
-    /// pass-through arm is untested, and a guard that refused every WAL-mode
-    /// database would look green.
+    /// A WAL-mode store with a live `-wal` must still open, covering the state
+    /// store's route through the shared guard's pass-through arm.
+    ///
+    /// The arm itself is not otherwise uncovered: deleting it also fails the
+    /// relay tests `wal_mode_database_with_live_wal_opens_and_recovers` and
+    /// `rejected_wal_open_checkpoints_and_removes_both_companions`, so three
+    /// tests across two targets fail. What this one adds is that the guard is
+    /// reached from `open_connection` and passes for a state-store database,
+    /// which no relay test can show.
     #[test]
     fn wal_mode_state_store_with_live_wal_opens()
     -> std::result::Result<(), Box<dyn std::error::Error>> {
