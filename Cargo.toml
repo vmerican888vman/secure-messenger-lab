@@ -19,6 +19,13 @@ thiserror = "=2.0.19"
 vodozemac = { version = "=0.10.0", default-features = false }
 zeroize = { version = "=1.9.0", default-features = false, features = ["alloc"] }
 
+# vodozemac 0.10.0 with one local patch applied on top of the exact crates.io
+# release: patch 0001 adds `Account::contains_one_time_key`, the reviewed pinned
+# API required by docs/phase2-design-decisions.md section 3. The patch is marked
+# UNREVIEWED until the independent reviewers sign off; see vendor/README.md.
+[patch.crates-io]
+vodozemac = { path = "vendor/vodozemac-0.10.0" }
+
 [profile.release]
 overflow-checks = true
 panic = "abort"
