@@ -23,6 +23,14 @@
 //! limited to internal consistency (`created_at < valid_until`,
 //! `expires_at > accepted_at`, receipt regression rules). Freshness at
 //! load is a façade/platform concern and is documented as a gap.
+//!
+//! The active-session transcript is role-aware (remediation decision after
+//! independent review): for an outbound session it is the verified peer
+//! bundle, for an inbound session it is our own consumed prekey bundle.
+//! See the `ActiveSession` docs in `records.rs` and `check_active_session`
+//! below. A peer binding is mandatory whenever an active session is
+//! present; receipts are always verified against the peer binding's pinned
+//! identity, never the transcript's.
 
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 use vodozemac::{Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
@@ -273,9 +281,10 @@ fn check_pending_prekey(state: &ClientStateV1, account: &Account) -> Result<()> 
 }
 
 /// Peer binding: the stored send public key must be the reconstructed
-/// keypair's public key, the bundle signature must verify under the
-/// bundle's pinned signing identity, and the bundle must equal the active
-/// session's establishment transcript when both are present.
+/// keypair's public key, and the bundle signature must verify under the
+/// bundle's pinned signing identity. The relationship between the binding
+/// and an active session is role-dependent and checked in
+/// `check_active_session`.
 fn check_peer_binding(state: &ClientStateV1) -> Result<()> {
     let Some(binding) = &state.peer_binding else {
         return Ok(());
@@ -289,11 +298,6 @@ fn check_peer_binding(state: &ClientStateV1) -> Result<()> {
         &prekey_signing_bytes(&binding.bundle),
         &binding.bundle.signature,
     )?;
-    if let Some(active) = &state.active_session {
-        if binding.bundle != active.transcript {
-            return Err(LabError::Storage);
-        }
-    }
     Ok(())
 }
 
@@ -351,34 +355,73 @@ fn check_active_session(
         return Err(LabError::Storage);
     }
 
-    // Transcript signature, role, peer identity and one-time key.
-    verify(
-        active.transcript.signing_identity,
-        &prekey_signing_bytes(&active.transcript),
-        &active.transcript.signature,
-    )?;
+    // Role-aware transcript (remediation decision, recorded here and in
+    // records.rs). vodozemac's `SessionKeys.identity_key` is always the
+    // session INITIATOR's long-term curve identity and
+    // `SessionKeys.one_time_key` is always the RECIPIENT's advertised
+    // one-time key. The transcript bundle is therefore interpreted per
+    // role:
+    //
+    // - outbound (we initiated): the transcript is the verified PEER
+    //   bundle. `identity_key` is our own identity, `one_time_key` is the
+    //   peer's advertised key.
+    // - inbound (the peer initiated): the transcript is OUR OWN prekey
+    //   bundle that the peer consumed. `identity_key` is the peer
+    //   initiator's identity, `one_time_key` is our consumed key, which
+    //   must no longer exist in the account.
+    //
+    // Whenever an active session is present, the peer binding (field 14)
+    // MUST be present. For inbound it carries the only peer-identity
+    // binding (`identity_key == binding.curve_identity`); for outbound the
+    // peer-identity binding is the equality of the binding bundle and the
+    // transcript. The receipt is always signed by the PEER, so it is
+    // verified against the binding's pinned identity, not the transcript's
+    // (which for inbound is our own).
+    let binding = state.peer_binding.as_ref().ok_or(LabError::Storage)?;
     match active.role {
         Role::Outbound => {
-            // We initiated: the session identity key is our own curve
-            // identity, the one-time key belongs to the peer's bundle.
-            if keys.identity_key != account.curve25519_key() {
+            // Transcript = the verified peer bundle; its signature verifies
+            // against the pinned peer signing identity over the same
+            // signing-bytes construction used for peer prekeys.
+            verify(
+                active.transcript.signing_identity,
+                &prekey_signing_bytes(&active.transcript),
+                &active.transcript.signature,
+            )?;
+            if keys.identity_key != state.own_curve_identity
+                || keys.one_time_key != active.transcript.one_time_key
+                || binding.bundle != active.transcript
+            {
                 return Err(LabError::Storage);
             }
         }
         Role::Inbound => {
-            // The peer initiated: the session identity key is the peer's
-            // curve identity from the transcript.
-            if keys.identity_key != active.transcript.curve_identity {
+            // Transcript = our own consumed prekey bundle: identities must
+            // be the account's own, the signature must verify against our
+            // own signing identity, the session's one-time key must be the
+            // advertised one, and that consumed key must no longer exist in
+            // the account (otherwise account and session state disagree).
+            if active.transcript.signing_identity != state.own_ed25519_identity
+                || active.transcript.curve_identity != state.own_curve_identity
+            {
+                return Err(LabError::Storage);
+            }
+            verify(
+                active.transcript.signing_identity,
+                &prekey_signing_bytes(&active.transcript),
+                &active.transcript.signature,
+            )?;
+            if keys.one_time_key != active.transcript.one_time_key
+                || keys.identity_key != binding.bundle.curve_identity
+                || account.contains_one_time_key(active.transcript.one_time_key)
+            {
                 return Err(LabError::Storage);
             }
         }
     }
-    if keys.one_time_key != active.transcript.one_time_key {
-        return Err(LabError::Storage);
-    }
 
     check_high_water(active)?;
-    check_receipt(state, account, active)?;
+    check_receipt(state, account, active, binding)?;
     Ok(())
 }
 
@@ -414,6 +457,7 @@ fn check_receipt(
     state: &ClientStateV1,
     account: &Account,
     active: &ActiveSession,
+    binding: &super::records::PeerBinding,
 ) -> Result<()> {
     match &active.receipt {
         None => {
@@ -425,9 +469,13 @@ fn check_receipt(
             Ok(())
         }
         Some(receipt) => {
+            // The receipt is always issued and signed by the PEER, so both
+            // the issuer binding and the signature verification use the
+            // peer binding's pinned identities (for an inbound session the
+            // transcript is our own bundle, not the peer's).
             if receipt.conversation_id != state.conversation_id
                 || receipt.epoch_id != active.epoch_id
-                || receipt.issuer_curve != active.transcript.curve_identity
+                || receipt.issuer_curve != binding.bundle.curve_identity
                 || receipt.acknowledged_sender_curve != account.curve25519_key()
                 || receipt.high_water != active.peer_contiguous_high_water
                 || receipt.high_water > active.last_assigned_send_seq
@@ -435,7 +483,7 @@ fn check_receipt(
                 return Err(LabError::Storage);
             }
             verify(
-                active.transcript.signing_identity,
+                binding.bundle.signing_identity,
                 &receipt_signing_bytes(receipt),
                 &receipt.signature,
             )

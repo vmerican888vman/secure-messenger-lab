@@ -235,6 +235,75 @@ fn mailbox_jsons(mailbox: &MailboxOwner) -> Result<KeypairJsons, Box<dyn Error>>
     ))
 }
 
+/// Everything `assemble_state` needs beyond the account and mailbox.
+struct StateAssembly {
+    conversation_id: ConversationId,
+    registration: MailboxRegistration,
+    pending_prekey: Option<PendingPreKey>,
+    peer_binding: Option<PeerBinding>,
+    active_session: Option<ActiveSession>,
+    inbound: Vec<InboundRecord>,
+    sends: Vec<SendRecord>,
+    acks: Vec<AckIntent>,
+    dedup: Vec<DedupRecord>,
+}
+
+fn assemble_state(
+    account: &Account,
+    mailbox: &MailboxOwner,
+    generation: u64,
+    parts: StateAssembly,
+) -> Result<ClientStateV1, Box<dyn Error>> {
+    let (send_json, receive_json, manage_json) = mailbox_jsons(mailbox)?;
+    Ok(ClientStateV1 {
+        profile_id: [0x11; 16],
+        key_ref: [0x22; 16],
+        generation,
+        conversation_id: parts.conversation_id,
+        account_pickle: Zeroizing::new(serde_json::to_vec(&account.pickle())?),
+        own_ed25519_identity: account.ed25519_key(),
+        own_curve_identity: account.curve25519_key(),
+        mailbox_queue_id: mailbox.queue_id(),
+        send_keypair_json: send_json,
+        receive_keypair_json: receive_json,
+        manage_keypair_json: manage_json,
+        registration: registration_record(&parts.registration),
+        pending_prekey: parts.pending_prekey,
+        peer_binding: parts.peer_binding,
+        active_session: parts.active_session,
+        inbound: parts.inbound,
+        sends: parts.sends,
+        acks: parts.acks,
+        dedup: parts.dedup,
+    })
+}
+
+/// The shared populated-session shape: two pending sends (sequences 1-2),
+/// one terminal send (sequence 3), high water 1, mode `Ready`, receipt.
+fn make_active_session(
+    role: Role,
+    session: &vodozemac::olm::Session,
+    transcript: &PeerBundle,
+    receipt: HighWaterReceipt,
+) -> Result<ActiveSession, Box<dyn Error>> {
+    let keys = session.session_keys();
+    Ok(ActiveSession {
+        role,
+        session_pickle: Zeroizing::new(serde_json::to_vec(&session.pickle())?),
+        identity_key: keys.identity_key,
+        base_key: keys.base_key,
+        one_time_key: keys.one_time_key,
+        transcript: *transcript,
+        epoch_id: epoch_of(keys),
+        last_assigned_send_seq: 3,
+        peer_contiguous_high_water: 1,
+        highest_contiguous_received_seq: 1,
+        mode: SessionMode::Ready,
+        receipt: Some(receipt),
+        received_above_high_water: vec![3],
+    })
+}
+
 /// A fully populated valid state: pending prekey, peer binding, outbound
 /// session with a receipt, one inbound record, three send records (two
 /// `Pending`, one terminal `Stored`), one ACK intent and two dedup records.
@@ -245,7 +314,6 @@ fn populated_fixture() -> Result<Fixture, Box<dyn Error>> {
     let peer_mailbox = MailboxOwner::new();
     let conversation_id = ConversationId::random();
 
-    let registration = our_mailbox.registration(NOW + 3_600);
     let pending_prekey = make_pending_prekey(&mut our_account)?;
     let (peer_bundle, peer_otk) = make_peer_bundle(&mut peer_account)?;
     let mut session = our_account.create_outbound_session(
@@ -255,55 +323,115 @@ fn populated_fixture() -> Result<Fixture, Box<dyn Error>> {
     )?;
 
     let peer_send_keypair = Ed25519Keypair::new();
-    let keys = session.session_keys();
-    let epoch_id = epoch_of(keys);
-    let sends = make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let epoch_id = epoch_of(session.session_keys());
+    let sends =
+        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
-    let (send_json, receive_json, manage_json) = mailbox_jsons(&our_mailbox)?;
+    let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
+    let active_session = make_active_session(Role::Outbound, &session, &peer_bundle, receipt)?;
 
-    let active_session = ActiveSession {
-        role: Role::Outbound,
-        session_pickle: Zeroizing::new(serde_json::to_vec(&session.pickle())?),
-        identity_key: keys.identity_key,
-        base_key: keys.base_key,
-        one_time_key: keys.one_time_key,
-        transcript: peer_bundle,
-        epoch_id,
-        last_assigned_send_seq: 3,
-        peer_contiguous_high_water: 1,
-        highest_contiguous_received_seq: 1,
-        mode: SessionMode::Ready,
-        receipt: Some(signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1)),
-        received_above_high_water: vec![3],
-    };
+    let state = assemble_state(
+        &our_account,
+        &our_mailbox,
+        1,
+        StateAssembly {
+            conversation_id,
+            registration: our_mailbox.registration(NOW + 3_600),
+            pending_prekey: Some(pending_prekey),
+            peer_binding: Some(PeerBinding {
+                bundle: peer_bundle,
+                queue_id: peer_mailbox.queue_id(),
+                send_keypair_json: keypair_json(&peer_send_keypair)?,
+                send_public_key: peer_send_keypair.public_key(),
+            }),
+            active_session: Some(active_session),
+            inbound: vec![inbound],
+            sends,
+            acks: vec![ack],
+            dedup,
+        },
+    )?;
+    Ok(Fixture {
+        state,
+        our_account,
+        peer_account,
+    })
+}
 
-    let state = ClientStateV1 {
-        profile_id: [0x11; 16],
-        key_ref: [0x22; 16],
-        generation: 1,
-        conversation_id,
-        account_pickle: Zeroizing::new(serde_json::to_vec(&our_account.pickle())?),
-        own_ed25519_identity: our_account.ed25519_key(),
-        own_curve_identity: our_account.curve25519_key(),
-        mailbox_queue_id: our_mailbox.queue_id(),
-        send_keypair_json: send_json,
-        receive_keypair_json: receive_json,
-        manage_keypair_json: manage_json,
-        registration: registration_record(&registration),
-        pending_prekey: Some(pending_prekey),
-        peer_binding: Some(PeerBinding {
-            bundle: peer_bundle,
-            queue_id: peer_mailbox.queue_id(),
-            send_keypair_json: keypair_json(&peer_send_keypair)?,
-            send_public_key: peer_send_keypair.public_key(),
-        }),
-        active_session: Some(active_session),
-        inbound: vec![inbound],
-        sends,
-        acks: vec![ack],
-        dedup,
+/// A fully populated valid state with a GENUINE inbound session: the peer
+/// created a real outbound session against our real published one-time key
+/// and we accepted the real pre-key message with `create_inbound_session`.
+/// The session transcript is our own consumed prekey bundle.
+fn inbound_fixture() -> Result<Fixture, Box<dyn Error>> {
+    let mut our_account = Account::new();
+    let mut peer_account = Account::new();
+    let our_mailbox = MailboxOwner::new();
+    let peer_mailbox = MailboxOwner::new();
+    let conversation_id = ConversationId::random();
+
+    // Our advertised prekey bundle becomes the session transcript.
+    let transcript = make_pending_prekey(&mut our_account)?.bundle();
+    let consumed_otk = transcript.one_time_key;
+
+    // The peer creates a real outbound session against our published key;
+    // we accept the real pre-key message, consuming the key.
+    let mut peer_session = peer_account.create_outbound_session(
+        SessionConfig::version_1(),
+        our_account.curve25519_key(),
+        consumed_otk,
+    )?;
+    let first_message = peer_session.encrypt(b"session bootstrap")?;
+    let OlmMessage::PreKey(pre_key_message) = first_message else {
+        return Err("first message must be a pre-key message".into());
     };
+    let creation = our_account.create_inbound_session(
+        SessionConfig::version_1(),
+        peer_account.curve25519_key(),
+        &pre_key_message,
+    )?;
+    let mut session = creation.session;
+    assert!(!our_account.contains_one_time_key(consumed_otk));
+
+    // Pin the vodozemac initiator/recipient semantics this fixture and the
+    // role-aware validation rely on.
+    let keys = session.session_keys();
+    assert_eq!(keys.identity_key, peer_account.curve25519_key());
+    assert_eq!(keys.one_time_key, consumed_otk);
+
+    let (peer_bundle, _) = make_peer_bundle(&mut peer_account)?;
+    let peer_send_keypair = Ed25519Keypair::new();
+    let epoch_id = epoch_of(keys);
+    let sends =
+        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let inbound_id = sends.first().ok_or("no sends")?.message_id;
+    let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
+    // A second, unconsumed one-time key backs the pending-prekey field.
+    let pending_prekey = make_pending_prekey(&mut our_account)?;
+    let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
+    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt)?;
+
+    let state = assemble_state(
+        &our_account,
+        &our_mailbox,
+        1,
+        StateAssembly {
+            conversation_id,
+            registration: our_mailbox.registration(NOW + 3_600),
+            pending_prekey: Some(pending_prekey),
+            peer_binding: Some(PeerBinding {
+                bundle: peer_bundle,
+                queue_id: peer_mailbox.queue_id(),
+                send_keypair_json: keypair_json(&peer_send_keypair)?,
+                send_public_key: peer_send_keypair.public_key(),
+            }),
+            active_session: Some(active_session),
+            inbound: vec![inbound],
+            sends,
+            acks: vec![ack],
+            dedup,
+        },
+    )?;
     Ok(Fixture {
         state,
         our_account,
@@ -318,8 +446,6 @@ fn minimal_fixture() -> Result<Fixture, Box<dyn Error>> {
     let our_account = Account::new();
     let peer_account = Account::new();
     let our_mailbox = MailboxOwner::new();
-    let registration = our_mailbox.registration(NOW + 3_600);
-    let keypairs = our_mailbox.serialized_private_material();
     let dedup = DedupRecord {
         message_id: MessageId::from_slice(&[0x55; 16]).ok_or("bad test id")?,
         epoch_id: digest(b"old-epoch"),
@@ -329,35 +455,22 @@ fn minimal_fixture() -> Result<Fixture, Box<dyn Error>> {
         expires_at: NOW + 3_600,
         state: DedupState::Expired,
     };
-    let state = ClientStateV1 {
-        profile_id: [0x33; 16],
-        key_ref: [0x44; 16],
-        generation: 9,
-        conversation_id: ConversationId::random(),
-        account_pickle: Zeroizing::new(serde_json::to_vec(&our_account.pickle())?),
-        own_ed25519_identity: our_account.ed25519_key(),
-        own_curve_identity: our_account.curve25519_key(),
-        mailbox_queue_id: our_mailbox.queue_id(),
-        send_keypair_json: Zeroizing::new(keypairs.first().ok_or("send keypair")?.clone()),
-        receive_keypair_json: Zeroizing::new(keypairs.get(1).ok_or("receive keypair")?.clone()),
-        manage_keypair_json: Zeroizing::new(keypairs.get(2).ok_or("manage keypair")?.clone()),
-        registration: RegistrationRecord {
-            queue_id: registration.queue_id,
-            send_key: registration.send_key,
-            receive_key: registration.receive_key,
-            manage_key: registration.manage_key,
-            nonce: registration.nonce,
-            valid_until: registration.valid_until,
-            signature: registration.signature,
+    let state = assemble_state(
+        &our_account,
+        &our_mailbox,
+        9,
+        StateAssembly {
+            conversation_id: ConversationId::random(),
+            registration: our_mailbox.registration(NOW + 3_600),
+            pending_prekey: None,
+            peer_binding: None,
+            active_session: None,
+            inbound: Vec::new(),
+            sends: Vec::new(),
+            acks: Vec::new(),
+            dedup: vec![dedup],
         },
-        pending_prekey: None,
-        peer_binding: None,
-        active_session: None,
-        inbound: Vec::new(),
-        sends: Vec::new(),
-        acks: Vec::new(),
-        dedup: vec![dedup],
-    };
+    )?;
     Ok(Fixture {
         state,
         our_account,
@@ -1271,8 +1384,11 @@ fn active_session_cross_checks() -> Result<(), Box<dyn Error>> {
     active.epoch_id[0] ^= 0x01;
     assert!(fixture.state.encode().is_err());
 
-    // Role must match the session keys: relabeling our outbound session
-    // as inbound makes the identity key the peer's, which it is not.
+    // Relabeling an outbound session as inbound must fail: an inbound
+    // transcript must be our own bundle signed by our own identity, but
+    // this transcript is the peer's bundle. (A genuine inbound session is
+    // covered by `genuine_inbound_session_round_trips_byte_identically`
+    // and the inbound negative tests below.)
     let mut fixture = populated_fixture()?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.role = Role::Inbound;
@@ -1518,5 +1634,168 @@ fn received_set_gap_rules_enforced() -> Result<(), Box<dyn Error>> {
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.received_above_high_water = (3..=67).collect();
     assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+// --- role-aware transcript (remediation regression tests) ------------------
+
+/// The reviewers' reproduction, now passing: a genuine inbound session
+/// (peer initiated against our real published one-time key; we accepted
+/// the real pre-key message) encodes, validates and round-trips
+/// byte-identically.
+#[test]
+fn genuine_inbound_session_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
+    let fixture = inbound_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    let reencoded = decoded.encode()?;
+    assert_eq!(&encoded[..], &reencoded[..]);
+    Ok(())
+}
+
+#[test]
+fn inbound_transcript_otk_must_match_session_keys() -> Result<(), Box<dyn Error>> {
+    let mut fixture = inbound_fixture()?;
+    // A foreign key our account never held, re-signed by us, so only the
+    // `session_keys.one_time_key` mismatch can fail validation.
+    let foreign = *fixture
+        .peer_account
+        .generate_one_time_keys(1)
+        .created
+        .first()
+        .ok_or("no foreign key")?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.transcript.one_time_key = foreign;
+    active.transcript.signature =
+        fixture.our_account.sign(prekey_signing_bytes(&active.transcript));
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+#[test]
+fn inbound_consumed_otk_must_not_remain_in_account() -> Result<(), Box<dyn Error>> {
+    let mut our_account = Account::new();
+    let mut peer_account = Account::new();
+    let our_mailbox = MailboxOwner::new();
+    let peer_mailbox = MailboxOwner::new();
+    let conversation_id = ConversationId::random();
+
+    let transcript = make_pending_prekey(&mut our_account)?.bundle();
+    let consumed_otk = transcript.one_time_key;
+    // Account snapshot taken BEFORE consumption; the session is after.
+    let stale_pickle = Zeroizing::new(serde_json::to_vec(&our_account.pickle())?);
+
+    let mut peer_session = peer_account.create_outbound_session(
+        SessionConfig::version_1(),
+        our_account.curve25519_key(),
+        consumed_otk,
+    )?;
+    let first_message = peer_session.encrypt(b"session bootstrap")?;
+    let OlmMessage::PreKey(pre_key_message) = first_message else {
+        return Err("first message must be a pre-key message".into());
+    };
+    let creation = our_account.create_inbound_session(
+        SessionConfig::version_1(),
+        peer_account.curve25519_key(),
+        &pre_key_message,
+    )?;
+    let mut session = creation.session;
+
+    // Sanity: the stale snapshot still holds the consumed key.
+    let stale_account =
+        Account::from_pickle(serde_json::from_slice::<vodozemac::olm::AccountPickle>(
+            &stale_pickle,
+        )?);
+    assert!(stale_account.contains_one_time_key(consumed_otk));
+
+    let (peer_bundle, _) = make_peer_bundle(&mut peer_account)?;
+    let peer_send_keypair = Ed25519Keypair::new();
+    let epoch_id = epoch_of(session.session_keys());
+    let sends =
+        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let inbound_id = sends.first().ok_or("no sends")?.message_id;
+    let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
+    let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
+    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt)?;
+
+    let mut state = assemble_state(
+        &our_account,
+        &our_mailbox,
+        1,
+        StateAssembly {
+            conversation_id,
+            registration: our_mailbox.registration(NOW + 3_600),
+            pending_prekey: None,
+            peer_binding: Some(PeerBinding {
+                bundle: peer_bundle,
+                queue_id: peer_mailbox.queue_id(),
+                send_keypair_json: keypair_json(&peer_send_keypair)?,
+                send_public_key: peer_send_keypair.public_key(),
+            }),
+            active_session: Some(active_session),
+            inbound: vec![inbound],
+            sends,
+            acks: vec![ack],
+            dedup,
+        },
+    )?;
+    state.account_pickle = stale_pickle;
+    assert!(state.encode().is_err());
+    Ok(())
+}
+
+#[test]
+fn inbound_transcript_signature_must_verify_with_own_identity() -> Result<(), Box<dyn Error>> {
+    // Flipped signature byte.
+    let mut fixture = inbound_fixture()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.transcript.signature = flip_signature(active.transcript.signature)?;
+    assert!(fixture.state.encode().is_err());
+
+    // Impostor transcript signed by the PEER: the signature verifies
+    // against the bundle's own identity, but that identity is not ours.
+    let mut fixture = inbound_fixture()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.transcript.signing_identity = fixture.peer_account.ed25519_key();
+    active.transcript.signature =
+        fixture.peer_account.sign(prekey_signing_bytes(&active.transcript));
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+#[test]
+fn session_requires_peer_binding_for_either_role() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    fixture.state.peer_binding = None;
+    assert!(fixture.state.encode().is_err(), "outbound without binding");
+
+    let mut fixture = inbound_fixture()?;
+    fixture.state.peer_binding = None;
+    assert!(fixture.state.encode().is_err(), "inbound without binding");
+    Ok(())
+}
+
+#[test]
+fn session_identity_must_match_peer_binding_curve_for_either_role() -> Result<(), Box<dyn Error>> {
+    for use_inbound in [false, true] {
+        let mut fixture = if use_inbound {
+            inbound_fixture()?
+        } else {
+            populated_fixture()?
+        };
+        // Replace the bound peer curve identity with an impostor's and
+        // re-sign the bundle under the peer's pinned signing identity, so
+        // the bundle itself still verifies and only the session-identity
+        // binding can fail.
+        let impostor = Account::new();
+        let binding = fixture.state.peer_binding.as_mut().ok_or("no binding")?;
+        binding.bundle.curve_identity = impostor.curve25519_key();
+        binding.bundle.signature =
+            fixture.peer_account.sign(prekey_signing_bytes(&binding.bundle));
+        assert!(
+            fixture.state.encode().is_err(),
+            "impostor binding curve accepted (inbound={use_inbound})"
+        );
+    }
     Ok(())
 }

@@ -23,6 +23,39 @@ the frozen design that is not documented as a deviation.
   invariants it cites.
 - `src/state/tests.rs` — 49 tests, including fixtures built from real vodozemac operations.
 
+## Remediation history
+
+Version 1 of this leg (head `a630f9a7b8b7c379330332d48e87239651944fb6`) was
+independently RETURNED by both reviewers with the identical blocking finding:
+the active-session transcript model assumed the session's identity and OTK
+always belong to the peer bundle, which is false for genuine inbound sessions
+(verdicts in `reviews/REVIEW-fable-client-state-codec.md` and
+`reviews/REVIEW-sol-client-state-codec.md`). The amended head under review
+makes the transcript role-aware. Confirm you are reviewing the amended model,
+not the returned one.
+
+The amended model (vodozemac's `SessionKeys.identity_key` is always the
+INITIATOR's identity; `SessionKeys.one_time_key` is always the RECIPIENT's
+advertised key — verified against `vendor/vodozemac-0.10.0/src/olm/session_keys.rs`
+and both `create_*_session` constructors):
+
+- **outbound (we initiated):** transcript = the verified peer bundle;
+  signature verifies with the peer's pinned identity; `identity_key` == our
+  own curve identity; `one_time_key` == peer's advertised OTK; peer binding
+  bundle == transcript bundle (whole-bundle equality).
+- **inbound (peer initiated):** transcript = our own consumed prekey bundle;
+  identities == our stored own identities; signature verifies with our own
+  signing identity; `one_time_key` == our consumed OTK, which must NOT still
+  exist in the account (`contains_one_time_key` must be false);
+  `identity_key` == peer binding's curve identity (the only peer-identity
+  binding).
+- **both roles:** peer binding (field 14) is mandatory when an active session
+  is present; the high-water receipt is always peer-signed, so it verifies
+  against the peer binding's pinned identity (not the transcript's).
+- A genuine inbound-session regression fixture
+  (`genuine_inbound_session_round_trips_byte_identically`) now exists, built
+  from real vodozemac session establishment in both directions.
+
 ## Documented decisions taken within the frozen constraints (attack these)
 
 1. Nested object-type IDs 0x0002–0x0009 and per-object field layouts as written in code — the
@@ -34,7 +67,8 @@ the frozen design that is not documented as a deviation.
 5. Send-array bound 32 applies to the whole array including terminal records (stricter than the
    table row).
 6. Receipt present ⇒ `receipt.high_water == peer_contiguous_high_water`; receipt absent ⇒ high
-   water must be 0.
+   water must be 0. The receipt verifies against the peer binding's pinned identity for both
+   roles (it is always peer-signed; the inbound transcript is our own bundle).
 7. Every inbound record and ACK intent requires a matching dedup record (message ID, epoch,
    sequence, queue, digest); the converse is not required. Dedup epochs may reference retired
    epochs (§4 retention); session absence ⇒ inbound/send/ACK arrays empty, dedup allowed.

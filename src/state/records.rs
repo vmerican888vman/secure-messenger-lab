@@ -334,6 +334,31 @@ impl HighWaterReceipt {
 /// Optional active session (object type `0x0005`): role, canonical pickle,
 /// all three `SessionKeys`, establishment transcript, epoch ID, sequence
 /// and high-water state, mode, receipt, and the out-of-order received set.
+///
+/// **The transcript is role-aware** (remediation decision after review:
+/// the earlier single interpretation was wrong for inbound sessions).
+/// vodozemac's `SessionKeys.identity_key` is always the session
+/// INITIATOR's long-term curve identity and `SessionKeys.one_time_key` is
+/// always the RECIPIENT's advertised one-time key, so the same five
+/// transcript sub-fields (fields 6-10: signing identity, curve identity,
+/// one-time key, `valid_until`, signature — wire layout unchanged) are
+/// interpreted per role:
+///
+/// - `Role::Outbound` (we initiated): the transcript is the verified
+///   **peer** bundle. `session_keys.identity_key` is our own identity;
+///   `session_keys.one_time_key` must equal the transcript's advertised
+///   key; the transcript signature verifies against the pinned peer
+///   signing identity.
+/// - `Role::Inbound` (the peer initiated): the transcript is **our own**
+///   prekey bundle that the peer consumed to establish the session.
+///   `session_keys.identity_key` is the peer initiator's identity (bound
+///   via the peer binding, which is mandatory whenever a session is
+///   present); `session_keys.one_time_key` must equal the transcript's
+///   key, which must no longer exist in the account; the transcript
+///   signature verifies against our own signing identity.
+///
+/// `session_keys.base_key` is not cross-checked for either role: it is the
+/// initiator's ephemeral base key, for which no stored reference exists.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
