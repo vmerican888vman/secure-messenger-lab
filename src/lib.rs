@@ -12,6 +12,7 @@ pub mod ids;
 pub mod persistence;
 mod private_store_dir;
 pub mod relay;
+mod state;
 
 pub use capability::{
     MailboxOwner, MailboxRegistration, ManageCapability, ReceiveCapability, SendCapability,

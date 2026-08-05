@@ -1,0 +1,558 @@
+//! Semantic validation for `ClientStateV1` (design section 3's long
+//! paragraph plus the section 4 high-water invariants). Runs after
+//! structural decoding and before any caller sees the state; `encode`
+//! re-runs it so an invalid in-memory state can never be serialized.
+//!
+//! Signature byte constructions replicated here (the originals are private
+//! to `src/client.rs` / `src/capability.rs`; the canonical length-prefixed
+//! framer `capability::canonical` is shared):
+//!
+//! - peer bundle: action `peer-prekey`, parts signing identity, curve
+//!   identity, one-time key, `valid_until` — identical to
+//!   `peer_prekey_signing_bytes` in `src/client.rs`.
+//! - send request: action `send`, parts queue, message ID, packet digest,
+//!   `expires_at` — identical to `send_signing_bytes` in
+//!   `src/capability.rs`.
+//! - high-water receipt: action `session-high-water/v1`, parts version
+//!   byte, conversation ID, epoch ID, acknowledged sender curve, issuer
+//!   curve, high water. Section 4 fixes the domain and the carried fields;
+//!   the part order within the canonical frame is this slice's choice
+//!   (no prior construction exists to replicate).
+//!
+//! No wall-clock `now` is available to a pure codec, so expiry checks are
+//! limited to internal consistency (`created_at < valid_until`,
+//! `expires_at > accepted_at`, receipt regression rules). Freshness at
+//! load is a façade/platform concern and is documented as a gap.
+
+use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
+use vodozemac::{Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
+use zeroize::Zeroizing;
+
+use super::records::{
+    ActiveSession, HighWaterReceipt, PeerBundle, RECEIPT_VERSION, Role, SessionMode,
+};
+use super::tlv::canonical_json;
+use super::{
+    ClientStateV1, MAX_ACCOUNT_PICKLE, MAX_ACKS, MAX_BODY, MAX_DEDUP, MAX_INBOUND,
+    MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS, MAX_SESSION_PICKLE,
+};
+use crate::capability::{canonical, digest};
+use crate::ids::{MessageId, QueueId};
+use crate::{LabError, MailboxRegistration, Result};
+
+const PREKEY_ACTION: &[u8] = b"peer-prekey";
+const SEND_ACTION: &[u8] = b"send";
+const RECEIPT_ACTION: &[u8] = b"session-high-water/v1";
+
+/// Section 4 budget: 24 application advances, 8 reserved control
+/// advances, 32 absolute maximum; more is malformed and rejected on load.
+const MAX_OUTSTANDING: u64 = 32;
+const CONTROL_ONLY_THRESHOLD: u64 = 24;
+
+/// Canonical length-prefixed signing bytes for a peer bundle; identical
+/// construction to `peer_prekey_signing_bytes` in `src/client.rs`.
+pub(super) fn prekey_signing_bytes(bundle: &PeerBundle) -> Vec<u8> {
+    canonical(
+        PREKEY_ACTION,
+        &[
+            bundle.signing_identity.as_bytes(),
+            bundle.curve_identity.as_bytes(),
+            bundle.one_time_key.as_bytes(),
+            &bundle.valid_until.to_be_bytes(),
+        ],
+    )
+}
+
+pub(super) fn send_signing_bytes(
+    queue_id: QueueId,
+    message_id: MessageId,
+    packet_digest: &[u8; 32],
+    expires_at: u64,
+) -> Vec<u8> {
+    canonical(
+        SEND_ACTION,
+        &[
+            queue_id.as_bytes(),
+            message_id.as_bytes(),
+            packet_digest,
+            &expires_at.to_be_bytes(),
+        ],
+    )
+}
+
+pub(super) fn receipt_signing_bytes(receipt: &HighWaterReceipt) -> Vec<u8> {
+    canonical(
+        RECEIPT_ACTION,
+        &[
+            &[RECEIPT_VERSION],
+            receipt.conversation_id.as_bytes(),
+            &receipt.epoch_id,
+            receipt.acknowledged_sender_curve.as_bytes(),
+            receipt.issuer_curve.as_bytes(),
+            &receipt.high_water.to_be_bytes(),
+        ],
+    )
+}
+
+fn verify(
+    key: Ed25519PublicKey,
+    message: &[u8],
+    signature: &Ed25519Signature,
+) -> Result<()> {
+    key.verify(message, signature).map_err(|_| LabError::Storage)
+}
+
+pub(super) fn validate(state: &ClientStateV1) -> Result<()> {
+    check_structure(state)?;
+    let account = check_account(state)?;
+    check_mailbox(state)?;
+    check_registration(state)?;
+    check_pending_prekey(state, &account)?;
+    check_peer_binding(state)?;
+    check_records(state, &account)?;
+    Ok(())
+}
+
+/// Re-check the structural invariants on the encode path: array bounds
+/// and ordering, send-record arm consistency, and every variable-length
+/// bound. (The decode path enforces these during parsing.)
+fn check_structure(state: &ClientStateV1) -> Result<()> {
+    check_sorted(&state.inbound, MAX_INBOUND, |record| record.message_id)?;
+    check_sorted(&state.sends, MAX_SENDS, |record| record.message_id)?;
+    check_sorted(&state.acks, MAX_ACKS, |record| record.message_id)?;
+    check_sorted(&state.dedup, MAX_DEDUP, |record| record.message_id)?;
+    for send in &state.sends {
+        if !send.arms_consistent() {
+            return Err(LabError::Storage);
+        }
+        if let Some(packet) = &send.packet {
+            let length = packet.as_bytes().len();
+            if length == 0 || length > MAX_PACKET {
+                return Err(LabError::Storage);
+            }
+        }
+    }
+    for record in &state.inbound {
+        if record.body.len() > MAX_BODY {
+            return Err(LabError::Storage);
+        }
+    }
+    if state.account_pickle.len() > MAX_ACCOUNT_PICKLE {
+        return Err(LabError::Storage);
+    }
+    for json in [
+        &state.send_keypair_json,
+        &state.receive_keypair_json,
+        &state.manage_keypair_json,
+    ] {
+        if json.len() > MAX_KEYPAIR_JSON {
+            return Err(LabError::Storage);
+        }
+    }
+    if let Some(binding) = &state.peer_binding {
+        if binding.send_keypair_json.len() > MAX_KEYPAIR_JSON {
+            return Err(LabError::Storage);
+        }
+    }
+    if let Some(active) = &state.active_session {
+        if active.session_pickle.len() > MAX_SESSION_PICKLE {
+            return Err(LabError::Storage);
+        }
+        let received = &active.received_above_high_water;
+        if received.len() > MAX_RECEIVED_SET {
+            return Err(LabError::Storage);
+        }
+        for pair in received.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(LabError::Storage);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_sorted<T>(
+    items: &[T],
+    bound: usize,
+    id_of: impl Fn(&T) -> MessageId,
+) -> Result<()> {
+    if items.len() > bound {
+        return Err(LabError::Storage);
+    }
+    for pair in items.windows(2) {
+        if id_of(&pair[0]).as_bytes() >= id_of(&pair[1]).as_bytes() {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+/// Canonical `Account` pickle, re-pickle byte equality, and the stored
+/// own public identity against the reconstructed account.
+fn check_account(state: &ClientStateV1) -> Result<Account> {
+    let pickle: AccountPickle = canonical_json(&state.account_pickle, MAX_ACCOUNT_PICKLE)?;
+    let account = Account::from_pickle(pickle);
+    let reencoded = serde_json::to_vec(&account.pickle()).map_err(|_| LabError::Storage)?;
+    if reencoded != state.account_pickle[..] {
+        return Err(LabError::Storage);
+    }
+    if account.ed25519_key() != state.own_ed25519_identity
+        || account.curve25519_key() != state.own_curve_identity
+    {
+        return Err(LabError::Storage);
+    }
+    Ok(account)
+}
+
+/// The three reconstructed capability public keys must match the
+/// registration intent, and the mailbox queue must be the registered one.
+fn check_mailbox(state: &ClientStateV1) -> Result<()> {
+    let send = keypair(&state.send_keypair_json)?;
+    let receive = keypair(&state.receive_keypair_json)?;
+    let manage = keypair(&state.manage_keypair_json)?;
+    if send.public_key() != state.registration.send_key
+        || receive.public_key() != state.registration.receive_key
+        || manage.public_key() != state.registration.manage_key
+    {
+        return Err(LabError::Storage);
+    }
+    if state.mailbox_queue_id != state.registration.queue_id {
+        return Err(LabError::Storage);
+    }
+    Ok(())
+}
+
+fn keypair(json: &Zeroizing<Vec<u8>>) -> Result<Ed25519Keypair> {
+    canonical_json(json, MAX_KEYPAIR_JSON)
+}
+
+/// The registration management signature must verify over the exact
+/// intent and current request (queue, keys, nonce, expiry).
+fn check_registration(state: &ClientStateV1) -> Result<()> {
+    let record = &state.registration;
+    let registration = MailboxRegistration {
+        queue_id: record.queue_id,
+        send_key: record.send_key,
+        receive_key: record.receive_key,
+        manage_key: record.manage_key,
+        nonce: record.nonce,
+        valid_until: record.valid_until,
+        signature: record.signature,
+    };
+    verify(
+        record.manage_key,
+        &registration.signing_bytes(),
+        &record.signature,
+    )
+}
+
+/// Pending prekey: identities must be the account's own, the signature
+/// must verify, and the exact published one-time key's private part must
+/// still exist in the account (pinned `Account::contains_one_time_key`).
+fn check_pending_prekey(state: &ClientStateV1, account: &Account) -> Result<()> {
+    let Some(prekey) = &state.pending_prekey else {
+        return Ok(());
+    };
+    if prekey.signing_identity != account.ed25519_key()
+        || prekey.curve_identity != account.curve25519_key()
+    {
+        return Err(LabError::Storage);
+    }
+    if prekey.created_at >= prekey.valid_until {
+        return Err(LabError::Storage);
+    }
+    verify(
+        prekey.signing_identity,
+        &prekey_signing_bytes(&prekey.bundle()),
+        &prekey.signature,
+    )?;
+    if !account.contains_one_time_key(prekey.one_time_key) {
+        return Err(LabError::Storage);
+    }
+    Ok(())
+}
+
+/// Peer binding: the stored send public key must be the reconstructed
+/// keypair's public key, the bundle signature must verify under the
+/// bundle's pinned signing identity, and the bundle must equal the active
+/// session's establishment transcript when both are present.
+fn check_peer_binding(state: &ClientStateV1) -> Result<()> {
+    let Some(binding) = &state.peer_binding else {
+        return Ok(());
+    };
+    let keypair = keypair(&binding.send_keypair_json)?;
+    if keypair.public_key() != binding.send_public_key {
+        return Err(LabError::Storage);
+    }
+    verify(
+        binding.bundle.signing_identity,
+        &prekey_signing_bytes(&binding.bundle),
+        &binding.bundle.signature,
+    )?;
+    if let Some(active) = &state.active_session {
+        if binding.bundle != active.transcript {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+/// Session presence/absence rules and all record cross-checks.
+fn check_records(state: &ClientStateV1, account: &Account) -> Result<()> {
+    let Some(active) = &state.active_session else {
+        // Session absence requires all session-dependent records absent.
+        // Dedup records are not session-dependent: section 4 retains them
+        // through their safety window across rekey, including while no
+        // session is installed.
+        if !state.inbound.is_empty() || !state.sends.is_empty() || !state.acks.is_empty() {
+            return Err(LabError::Storage);
+        }
+        check_dedup(state)?;
+        return Ok(());
+    };
+    check_active_session(state, account, active)?;
+    check_inbound(state, active)?;
+    check_sends(state, active)?;
+    check_acks(state, active)?;
+    check_dedup(state)?;
+    Ok(())
+}
+
+fn check_active_session(
+    state: &ClientStateV1,
+    account: &Account,
+    active: &ActiveSession,
+) -> Result<()> {
+    // Canonical session pickle; re-pickle byte equality; config version 1.
+    let pickle: SessionPickle = canonical_json(&active.session_pickle, MAX_SESSION_PICKLE)?;
+    let session = Session::from_pickle(pickle);
+    let reencoded = serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?;
+    if reencoded != active.session_pickle[..] {
+        return Err(LabError::Storage);
+    }
+    if session.session_config().version() != super::SESSION_CONFIG_VERSION {
+        return Err(LabError::Storage);
+    }
+
+    // `session_keys()` must equal the stored establishment keys, and the
+    // epoch ID is `SHA-256(identity_key || base_key || one_time_key)`.
+    let keys = session.session_keys();
+    if keys.identity_key != active.identity_key
+        || keys.base_key != active.base_key
+        || keys.one_time_key != active.one_time_key
+    {
+        return Err(LabError::Storage);
+    }
+    let mut epoch_preimage = Vec::with_capacity(96);
+    epoch_preimage.extend_from_slice(keys.identity_key.as_bytes());
+    epoch_preimage.extend_from_slice(keys.base_key.as_bytes());
+    epoch_preimage.extend_from_slice(keys.one_time_key.as_bytes());
+    if digest(&epoch_preimage) != active.epoch_id {
+        return Err(LabError::Storage);
+    }
+
+    // Transcript signature, role, peer identity and one-time key.
+    verify(
+        active.transcript.signing_identity,
+        &prekey_signing_bytes(&active.transcript),
+        &active.transcript.signature,
+    )?;
+    match active.role {
+        Role::Outbound => {
+            // We initiated: the session identity key is our own curve
+            // identity, the one-time key belongs to the peer's bundle.
+            if keys.identity_key != account.curve25519_key() {
+                return Err(LabError::Storage);
+            }
+        }
+        Role::Inbound => {
+            // The peer initiated: the session identity key is the peer's
+            // curve identity from the transcript.
+            if keys.identity_key != active.transcript.curve_identity {
+                return Err(LabError::Storage);
+            }
+        }
+    }
+    if keys.one_time_key != active.transcript.one_time_key {
+        return Err(LabError::Storage);
+    }
+
+    check_high_water(active)?;
+    check_receipt(state, account, active)?;
+    Ok(())
+}
+
+/// Section 4 high-water invariants and mode consistency.
+fn check_high_water(active: &ActiveSession) -> Result<()> {
+    if active.peer_contiguous_high_water > active.last_assigned_send_seq {
+        return Err(LabError::Storage);
+    }
+    let outstanding = active.last_assigned_send_seq - active.peer_contiguous_high_water;
+    if outstanding > MAX_OUTSTANDING {
+        return Err(LabError::Storage);
+    }
+    if outstanding == MAX_OUTSTANDING && active.mode != SessionMode::ReceiptLocked {
+        return Err(LabError::Storage);
+    }
+    if (CONTROL_ONLY_THRESHOLD..MAX_OUTSTANDING).contains(&outstanding)
+        && !matches!(active.mode, SessionMode::ControlOnly | SessionMode::ReceiptLocked)
+    {
+        return Err(LabError::Storage);
+    }
+    // Every out-of-order received sequence must sit strictly above the
+    // implied contiguous high water; an element exactly at `hcr + 1` would
+    // have advanced the contiguous high water, so it is a gap inconsistency.
+    for &sequence in &active.received_above_high_water {
+        if sequence <= active.highest_contiguous_received_seq.saturating_add(1) {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+fn check_receipt(
+    state: &ClientStateV1,
+    account: &Account,
+    active: &ActiveSession,
+) -> Result<()> {
+    match &active.receipt {
+        None => {
+            // The high water only ever advances through a receipt, so a
+            // nonzero high water without the latest receipt is malformed.
+            if active.peer_contiguous_high_water != 0 {
+                return Err(LabError::Storage);
+            }
+            Ok(())
+        }
+        Some(receipt) => {
+            if receipt.conversation_id != state.conversation_id
+                || receipt.epoch_id != active.epoch_id
+                || receipt.issuer_curve != active.transcript.curve_identity
+                || receipt.acknowledged_sender_curve != account.curve25519_key()
+                || receipt.high_water != active.peer_contiguous_high_water
+                || receipt.high_water > active.last_assigned_send_seq
+            {
+                return Err(LabError::Storage);
+            }
+            verify(
+                active.transcript.signing_identity,
+                &receipt_signing_bytes(receipt),
+                &receipt.signature,
+            )
+        }
+    }
+}
+
+fn check_inbound(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    for record in &state.inbound {
+        if record.epoch_id != active.epoch_id
+            || record.queue_id != state.mailbox_queue_id
+            || record.sender_sequence == 0
+            || record.expires_at <= record.accepted_at
+        {
+            return Err(LabError::Storage);
+        }
+        // An accepted sequence above the contiguous high water must be in
+        // the bounded out-of-order set.
+        if record.sender_sequence > active.highest_contiguous_received_seq
+            && !active
+                .received_above_high_water
+                .contains(&record.sender_sequence)
+        {
+            return Err(LabError::Storage);
+        }
+        let dedup = find_dedup(state, &record.message_id)?;
+        if dedup.epoch_id != record.epoch_id
+            || dedup.sequence != record.sender_sequence
+            || dedup.queue_id != record.queue_id
+            || dedup.packet_digest != record.packet_digest
+        {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    let mut sequences = Vec::with_capacity(state.sends.len());
+    for record in &state.sends {
+        if record.epoch_id != active.epoch_id
+            || record.sequence == 0
+            || record.sequence > active.last_assigned_send_seq
+        {
+            return Err(LabError::Storage);
+        }
+        sequences.push(record.sequence);
+        if !record.state.is_terminal() {
+            // Non-terminal sends need the peer binding: the queue must be
+            // the peer's mailbox and the send signature must verify under
+            // the bound send capability.
+            let binding = state.peer_binding.as_ref().ok_or(LabError::Storage)?;
+            let (Some(queue_id), Some(packet), Some(signature)) = (
+                record.queue_id,
+                &record.packet,
+                &record.send_signature,
+            ) else {
+                return Err(LabError::Storage);
+            };
+            if queue_id != binding.queue_id {
+                return Err(LabError::Storage);
+            }
+            verify(
+                binding.send_public_key,
+                &send_signing_bytes(queue_id, record.message_id, &packet.digest(), record.expires_at),
+                signature,
+            )?;
+        }
+    }
+    // Send sequences are unique across the outbox.
+    sequences.sort_unstable();
+    for pair in sequences.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+fn check_acks(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    for record in &state.acks {
+        if record.epoch_id != active.epoch_id
+            || record.queue_id != state.mailbox_queue_id
+            || record.sequence == 0
+        {
+            return Err(LabError::Storage);
+        }
+        let dedup = find_dedup(state, &record.message_id)?;
+        if dedup.epoch_id != record.epoch_id
+            || dedup.sequence != record.sequence
+            || dedup.queue_id != record.queue_id
+            || dedup.packet_digest != record.packet_digest
+        {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+fn check_dedup(state: &ClientStateV1) -> Result<()> {
+    for record in &state.dedup {
+        if record.queue_id != state.mailbox_queue_id || record.sequence == 0 {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
+}
+
+/// Dedup records are sorted by raw `MessageId`; an ACK intent or inbound
+/// record references exactly one of them.
+fn find_dedup<'a>(
+    state: &'a ClientStateV1,
+    message_id: &MessageId,
+) -> Result<&'a super::records::DedupRecord> {
+    state
+        .dedup
+        .binary_search_by(|probe| probe.message_id.as_bytes().cmp(message_id.as_bytes()))
+        .map(|index| &state.dedup[index])
+        .map_err(|_| LabError::Storage)
+}
