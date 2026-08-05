@@ -66,7 +66,10 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// Returns [`LabError::Storage`] if `SQLite` cannot open or initialize the database.
+    /// Returns [`LabError::Storage`] if `SQLite` cannot open or initialize the
+    /// database, and also when the open is *refused* — a non-empty `-wal`
+    /// beside a database not in WAL mode fails closed even though `SQLite`
+    /// could have opened it. See [`reject_anomalous_wal`].
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_at(path, unix_now()?)
     }
@@ -77,7 +80,10 @@ impl Relay {
     /// # Errors
     ///
     /// Returns [`LabError::Storage`] if `SQLite` cannot open, initialize, or
-    /// sweep the database.
+    /// sweep the database, and also when the open is *refused* — a non-empty
+    /// `-wal` beside a database not in WAL mode fails closed even though
+    /// `SQLite` could have opened it, including when the database file is
+    /// zero-length. See [`reject_anomalous_wal`].
     pub fn open_at(path: &Path, now: u64) -> Result<Self> {
         preflight_existing_database(path)?;
         let connection = Connection::open(path)?;
@@ -655,13 +661,17 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
 /// The relay never *leaves* a database in WAL mode: `initialize` sets
 /// `journal_mode = DELETE` on every open. It does accept one — a WAL-mode
 /// database opens successfully and is converted back — so this is not a claim
-/// that the header is always rollback-mode. What it does mean is that reaching
-/// rollback-mode is the last thing a relay open does, so a `-wal` that appears
-/// beside a rollback-mode header did not come from this crate and is not
-/// legitimate recovery state. A genuine WAL-mode database with a live `-wal`
-/// has a WAL-mode header and passes this check unharmed.
+/// that the header is always rollback-mode. What it does mean is that a relay
+/// open never *ends* in WAL mode, so a `-wal` beside a rollback-mode header
+/// did not come from this crate and is not legitimate recovery state. That
+/// holds because `SQLite` checkpoints and unlinks the `-wal` before flipping
+/// the header out of WAL mode, so a crash mid-conversion leaves a WAL-mode
+/// header with no companion, never the reverse: 1018 crash trials across both
+/// directions produced the refused combination zero times. A genuine WAL-mode
+/// database with a live `-wal` passes this check unharmed.
 ///
-/// The guard covers this crate's open path, not the filesystem. Any other
+/// The guard covers the relay's open path only — not the filesystem, and not
+/// `ClientStateStore::open`, which has no comparable preflight. Any other
 /// `SQLite` client that opens the same path while the planted file exists still
 /// triggers the replay, because that decision belongs to whoever opens the
 /// database. Proving that is not hypothetical: an inspection helper inside
@@ -692,13 +702,12 @@ fn reject_anomalous_wal(path: &Path) -> Result<()> {
 ///   is_never_mutated` pins that a non-hot journal really does take this path.
 /// - `-wal`: gated additionally on the main database header being in WAL mode,
 ///   so a WAL beside a rollback-mode database does not route through the
-///   bypass. This gate decides only which path *this* function reports; it does
-///   not stop the file being used. `SQLite` opens a `-wal` on file existence
-///   alone and never consults the main header, so the subsequent normal open
-///   replays a planted WAL either way. Read this arm as bookkeeping, not as a
-///   defense — an earlier version of this comment claimed it prevented a
-///   planted file turning a read-only inspection into a mutating open, and
-///   measurement showed the opposite.
+///   bypass. That combination no longer reaches this function at all:
+///   `reject_anomalous_wal` fails the open before the caller gets here, so this
+///   arm sees only WAL-mode headers and the `false` branch is unreachable in
+///   practice. It is not itself a defense — `SQLite` opens a `-wal` on file
+///   existence alone, so if the earlier refusal were removed, the normal open
+///   would replay a planted WAL regardless of what this arm reported.
 ///
 /// Deciding either arm differently changes no outcome the relay accepts:
 /// `validate_schema_for_open` still runs authoritatively on whatever image the

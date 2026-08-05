@@ -783,29 +783,42 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
     Ok(())
 }
 
-/// The pass-through arm of `reject_anomalous_wal`: a genuine WAL-mode database
-/// must still open. Without this, every test reaching that arm goes on to
-/// reject for some other reason, so a guard that refused all WAL-mode databases
-/// would still look green. Also pins that the relay converts it back, which is
-/// what makes a `-wal` beside a rollback-mode header anomalous in the first
-/// place.
+/// The pass-through arm of `reject_anomalous_wal`: a WAL-mode database with a
+/// LIVE `-wal` must still open and recover. Reaching that arm requires both a
+/// WAL-mode header and a non-empty `-wal`, so the crash has to be real — a
+/// clean close checkpoints and deletes the companion, which short-circuits the
+/// guard before the header is ever consulted and silently tests nothing.
+/// The assertions on `wal_len` and the header exist to prove the arm is
+/// actually reached, not merely assumed.
 #[test]
-fn wal_mode_database_opens_and_is_converted_back() -> Result<(), Box<dyn Error>> {
+fn wal_mode_database_with_live_wal_opens_and_recovers() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("wal-mode-ok.sqlite");
-    drop(Relay::open_at(&database, NOW)?);
+    seed_current_large_messages(&database)?;
 
-    let converter = Connection::open(&database)?;
-    converter.execute_batch("PRAGMA journal_mode = WAL;")?;
-    drop(converter);
+    // Real crash: converts to WAL, commits a delete of every message, aborts
+    // before any checkpoint. Schema stays valid, so the open must succeed.
+    run_hot_journal_child(&database, "wal-crash")?;
+
+    let wal = directory.path().join("wal-mode-ok.sqlite-wal");
     let header = fs::read(&database)?;
     assert_eq!((header[18], header[19]), (2, 2));
+    assert!(fs::metadata(&wal)?.len() > 0);
 
     // Must open, not be refused by the anomalous-WAL guard.
     drop(Relay::open_at(&database, NOW)?);
 
+    // The committed delete was recovered, not lost, and the relay converted
+    // the database back out of WAL mode.
+    let recovered = Connection::open(&database)?;
+    let messages = recovered.query_row("SELECT COUNT(*) FROM messages", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    drop(recovered);
+    assert_eq!(messages, 0);
     let after = fs::read(&database)?;
     assert_eq!((after[18], after[19]), (1, 1));
+    assert!(!wal.exists());
     Ok(())
 }
 
