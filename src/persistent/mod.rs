@@ -1,0 +1,699 @@
+//! The Phase-2 persistence-owning façade, leg D1 (design
+//! docs/phase2-design-decisions.md section 2).
+//!
+//! [`PersistentClient`] is the sole consumer of the `ClientStateV1` codec
+//! (`crate::state`) and exclusively owns the store handle, the decoded
+//! state, the `Account`, the optional `Session`, the mailbox capability
+//! keypairs, the peer binding, inbound records and every outbox. No
+//! reference into façade state ever escapes; callers receive only owned
+//! identities, IDs, views, exact durable requests, action tokens and the
+//! redacted contact offer.
+//!
+//! # Mutator discipline (§2 steps 1-8)
+//!
+//! Every mutator runs through [`PersistentClient::mutate`]:
+//!
+//! 1. require `Ready`, enter `Mutating` (`FacadeState`, checked first);
+//! 2. known bounds checks run first inside each operation closure (at most
+//!    one pending prekey, one peer binding, one active session);
+//! 3. [`PersistentClient::stage`] clones the complete candidate logical
+//!    and crypto state (state bytes via encode/decode, `Account`/`Session`
+//!    via pickle round-trips — they are not `Clone`);
+//! 4. the operation mutates the candidate, [`sync_pickles`] re-serializes
+//!    the crypto state into the candidate state and requires crypto and
+//!    logical state to agree, and `ClientStateV1::encode` re-runs the full
+//!    codec semantic validation and every aggregate bound;
+//! 5. the complete snapshot commits through the store's generation-CAS;
+//! 6. install happens by infallible moves and the artifact is returned
+//!    only after the commit succeeds;
+//! 7. any pre-commit failure discards the candidate and returns to
+//!    `Ready` (nothing in the installed state was touched);
+//! 8. any commit/CAS/uncertain-storage failure enters
+//!    `ReconcileRequired`: every operation except the non-failing
+//!    `protection_level()` rejects until drop and reopen. The store
+//!    poisons itself on the same failure, so its handle is unusable too.
+//!
+//! All operations are synchronous `&mut self`; no callbacks, transport,
+//! UI, logging or await points occur while staging.
+//!
+//! # D1 scope boundaries and deviations (all deliberate, for review)
+//!
+//! - **Platform-key lifecycle out of scope.** The §4 lifecycle manager
+//!   (`Provisional`/`Expected`/`Locked`/`Deleting`, registry, CAS) is not
+//!   implemented in D1. The existing [`StateKeyProtector`] contract is
+//!   assumed: an independently stored expected binding, wrap/unwrap, and
+//!   honest `protection_level()` evidence. This is the documented gap for
+//!   the review brief.
+//! - **Action token + request digest without a codec field.** The frozen
+//!   `ClientStateV1` grammar has no action-token or digest field, and this
+//!   leg may not change `src/state/**`. The durable action record is
+//!   realized through the registration record itself: the action token IS
+//!   the freshly minted random 16-byte registration nonce (a durable
+//!   random action ID), and the request binding is the manage-key
+//!   signature over the exact request, re-verified when a result is
+//!   presented, together with a SHA-256 digest recomputed over the
+//!   record's canonical bytes. Presentation requires token equality with
+//!   the durable nonce; an authentic rollback restores the OLD record, so
+//!   a newer token is rejected even when the generation repeats (the §2
+//!   property). Recording a result consumes the action by re-minting the
+//!   nonce, which makes replays and cross-action tokens fail.
+//! - **Registration terminal marker.** The record has no terminal-state
+//!   field either. D1 convention: `Confirmed` keeps the exact request's
+//!   `valid_until` (the confirmed request remains the durable one) with a
+//!   fresh nonce; `Failed` re-signs the intent with `valid_until = 0` and
+//!   a fresh nonce. Both consume the presented token.
+//! - **`MailboxOwner` is not reused.** Its keypairs are not extractable
+//!   outside `cfg(test)` (only `serialized_private_material` exists, test
+//!   gated), and this leg may not modify `capability.rs`. The façade
+//!   builds the mailbox triple from `Ed25519Keypair` directly and signs
+//!   with the `pub(crate)` `MailboxRegistration::signing_bytes`, the same
+//!   canonical construction `MailboxOwner::registration` uses.
+//! - **`create` re-validation without a physical reopen.** §1 asks for a
+//!   reopen-and-revalidate after writing generation 1. `P` is not
+//!   `Clone`, the store consumes the protector, and the store holds the
+//!   `PrivateStoreDir` lock, so a physical close/reopen is impossible
+//!   within this signature. D1 instead re-validates fully — a fresh
+//!   `ClientStateV1::decode` (parse + complete semantic validation) of the
+//!   authenticated committed snapshot read back through the same handle.
+//! - **`PendingPreKey.created_at` is 0.** `prekey_action` receives no
+//!   clock; the codec only requires `created_at < valid_until`.
+
+use std::marker::PhantomData;
+
+use vodozemac::olm::{Account, Session, SessionConfig};
+use vodozemac::{Curve25519PublicKey, Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
+use zeroize::Zeroizing;
+
+use crate::capability::{canonical, digest};
+use crate::ids::{ConversationId, Nonce, QueueId};
+use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
+use crate::private_store_dir::PrivateStoreDir;
+use crate::state::{
+    ActiveSession, ClientStateV1, PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role,
+    SessionMode,
+};
+use crate::{LabError, MailboxRegistration, Result};
+
+/// Validity window for a contact offer, mirroring
+/// `CONTACT_BUNDLE_MAX_VALIDITY_SECONDS` in `src/client.rs` (private
+/// there; replicated, not edited).
+const CONTACT_OFFER_MAX_VALIDITY_SECONDS: u64 = 5 * 60;
+
+const PREKEY_ACTION: &[u8] = b"peer-prekey";
+
+/// Canonical length-prefixed signing bytes for a peer bundle; identical
+/// construction to `peer_prekey_signing_bytes` in `src/client.rs`.
+fn prekey_signing_bytes(bundle: &PeerBundle) -> Vec<u8> {
+    canonical(
+        PREKEY_ACTION,
+        &[
+            bundle.signing_identity.as_bytes(),
+            bundle.curve_identity.as_bytes(),
+            bundle.one_time_key.as_bytes(),
+            &bundle.valid_until.to_be_bytes(),
+        ],
+    )
+}
+
+/// An externally transmitted request paired with its opaque action token.
+/// The request is returned only after the exact request and the candidate
+/// state have committed; presenting a result requires both the token and
+/// the durable request binding to match (see module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAction<T> {
+    pub token: [u8; 16],
+    pub request: T,
+}
+
+/// Owned view of the client's own public identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicIdentity {
+    pub ed25519: Ed25519PublicKey,
+    pub curve25519: Curve25519PublicKey,
+}
+
+/// The transferable, redacted contact offer: everything a peer needs to
+/// pin and verify this client out of band, and nothing else. It never
+/// contains the `Account`, a pickle, or any private key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedactedContactOffer {
+    pub signing_identity: Ed25519PublicKey,
+    pub curve_identity: Curve25519PublicKey,
+    pub one_time_key: Curve25519PublicKey,
+    pub valid_until: u64,
+    pub signature: Ed25519Signature,
+}
+
+/// Outcome of a durable registration action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationOutcome {
+    Confirmed,
+    Failed,
+}
+
+/// Bookkeeping for the §2 mutator discipline. `Mutating` is never
+/// observable across operations because everything is synchronous
+/// `&mut self`; it exists to make the discipline explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FacadeState {
+    Ready,
+    Mutating,
+    ReconcileRequired,
+}
+
+/// The three mailbox capability keypairs. Immutable after `create`.
+struct MailboxKeypairs {
+    send: Ed25519Keypair,
+    receive: Ed25519Keypair,
+    manage: Ed25519Keypair,
+}
+
+/// A complete cloned candidate: logical state plus crypto state. Mutated,
+/// cross-validated, serialized and committed as one snapshot; installed by
+/// infallible moves only after the commit succeeds.
+struct Candidate {
+    state: ClientStateV1,
+    account: Account,
+    session: Option<Session>,
+}
+
+/// Mint a manage-signed registration record (the exact current request).
+/// The nonce is the durable random action ID for the action that issued
+/// this request (see module docs).
+fn mint_registration(
+    keypairs: &MailboxKeypairs,
+    queue_id: QueueId,
+    nonce: Nonce,
+    valid_until: u64,
+) -> (RegistrationRecord, MailboxRegistration) {
+    let mut request = MailboxRegistration {
+        queue_id,
+        send_key: keypairs.send.public_key(),
+        receive_key: keypairs.receive.public_key(),
+        manage_key: keypairs.manage.public_key(),
+        nonce,
+        valid_until,
+        signature: keypairs.manage.sign(b""),
+    };
+    request.signature = keypairs.manage.sign(&request.signing_bytes());
+    let record = RegistrationRecord {
+        queue_id: request.queue_id,
+        send_key: request.send_key,
+        receive_key: request.receive_key,
+        manage_key: request.manage_key,
+        nonce: request.nonce,
+        valid_until: request.valid_until,
+        signature: request.signature,
+    };
+    (record, request)
+}
+
+/// `epoch_id = SHA-256(identity_key || base_key || one_time_key)`.
+fn epoch_of(keys: vodozemac::olm::SessionKeys) -> [u8; 32] {
+    let mut preimage = Vec::with_capacity(96);
+    preimage.extend_from_slice(keys.identity_key.as_bytes());
+    preimage.extend_from_slice(keys.base_key.as_bytes());
+    preimage.extend_from_slice(keys.one_time_key.as_bytes());
+    digest(&preimage)
+}
+
+/// The single-actor, persistence-owning client. Not `Clone` (no
+/// implementation is provided and the store connection is not `Clone`)
+/// and not `Sync`/`Send` (the marker field plus the naturally `!Sync`
+/// store connection).
+pub struct PersistentClient<P: StateKeyProtector> {
+    store: ClientStateStore<P>,
+    state: ClientStateV1,
+    account: Account,
+    session: Option<Session>,
+    keypairs: MailboxKeypairs,
+    facade_state: FacadeState,
+    _not_sync: PhantomData<*mut ()>,
+}
+
+impl<P: StateKeyProtector> PersistentClient<P> {
+    /// Create a fresh profile: new `Account` and mailbox, generation 1,
+    /// committed atomically through the store's create path (which
+    /// requires [`crate::MainDatabase::Absent`]), then fully re-validated
+    /// (decode + complete semantic validation) before anything is
+    /// exposed. See the module docs for the reopen deviation.
+    ///
+    /// `now` seeds the initial registration intent's expiry; no
+    /// registration request has been issued yet at creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error when the directory is not absent of
+    /// a database, the platform binding is unavailable, the initial commit
+    /// fails, or the committed state fails re-validation.
+    pub fn create(dir: PrivateStoreDir, protector: P, now: u64) -> Result<Self> {
+        let binding = protector.expected_binding()?;
+        let account = Account::new();
+        let keypairs = MailboxKeypairs {
+            send: Ed25519Keypair::new(),
+            receive: Ed25519Keypair::new(),
+            manage: Ed25519Keypair::new(),
+        };
+        let queue_id = QueueId::random();
+        let (registration, _request) = mint_registration(&keypairs, queue_id, Nonce::random(), now);
+        let state = ClientStateV1 {
+            profile_id: *binding.profile_id(),
+            key_ref: *binding.key_ref(),
+            generation: 1,
+            conversation_id: ConversationId::random(),
+            account_pickle: Zeroizing::new(
+                serde_json::to_vec(&account.pickle()).map_err(|_| LabError::Storage)?,
+            ),
+            own_ed25519_identity: account.ed25519_key(),
+            own_curve_identity: account.curve25519_key(),
+            mailbox_queue_id: queue_id,
+            send_keypair_json: Zeroizing::new(
+                serde_json::to_vec(&keypairs.send).map_err(|_| LabError::Storage)?,
+            ),
+            receive_keypair_json: Zeroizing::new(
+                serde_json::to_vec(&keypairs.receive).map_err(|_| LabError::Storage)?,
+            ),
+            manage_keypair_json: Zeroizing::new(
+                serde_json::to_vec(&keypairs.manage).map_err(|_| LabError::Storage)?,
+            ),
+            registration,
+            pending_prekey: None,
+            peer_binding: None,
+            active_session: None,
+            inbound: Vec::new(),
+            sends: Vec::new(),
+            acks: Vec::new(),
+            dedup: Vec::new(),
+        };
+        let snapshot = state.encode()?;
+        let store = ClientStateStore::create(dir, protector, &snapshot)?;
+        // Full re-validation of the committed snapshot before exposure
+        // (see the module docs for why this is not a physical reopen):
+        // `from_store` decodes and validates the authenticated committed
+        // bytes and reconstructs the crypto state from the pickles.
+        Self::from_store(store)
+    }
+
+    /// Open an existing profile: the store authenticates and decrypts the
+    /// snapshot, `ClientStateV1::decode` re-runs the complete §3
+    /// validation, and the `Account`/`Session` are reconstructed from
+    /// their canonical pickles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error when no authentic validated database
+    /// exists or the decoded state fails validation.
+    pub fn open(dir: PrivateStoreDir, protector: P) -> Result<Self> {
+        let store = ClientStateStore::open(dir, protector)?;
+        Self::from_store(store)
+    }
+
+    /// Build the façade from an authenticated store: decode and validate,
+    /// then reconstruct the crypto state from the canonical pickles.
+    fn from_store(store: ClientStateStore<P>) -> Result<Self> {
+        let state = ClientStateV1::decode(store.state()?)?;
+        let account = Account::from_pickle(
+            serde_json::from_slice(&state.account_pickle).map_err(|_| LabError::Storage)?,
+        );
+        let session = match &state.active_session {
+            Some(active) => Some(Session::from_pickle(
+                serde_json::from_slice(&active.session_pickle).map_err(|_| LabError::Storage)?,
+            )),
+            None => None,
+        };
+        let keypairs = MailboxKeypairs {
+            send: serde_json::from_slice(&state.send_keypair_json)
+                .map_err(|_| LabError::Storage)?,
+            receive: serde_json::from_slice(&state.receive_keypair_json)
+                .map_err(|_| LabError::Storage)?,
+            manage: serde_json::from_slice(&state.manage_keypair_json)
+                .map_err(|_| LabError::Storage)?,
+        };
+        Ok(Self {
+            store,
+            state,
+            account,
+            session,
+            keypairs,
+            facade_state: FacadeState::Ready,
+            _not_sync: PhantomData,
+        })
+    }
+
+    /// Owned view of the client's own public identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`
+    /// (after a failed commit, until drop and reopen).
+    pub fn public_identity(&self) -> Result<PublicIdentity> {
+        self.ensure_ready()?;
+        Ok(PublicIdentity {
+            ed25519: self.account.ed25519_key(),
+            curve25519: self.account.curve25519_key(),
+        })
+    }
+
+    /// Protection evidence reported by the platform adapter. Non-failing
+    /// passthrough; it stays available even in `ReconcileRequired` so the
+    /// actor can report why recovery is needed.
+    #[must_use]
+    pub fn protection_level(&self) -> ProtectionLevel {
+        self.store.protection_level()
+    }
+
+    /// Generate one one-time key, sign the contact bundle, record the
+    /// pending prekey, mark the key published, commit, and only then
+    /// return the transferable redacted offer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse error when a pending prekey already exists, key
+    /// generation or signing fails, or the commit fails.
+    pub fn prekey_action(&mut self, valid_until: u64) -> Result<RedactedContactOffer> {
+        self.mutate(|candidate, _keypairs| {
+            if candidate.state.pending_prekey.is_some() {
+                // Known bound: at most one pending prekey.
+                return Err(LabError::Crypto);
+            }
+            let one_time_key = *candidate
+                .account
+                .generate_one_time_keys(1)
+                .created
+                .first()
+                .ok_or(LabError::Crypto)?;
+            let mut bundle = PeerBundle {
+                signing_identity: candidate.account.ed25519_key(),
+                curve_identity: candidate.account.curve25519_key(),
+                one_time_key,
+                valid_until,
+                signature: candidate.account.sign(b""),
+            };
+            bundle.signature = candidate.account.sign(prekey_signing_bytes(&bundle));
+            candidate.account.mark_keys_as_published();
+            candidate.state.pending_prekey = Some(PendingPreKey {
+                signing_identity: bundle.signing_identity,
+                curve_identity: bundle.curve_identity,
+                one_time_key,
+                created_at: 0,
+                valid_until,
+                signature: bundle.signature,
+            });
+            Ok(RedactedContactOffer {
+                signing_identity: bundle.signing_identity,
+                curve_identity: bundle.curve_identity,
+                one_time_key,
+                valid_until,
+                signature: bundle.signature,
+            })
+        })
+    }
+
+    /// Verify a peer's contact offer against the separately pinned peer
+    /// signing identity (identity match, short validity window, signature
+    /// — the same rules as `PeerPreKey::verify` in `src/client.rs`,
+    /// replicated) and commit the peer binding: the verified bundle plus
+    /// the send capability for the peer's mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::PeerVerificationFailed`] for an identity,
+    /// window or signature mismatch, [`LabError::Unauthorized`] when a
+    /// peer binding already exists, or a coarse storage error.
+    // The keypair is taken by value deliberately: the caller transfers the
+    // send capability into the façade, which becomes its sole owner.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn commit_verified_contact(
+        &mut self,
+        pinned_signing_identity: Ed25519PublicKey,
+        offer: RedactedContactOffer,
+        peer_queue_id: QueueId,
+        peer_send_keypair: Ed25519Keypair,
+        now: u64,
+    ) -> Result<()> {
+        if offer.signing_identity != pinned_signing_identity
+            || offer.valid_until <= now
+            || offer.valid_until > now.saturating_add(CONTACT_OFFER_MAX_VALIDITY_SECONDS)
+        {
+            return Err(LabError::PeerVerificationFailed);
+        }
+        let bundle = PeerBundle {
+            signing_identity: offer.signing_identity,
+            curve_identity: offer.curve_identity,
+            one_time_key: offer.one_time_key,
+            valid_until: offer.valid_until,
+            signature: offer.signature,
+        };
+        pinned_signing_identity
+            .verify(&prekey_signing_bytes(&bundle), &offer.signature)
+            .map_err(|_| LabError::PeerVerificationFailed)?;
+        let send_keypair_json = Zeroizing::new(
+            serde_json::to_vec(&peer_send_keypair).map_err(|_| LabError::Storage)?,
+        );
+        let send_public_key = peer_send_keypair.public_key();
+        self.mutate(|candidate, _keypairs| {
+            if candidate.state.peer_binding.is_some() {
+                // Known bound: at most one peer binding.
+                return Err(LabError::Unauthorized);
+            }
+            candidate.state.peer_binding = Some(PeerBinding {
+                bundle,
+                queue_id: peer_queue_id,
+                send_keypair_json,
+                send_public_key,
+            });
+            Ok(())
+        })
+    }
+
+    /// Establish the outbound session from the committed peer binding and
+    /// commit the `ActiveSession` record (role outbound, transcript = the
+    /// peer bundle, fresh epoch, zero sequence and high-water state, mode
+    /// `Ready`, no receipt, empty received set, conversation from state).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::SessionAlreadyExists`] when a session exists,
+    /// [`LabError::MissingSession`] when no peer binding is committed,
+    /// [`LabError::PeerVerificationFailed`] when the bundle expired, or a
+    /// coarse error when Olm rejects the bundle or the commit fails.
+    pub fn establish_outbound_session(&mut self, now: u64) -> Result<()> {
+        self.mutate(|candidate, _keypairs| {
+            if candidate.session.is_some() || candidate.state.active_session.is_some() {
+                // Known bound: at most one active session.
+                return Err(LabError::SessionAlreadyExists);
+            }
+            let binding = candidate
+                .state
+                .peer_binding
+                .as_ref()
+                .ok_or(LabError::MissingSession)?;
+            if binding.bundle.valid_until <= now {
+                return Err(LabError::PeerVerificationFailed);
+            }
+            let session = candidate
+                .account
+                .create_outbound_session(
+                    SessionConfig::version_1(),
+                    binding.bundle.curve_identity,
+                    binding.bundle.one_time_key,
+                )
+                .map_err(|_| LabError::Crypto)?;
+            let keys = session.session_keys();
+            candidate.state.active_session = Some(ActiveSession {
+                role: Role::Outbound,
+                session_pickle: Zeroizing::new(
+                    serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?,
+                ),
+                identity_key: keys.identity_key,
+                base_key: keys.base_key,
+                one_time_key: keys.one_time_key,
+                transcript: binding.bundle,
+                epoch_id: epoch_of(keys),
+                last_assigned_send_seq: 0,
+                peer_contiguous_high_water: 0,
+                highest_contiguous_received_seq: 0,
+                mode: SessionMode::Ready,
+                receipt: None,
+                received_above_high_water: Vec::new(),
+                conversation_id: candidate.state.conversation_id,
+            });
+            candidate.session = Some(session);
+            Ok(())
+        })
+    }
+
+    /// Mint the exact current registration request (fresh nonce = the
+    /// action token), record it durably, commit, and only then return the
+    /// action.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse error when signing or the commit fails.
+    pub fn registration_action(
+        &mut self,
+        valid_until: u64,
+    ) -> Result<DurableAction<MailboxRegistration>> {
+        self.mutate(|candidate, keypairs| {
+            let nonce = Nonce::random();
+            let (record, request) =
+                mint_registration(keypairs, candidate.state.mailbox_queue_id, nonce, valid_until);
+            candidate.state.registration = record;
+            Ok(DurableAction {
+                token: *nonce.as_bytes(),
+                request,
+            })
+        })
+    }
+
+    /// Record the relay's answer to a durable registration action. The
+    /// presented token must equal the durable record's nonce (the random
+    /// action ID), and the durable request binding — the manage signature
+    /// over the exact request plus the canonical-bytes digest — is
+    /// re-verified. On a match the action is consumed (the nonce is
+    /// re-minted) and the record marked terminal: `Confirmed` keeps the
+    /// exact request's expiry, `Failed` re-signs with `valid_until = 0`.
+    /// Any mismatch rejects without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::Unauthorized`] for a wrong, replayed or
+    /// cross-action token, or a coarse storage error when the commit
+    /// fails.
+    pub fn record_registration_result(
+        &mut self,
+        token: [u8; 16],
+        outcome: RegistrationOutcome,
+    ) -> Result<()> {
+        self.mutate(|candidate, keypairs| {
+            let record = &candidate.state.registration;
+            if record.nonce.as_bytes() != &token {
+                return Err(LabError::Unauthorized);
+            }
+            // Re-verify the durable request binding: the manage signature
+            // over the exact request, and the digest of the record's
+            // canonical bytes (see the module docs for the digest
+            // realization).
+            let request = MailboxRegistration {
+                queue_id: record.queue_id,
+                send_key: record.send_key,
+                receive_key: record.receive_key,
+                manage_key: record.manage_key,
+                nonce: record.nonce,
+                valid_until: record.valid_until,
+                signature: record.signature,
+            };
+            record
+                .manage_key
+                .verify(&request.signing_bytes(), &record.signature)
+                .map_err(|_| LabError::Unauthorized)?;
+            let _request_digest = digest(&record.encode()?);
+            let valid_until = match outcome {
+                RegistrationOutcome::Confirmed => record.valid_until,
+                RegistrationOutcome::Failed => 0,
+            };
+            let (successor, _request) = mint_registration(
+                keypairs,
+                record.queue_id,
+                Nonce::random(),
+                valid_until,
+            );
+            candidate.state.registration = successor;
+            Ok(())
+        })
+    }
+
+    fn ensure_ready(&self) -> Result<()> {
+        if self.facade_state != FacadeState::Ready {
+            return Err(LabError::Storage);
+        }
+        Ok(())
+    }
+
+    /// Clone the complete candidate logical and crypto state (step 3).
+    fn stage(&self) -> Result<Candidate> {
+        let state = ClientStateV1::decode(&self.state.encode()?)?;
+        let account = Account::from_pickle(self.account.pickle());
+        let session = self
+            .session
+            .as_ref()
+            .map(|session| Session::from_pickle(session.pickle()));
+        Ok(Candidate {
+            state,
+            account,
+            session,
+        })
+    }
+
+    /// Install the candidate by infallible moves (step 6).
+    fn install(&mut self, candidate: Candidate) {
+        self.state = candidate.state;
+        self.account = candidate.account;
+        self.session = candidate.session;
+    }
+
+    /// The §2 mutator sequence; see the module docs for the step mapping.
+    fn mutate<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Candidate, &MailboxKeypairs) -> Result<T>,
+    ) -> Result<T> {
+        // Step 1: require Ready, enter Mutating.
+        self.ensure_ready()?;
+        self.facade_state = FacadeState::Mutating;
+        // Step 3: clone the complete candidate state.
+        let mut candidate = match self.stage() {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.facade_state = FacadeState::Ready;
+                return Err(error);
+            }
+        };
+        // Steps 2 and 4: bounds checks and mutation inside the operation,
+        // then crypto/logical agreement, full codec cross-validation,
+        // serialization and aggregate bounds.
+        let outcome = operation(&mut candidate, &self.keypairs).and_then(|artifact| {
+            sync_pickles(&mut candidate)?;
+            candidate.state.encode().map(|snapshot| (artifact, snapshot))
+        });
+        let (artifact, snapshot) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Step 7: pre-commit failure discards the candidate.
+                self.facade_state = FacadeState::Ready;
+                return Err(error);
+            }
+        };
+        // Step 5: commit the complete snapshot through the generation-CAS.
+        match self.store.commit(&snapshot) {
+            Ok(()) => {
+                // Step 6: install by infallible moves, then return.
+                self.install(candidate);
+                self.facade_state = FacadeState::Ready;
+                Ok(artifact)
+            }
+            Err(error) => {
+                // Step 8: commit/CAS/uncertain-storage failure.
+                self.facade_state = FacadeState::ReconcileRequired;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Re-serialize the candidate's crypto state into the candidate's logical
+/// state and require the two to agree (part of step 4).
+fn sync_pickles(candidate: &mut Candidate) -> Result<()> {
+    candidate.state.account_pickle = Zeroizing::new(
+        serde_json::to_vec(&candidate.account.pickle()).map_err(|_| LabError::Storage)?,
+    );
+    match (&candidate.session, candidate.state.active_session.as_mut()) {
+        (Some(session), Some(active)) => {
+            active.session_pickle = Zeroizing::new(
+                serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?,
+            );
+        }
+        (None, None) => {}
+        _ => return Err(LabError::Storage),
+    }
+    Ok(())
+}

@@ -28,7 +28,12 @@ mod validate;
 #[cfg(test)]
 mod tests;
 
-use records::{
+// Re-exported for the façade (`src/persistent`) and the unit tests.
+// Widened from a private `use` to `pub(crate)` when the D1 façade landed:
+// the façade must construct these record values (its own module docs have
+// always described this API as the contract the façade will consume), and
+// no behavior changed — this is visibility only.
+pub(crate) use records::{
     AckIntent, ActiveSession, DedupRecord, InboundRecord, PeerBinding, PendingPreKey,
     RegistrationRecord, SendRecord,
 };
@@ -39,8 +44,8 @@ use zeroize::Zeroizing;
 use crate::ids::{ConversationId, QueueId};
 use crate::{LabError, PROTOCOL_DOMAIN, Result};
 
-// Re-exported for the future façade and the unit tests; the lib target has
-// no consumer until the façade slice lands.
+// Re-exported for the façade and the unit tests. Some variants are
+// exercised only by the codec's own tests until D2 lands.
 #[allow(unused_imports)]
 pub(crate) use records::{
     AckState, DedupState, HighWaterReceipt, PeerBundle, Role, SendState, SessionMode,

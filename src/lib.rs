@@ -10,6 +10,7 @@ mod companion;
 pub mod error;
 pub mod ids;
 pub mod persistence;
+mod persistent;
 mod private_store_dir;
 pub mod relay;
 mod state;
@@ -24,6 +25,9 @@ pub use client::{
 pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
 pub use persistence::{ClientStateStore, ProfileBinding, ProtectionLevel, StateKeyProtector};
+pub use persistent::{
+    DurableAction, PersistentClient, PublicIdentity, RedactedContactOffer, RegistrationOutcome,
+};
 pub use private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 pub use relay::{AckOutcome, EnqueueOutcome, Relay, StoredEnvelope};
 
