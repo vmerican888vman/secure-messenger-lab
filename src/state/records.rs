@@ -359,6 +359,13 @@ impl HighWaterReceipt {
 ///
 /// `session_keys.base_key` is not cross-checked for either role: it is the
 /// initiator's ephemeral base key, for which no stored reference exists.
+///
+/// **Wire-layout amendment (review v2 remediation):** field 18,
+/// `conversation_id[16]`, was added so the conversation binding is
+/// provable for every session, receipt or not. It is appended after the
+/// original fields 1-17 to keep their numbering stable; the object now
+/// declares 18 fields. Validation requires it to equal top-level field 8
+/// for both roles, and a present receipt must still also match it.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -376,6 +383,8 @@ pub(crate) struct ActiveSession {
     /// Strictly increasing sender sequences accepted above the contiguous
     /// high water; bounded at 64 (see module docs in `mod.rs`).
     pub(crate) received_above_high_water: Vec<u64>,
+    /// Conversation binding; must equal top-level field 8 (field 18).
+    pub(crate) conversation_id: ConversationId,
 }
 
 impl ActiveSession {
@@ -405,6 +414,7 @@ impl ActiveSession {
         };
         let receipt = HighWaterReceipt::parse(object.field(16)?)?;
         let received = parse_u64_set(object.field(17)?, MAX_RECEIVED_SET)?;
+        let conversation_id = conversation_id(object.field(18)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -420,6 +430,7 @@ impl ActiveSession {
             mode,
             receipt,
             received_above_high_water: received,
+            conversation_id,
         })
     }
 
@@ -446,6 +457,7 @@ impl ActiveSession {
                 (15, vec![self.mode as u8]),
                 (16, receipt_bytes),
                 (17, encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?),
+                (18, self.conversation_id.as_bytes().to_vec()),
             ],
         )
     }
@@ -508,8 +520,15 @@ impl InboundRecord {
 }
 
 /// Send-record state: `1` = `Pending`, `2` = `DeliveryUnknown`,
-/// `3` = `Stored`, `4` = `Duplicate`, `5` = `Expired`. The first two are
-/// the non-terminal arm; the rest are terminal.
+/// `3` = `Stored`, `4` = `Duplicate`, `5` = `Expired`.
+///
+/// **Remediation decision (review v2):** only `Pending` carries the full
+/// arm (queue, packet, expiry, signature). `DeliveryUnknown` was
+/// reclassified into the digest+expiry arm per the frozen design text:
+/// section 3's "terminal alternatives holding only digest and expiry" and
+/// section 4's grouping of `Stored`, `Duplicate`, expiry and consuming
+/// `DeliveryUnknown` as non-advancing. The original slice brief had it in
+/// the full arm; the frozen text wins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SendState {
     Pending = 1,
@@ -520,15 +539,18 @@ pub(crate) enum SendState {
 }
 
 impl SendState {
-    pub(crate) const fn is_terminal(self) -> bool {
-        matches!(self, Self::Stored | Self::Duplicate | Self::Expired)
+    /// Only `Pending` carries the full arm (queue, packet, expiry,
+    /// signature); every other state holds only digest and expiry.
+    pub(crate) const fn carries_full_arm(self) -> bool {
+        matches!(self, Self::Pending)
     }
 }
 
 /// Send record (object type `0x0007`). Both arms are encoded under the
 /// same field IDs with zero length meaning absent, per the optional-field
-/// rule: `Pending`/`DeliveryUnknown` carry queue, packet and signature
-/// (digest absent); terminal states carry only digest and expiry.
+/// rule: `Pending` carries queue, packet and signature (digest absent);
+/// `DeliveryUnknown`, `Stored`, `Duplicate` and `Expired` carry only
+/// digest and expiry.
 pub(crate) struct SendRecord {
     pub(crate) message_id: MessageId,
     pub(crate) state: SendState,
@@ -573,16 +595,16 @@ impl SendRecord {
 
     /// The optional fields must match the state arm exactly.
     pub(crate) fn arms_consistent(&self) -> bool {
-        if self.state.is_terminal() {
-            self.queue_id.is_none()
-                && self.packet.is_none()
-                && self.send_signature.is_none()
-                && self.packet_digest.is_some()
-        } else {
+        if self.state.carries_full_arm() {
             self.queue_id.is_some()
                 && self.packet.is_some()
                 && self.send_signature.is_some()
                 && self.packet_digest.is_none()
+        } else {
+            self.queue_id.is_none()
+                && self.packet.is_none()
+                && self.send_signature.is_none()
+                && self.packet_digest.is_some()
         }
     }
 

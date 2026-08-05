@@ -255,8 +255,12 @@ fn check_registration(state: &ClientStateV1) -> Result<()> {
 }
 
 /// Pending prekey: identities must be the account's own, the signature
-/// must verify, and the exact published one-time key's private part must
-/// still exist in the account (pinned `Account::contains_one_time_key`).
+/// must verify, and the exact PUBLISHED one-time key's private part must
+/// still exist in the account. "Published" (review v2 remediation) means
+/// both: held in the OTK store (pinned `Account::contains_one_time_key`,
+/// which deliberately also finds unpublished keys) AND absent from
+/// `Account::one_time_keys()` (the unpublished set), proving the key was
+/// marked published and is still held.
 fn check_pending_prekey(state: &ClientStateV1, account: &Account) -> Result<()> {
     let Some(prekey) = &state.pending_prekey else {
         return Ok(());
@@ -275,6 +279,13 @@ fn check_pending_prekey(state: &ClientStateV1, account: &Account) -> Result<()> 
         &prekey.signature,
     )?;
     if !account.contains_one_time_key(prekey.one_time_key) {
+        return Err(LabError::Storage);
+    }
+    if account
+        .one_time_keys()
+        .values()
+        .any(|key| *key == prekey.one_time_key)
+    {
         return Err(LabError::Storage);
     }
     Ok(())
@@ -352,6 +363,28 @@ fn check_active_session(
     epoch_preimage.extend_from_slice(keys.base_key.as_bytes());
     epoch_preimage.extend_from_slice(keys.one_time_key.as_bytes());
     if digest(&epoch_preimage) != active.epoch_id {
+        return Err(LabError::Storage);
+    }
+
+    // Conversation binding (review v2 remediation): the session record's
+    // `conversation_id` (field 18) must equal top-level field 8 for every
+    // session, receipt or not; a present receipt additionally still must
+    // match it in `check_receipt`.
+    if active.conversation_id != state.conversation_id {
+        return Err(LabError::Storage);
+    }
+
+    // Receive-side state must be provable by the restored ratchet: if any
+    // receive-side state is present, the session must actually have
+    // received and decrypted a message. The converse is not required — a
+    // session whose receive-side records were all consumed is legitimate —
+    // and a receipt is send-side, so a receipt-only session does not
+    // require this.
+    let receive_side_present = active.highest_contiguous_received_seq > 0
+        || !active.received_above_high_water.is_empty()
+        || !state.inbound.is_empty()
+        || !state.acks.is_empty();
+    if receive_side_present && !session.has_received_message() {
         return Err(LabError::Storage);
     }
 
@@ -531,10 +564,12 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
             return Err(LabError::Storage);
         }
         sequences.push(record.sequence);
-        if !record.state.is_terminal() {
-            // Non-terminal sends need the peer binding: the queue must be
-            // the peer's mailbox and the send signature must verify under
-            // the bound send capability.
+        if record.state.carries_full_arm() {
+            // Pending sends need the peer binding: the queue must be the
+            // peer's mailbox and the send signature must verify under the
+            // bound send capability. (`DeliveryUnknown` and the terminal
+            // states hold only digest and expiry; nothing remains to
+            // verify.)
             let binding = state.peer_binding.as_ref().ok_or(LabError::Storage)?;
             let (Some(queue_id), Some(packet), Some(signature)) = (
                 record.queue_id,

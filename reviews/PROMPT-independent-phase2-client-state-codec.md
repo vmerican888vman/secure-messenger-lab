@@ -30,14 +30,31 @@ independently RETURNED by both reviewers with the identical blocking finding:
 the active-session transcript model assumed the session's identity and OTK
 always belong to the peer bundle, which is false for genuine inbound sessions
 (verdicts in `reviews/REVIEW-fable-client-state-codec.md` and
-`reviews/REVIEW-sol-client-state-codec.md`). The amended head under review
-makes the transcript role-aware. Confirm you are reviewing the amended model,
-not the returned one.
+`reviews/REVIEW-sol-client-state-codec.md`).
 
-The amended model (vodozemac's `SessionKeys.identity_key` is always the
-INITIATOR's identity; `SessionKeys.one_time_key` is always the RECIPIENT's
-advertised key — verified against `vendor/vodozemac-0.10.0/src/olm/session_keys.rs`
-and both `create_*_session` constructors):
+Version 2 (head `eaebebe4e6aef7c1a024e8f2a3ef6bebd7061bd4`) made the
+transcript role-aware and was RETURNED by Sol with four further blockers
+(verdict in `reviews/REVIEW-sol-client-state-codec-v2.md`). The amended head
+under review now fixes all four:
+
+1. Receive-side state (`highest_contiguous_received_seq > 0`, non-empty
+   received set, inbound records, or ACK intents) now requires
+   `Session::has_received_message()` on the restored ratchet. The populated
+   fixture is genuine end-to-end (real encrypt → real inbound accept → real
+   reply → real decrypt). A receipt alone does not require it (send-side).
+2. ActiveSession carries `conversation_id[16]` as new field 18 (a
+   review-authorized wire-layout amendment; prior field numbering unchanged);
+   validation requires it to equal field 8 for both roles, receipt or not.
+3. `DeliveryUnknown` moved to the digest+expiry arm per the frozen design
+   (`docs/persistence-spike-design.md`); only `Pending` carries
+   queue/packet/expiry/signature.
+4. A pending prekey must now reference a *published* OTK: held
+   (`contains_one_time_key`) AND absent from `account.one_time_keys()` (the
+   unpublished set).
+
+Confirm you are reviewing the amended head, not either returned one.
+
+The role-aware transcript model from v2 (unchanged by v3):
 
 - **outbound (we initiated):** transcript = the verified peer bundle;
   signature verifies with the peer's pinned identity; `identity_key` == our

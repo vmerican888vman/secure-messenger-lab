@@ -285,6 +285,7 @@ fn make_active_session(
     session: &vodozemac::olm::Session,
     transcript: &PeerBundle,
     receipt: HighWaterReceipt,
+    conversation_id: ConversationId,
 ) -> Result<ActiveSession, Box<dyn Error>> {
     let keys = session.session_keys();
     Ok(ActiveSession {
@@ -301,13 +302,31 @@ fn make_active_session(
         mode: SessionMode::Ready,
         receipt: Some(receipt),
         received_above_high_water: vec![3],
+        conversation_id,
     })
 }
 
 /// A fully populated valid state: pending prekey, peer binding, outbound
 /// session with a receipt, one inbound record, three send records (two
 /// `Pending`, one terminal `Stored`), one ACK intent and two dedup records.
+///
+/// The receive side is GENUINE (review v2 remediation): our outbound
+/// session encrypts a bootstrap pre-key message, the peer's real inbound
+/// session is created from it and replies, and our session decrypts the
+/// reply, so `has_received_message()` is true and every receive-side
+/// record reflects real ratchet history.
 fn populated_fixture() -> Result<Fixture, Box<dyn Error>> {
+    outbound_fixture(true)
+}
+
+/// Same as `populated_fixture` but the peer never replies: the session has
+/// only ever encrypted. Used by the receive-side provenance negative tests
+/// and the receipt-only positive test.
+fn send_only_fixture() -> Result<Fixture, Box<dyn Error>> {
+    outbound_fixture(false)
+}
+
+fn outbound_fixture(genuine_receive: bool) -> Result<Fixture, Box<dyn Error>> {
     let mut our_account = Account::new();
     let mut peer_account = Account::new();
     let our_mailbox = MailboxOwner::new();
@@ -322,6 +341,22 @@ fn populated_fixture() -> Result<Fixture, Box<dyn Error>> {
         peer_otk,
     )?;
 
+    if genuine_receive {
+        let bootstrap = session.encrypt(b"session bootstrap")?;
+        let OlmMessage::PreKey(pre_key_message) = bootstrap else {
+            return Err("first message must be a pre-key message".into());
+        };
+        let mut peer_side = peer_account
+            .create_inbound_session(
+                SessionConfig::version_1(),
+                our_account.curve25519_key(),
+                &pre_key_message,
+            )?
+            .session;
+        let reply = peer_side.encrypt(b"peer reply")?;
+        let _plaintext = session.decrypt(&reply)?;
+    }
+
     let peer_send_keypair = Ed25519Keypair::new();
     let epoch_id = epoch_of(session.session_keys());
     let sends =
@@ -329,7 +364,8 @@ fn populated_fixture() -> Result<Fixture, Box<dyn Error>> {
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session = make_active_session(Role::Outbound, &session, &peer_bundle, receipt)?;
+    let active_session =
+        make_active_session(Role::Outbound, &session, &peer_bundle, receipt, conversation_id)?;
 
     let state = assemble_state(
         &our_account,
@@ -409,7 +445,7 @@ fn inbound_fixture() -> Result<Fixture, Box<dyn Error>> {
     // A second, unconsumed one-time key backs the pending-prekey field.
     let pending_prekey = make_pending_prekey(&mut our_account)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt)?;
+    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt, conversation_id)?;
 
     let state = assemble_state(
         &our_account,
@@ -1716,7 +1752,7 @@ fn inbound_consumed_otk_must_not_remain_in_account() -> Result<(), Box<dyn Error
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt)?;
+    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt, conversation_id)?;
 
     let mut state = assemble_state(
         &our_account,
@@ -1797,5 +1833,257 @@ fn session_identity_must_match_peer_binding_curve_for_either_role() -> Result<()
             "impostor binding curve accepted (inbound={use_inbound})"
         );
     }
+    Ok(())
+}
+
+// --- review v2 remediation tests -------------------------------------------
+
+/// Finding 1: receive-side state must be provable by the restored ratchet.
+/// A session that only ever encrypted rejects any receive-side state.
+#[test]
+fn receive_side_state_requires_a_receiving_ratchet() -> Result<(), Box<dyn Error>> {
+    // (a) A contiguous receive high water without any received message.
+    let mut fixture = send_only_fixture()?;
+    set_water(&mut fixture, 3, 1, SessionMode::Ready)?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.highest_contiguous_received_seq = 1;
+    assert!(fixture.state.encode().is_err(), "(a) fabricated high water");
+
+    // (b) An out-of-order received set on a send-only ratchet.
+    let mut fixture = send_only_fixture()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.received_above_high_water = vec![1];
+    assert!(fixture.state.encode().is_err(), "(b) fabricated received set");
+
+    // (c) One inbound record on a send-only ratchet (dedup record present
+    // and consistent; only the ratchet provenance can fail).
+    let mut fixture = send_only_fixture()?;
+    fixture.state.acks.clear();
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.highest_contiguous_received_seq = 0;
+    active.received_above_high_water.clear();
+    assert!(fixture.state.encode().is_err(), "(c) fabricated inbound record");
+
+    // (d) One ACK intent on a send-only ratchet (matching dedup present).
+    let mut fixture = send_only_fixture()?;
+    fixture.state.inbound.clear();
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.highest_contiguous_received_seq = 0;
+    active.received_above_high_water.clear();
+    assert!(fixture.state.encode().is_err(), "(d) fabricated ACK intent");
+    Ok(())
+}
+
+/// Finding 1, converse: a receipt is send-side. A receipt-only session
+/// (never received, receipt present, all receive-side state empty) must
+/// still validate.
+#[test]
+fn receipt_only_session_validates() -> Result<(), Box<dyn Error>> {
+    let mut fixture = send_only_fixture()?;
+    fixture.state.inbound.clear();
+    fixture.state.acks.clear();
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.highest_contiguous_received_seq = 0;
+    active.received_above_high_water.clear();
+    // peer_contiguous_high_water stays 1 with its genuine receipt.
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    let reencoded = decoded.encode()?;
+    assert_eq!(&encoded[..], &reencoded[..]);
+    Ok(())
+}
+
+/// Finding 2: the conversation binding holds receipt-free. Positive: a
+/// receipt-free populated session validates when the IDs agree. Negative
+/// (Sol's repro): mutating field 8 on the encoded receipt-free state must
+/// fail decode, and building a mismatched `active.conversation_id` must
+/// fail encode.
+#[test]
+fn conversation_binding_does_not_depend_on_receipt() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    set_water(&mut fixture, 3, 0, SessionMode::Ready)?; // receipt now None
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+
+    // Sol's repro: flip a conversation_id byte in field 8 of the
+    // receipt-free encoding; decode must fail.
+    let (start, _) = field_value_span(&encoded, 7)?;
+    let mut mutated = encoded.to_vec();
+    *mutated.get_mut(start).ok_or("conversation field")? ^= 0x01;
+    assert!(ClientStateV1::decode(&mutated).is_err(), "field-8 flip accepted");
+
+    // Build-time mismatch: the session record claims another conversation.
+    let mut fixture = populated_fixture()?;
+    set_water(&mut fixture, 3, 0, SessionMode::Ready)?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.conversation_id = ConversationId::random();
+    assert!(fixture.state.encode().is_err(), "mismatched session conversation");
+    Ok(())
+}
+
+/// Finding 3: a Pending -> `DeliveryUnknown` transition drops the full arm
+/// and keeps only digest and expiry; it must encode and round-trip.
+#[test]
+fn delivery_unknown_transition_uses_digest_arm_and_round_trips() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    let pending = &fixture.state.sends[0];
+    let packet_digest = pending.packet.as_ref().ok_or("no packet")?.digest();
+    let transitioned = SendRecord {
+        message_id: pending.message_id,
+        state: SendState::DeliveryUnknown,
+        epoch_id: pending.epoch_id,
+        sequence: pending.sequence,
+        queue_id: None,
+        packet: None,
+        expires_at: pending.expires_at,
+        send_signature: None,
+        packet_digest: Some(packet_digest),
+    };
+    fixture.state.sends[0] = transitioned;
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    let reencoded = decoded.encode()?;
+    assert_eq!(&encoded[..], &reencoded[..]);
+    assert!(matches!(
+        decoded.sends[0].state,
+        SendState::DeliveryUnknown
+    ));
+    Ok(())
+}
+
+/// Finding 3: a `DeliveryUnknown` record still carrying the full arm is
+/// rejected, on both the encode and the decode path.
+#[test]
+fn delivery_unknown_with_full_arm_rejected() -> Result<(), Box<dyn Error>> {
+    // Encode path: relabel a Pending record, keeping its full arm.
+    let mut fixture = populated_fixture()?;
+    fixture.state.sends[0].state = SendState::DeliveryUnknown;
+    assert!(fixture.state.encode().is_err());
+
+    // Decode path: same relabel on the wire bytes (state byte at object
+    // offset 32 inside the array element).
+    let fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let blocks = split_top(&encoded)?;
+    let mut elements = split_array(blocks.get(16).ok_or("sends")?.get(6..).ok_or("sends")?)?;
+    let pending = elements.get_mut(0).ok_or("no pending send")?;
+    *pending.get_mut(4 + 32).ok_or("state byte")? = 2;
+    let bytes = splice_top(&encoded, 16, field_block(17, &join_array(&elements)?)?)?;
+    assert!(ClientStateV1::decode(&bytes).is_err());
+    Ok(())
+}
+
+/// Finding 3: bound accounting across mixed arms — 32 records of mixed
+/// `Pending`/`DeliveryUnknown`/terminal states validate; a 33rd record
+/// breaks the array bound.
+#[test]
+fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
+    let mut fixture = send_only_fixture()?;
+    // Clear the receive side so only the outbox is under test, and make
+    // room for 32 outstanding sequences (mode ReceiptLocked at exactly 32).
+    fixture.state.inbound.clear();
+    fixture.state.acks.clear();
+    set_water(&mut fixture, 32, 0, SessionMode::ReceiptLocked)?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.highest_contiguous_received_seq = 0;
+    active.received_above_high_water.clear();
+
+    // Keep the two genuine Pending records (sequences 1-2), drop the
+    // terminal one, then add 30 digest-arm records (sequences 3..=32,
+    // alternating DeliveryUnknown/Stored) with fresh sorted IDs.
+    fixture.state.sends.truncate(2);
+    let epoch_id = fixture.state.sends[0].epoch_id;
+    let mut extra_ids = sorted_message_ids(29);
+    for (index, message_id) in extra_ids.drain(..).enumerate() {
+        let sequence = u64::try_from(index)? + 4;
+        let state = if index % 2 == 0 {
+            SendState::DeliveryUnknown
+        } else {
+            SendState::Stored
+        };
+        fixture.state.sends.push(SendRecord {
+            message_id,
+            state,
+            epoch_id,
+            sequence,
+            queue_id: None,
+            packet: None,
+            expires_at: NOW + 3_600,
+            send_signature: None,
+            packet_digest: Some(digest(b"packet")),
+        });
+    }
+    // Re-add a terminal record at sequence 3 and sort by message ID.
+    fixture.state.sends.push(SendRecord {
+        message_id: MessageId::from_slice(&[0x01; 16]).ok_or("bad test id")?,
+        state: SendState::Stored,
+        epoch_id,
+        sequence: 3,
+        queue_id: None,
+        packet: None,
+        expires_at: NOW + 3_600,
+        send_signature: None,
+        packet_digest: Some(digest(b"stored-packet")),
+    });
+    fixture
+        .state
+        .sends
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    assert_eq!(fixture.state.sends.len(), 32);
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+
+    // A 33rd record exceeds the bound regardless of arm.
+    fixture.state.sends.push(SendRecord {
+        message_id: MessageId::from_slice(&[0xF0; 16]).ok_or("bad test id")?,
+        state: SendState::DeliveryUnknown,
+        epoch_id,
+        sequence: 3,
+        queue_id: None,
+        packet: None,
+        expires_at: NOW + 3_600,
+        send_signature: None,
+        packet_digest: Some(digest(b"another")),
+    });
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+/// Finding 4: the pending prekey must reference a PUBLISHED one-time key.
+/// Held-but-unpublished is rejected; marked-published still passes.
+#[test]
+fn pending_prekey_must_be_marked_published() -> Result<(), Box<dyn Error>> {
+    let mut fixture = minimal_fixture()?;
+    let mut account = Account::new();
+    let one_time_key = *account
+        .generate_one_time_keys(1)
+        .created
+        .first()
+        .ok_or("no one-time key")?;
+    // Deliberately NOT marked as published.
+    let mut prekey = PendingPreKey {
+        signing_identity: account.ed25519_key(),
+        curve_identity: account.curve25519_key(),
+        one_time_key,
+        created_at: NOW,
+        valid_until: NOW + 300,
+        signature: account.sign(b""),
+    };
+    prekey.signature = account.sign(prekey_signing_bytes(&prekey.bundle()));
+    assert!(account.contains_one_time_key(one_time_key));
+    assert!(account.one_time_keys().values().any(|key| *key == one_time_key));
+
+    fixture.state.own_ed25519_identity = account.ed25519_key();
+    fixture.state.own_curve_identity = account.curve25519_key();
+    fixture.state.account_pickle = Zeroizing::new(serde_json::to_vec(&account.pickle())?);
+    fixture.state.pending_prekey = Some(prekey);
+    assert!(fixture.state.encode().is_err(), "unpublished OTK accepted");
+
+    // Marking it published (and re-pickling) makes the state valid again.
+    account.mark_keys_as_published();
+    fixture.state.account_pickle = Zeroizing::new(serde_json::to_vec(&account.pickle())?);
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
     Ok(())
 }
