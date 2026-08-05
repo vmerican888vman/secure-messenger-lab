@@ -9,6 +9,7 @@ use super::envelope::{
     seal,
 };
 use super::protector::{ProfileBinding, ProtectionLevel, StateKeyProtector};
+use crate::companion::reject_anomalous_wal;
 use crate::{LabError, Result};
 
 const APPLICATION_ID: i64 = 0x534D_534C;
@@ -342,7 +343,17 @@ fn test_abort_at(point: &str) {
     std::process::abort();
 }
 
+/// The single choke point for both `create` and `open`, which is why the
+/// anomalous-WAL refusal lives here: guarding one entry point and not the other
+/// would leave the store destroyable through whichever was missed.
+///
+/// This store holds wrapped key material rather than replaceable queue state,
+/// so the consequence of the weakness is worse here than in the relay. Measured
+/// before the guard: planting one `-wal` beside a healthy store, with no write
+/// access to the database, took it from 8192 to 12288 bytes and made every
+/// later open fail, including after the planted file was removed.
 fn open_connection(path: &Path) -> Result<Connection> {
+    reject_anomalous_wal(path)?;
     let connection = Connection::open(path).map_err(|_| LabError::Storage)?;
     connection
         .execute_batch(
@@ -821,9 +832,124 @@ mod tests {
                     ClientStateStore::open(Path::new(&path), TestProtector::new(31, 32))?;
                 store.commit(b"committed")?;
             }
+            "wal-crash" => {
+                // Leave a genuine live WAL: converted, written, never closed.
+                // A clean close would checkpoint and unlink the companion, and
+                // a leaked in-process connection would hold a lock that makes
+                // the later open fail for an unrelated reason.
+                let connection = Connection::open(Path::new(&path))?;
+                connection.execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA wal_autocheckpoint = 0;",
+                )?;
+                connection.execute("UPDATE client_state SET slot = 1 WHERE slot = 1", [])?;
+                std::process::abort();
+            }
             _ => return Err(Box::new(LabError::Storage)),
         }
         Err(Box::new(LabError::Storage))
+    }
+
+    /// Creating a single file beside a healthy store — with no write access to
+    /// the database — used to destroy it permanently, the same weakness the
+    /// relay carried. It matters more here: this store holds wrapped key
+    /// material, not replaceable queue state.
+    ///
+    /// Asserts the two things that make refusal better than an open: the
+    /// database is left byte-identical, and removing the planted file restores
+    /// service with the state still readable.
+    #[test]
+    fn planted_wal_is_refused_without_touching_the_state_store()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+
+        // Stage a WAL elsewhere carrying a schema the store would reject.
+        let attacker = database(&directory, "attacker.sqlite");
+        drop(ClientStateStore::create(
+            &attacker,
+            TestProtector::new(51, 52),
+            b"attacker",
+        )?);
+        let staging = Connection::open(&attacker)?;
+        staging.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE extra_hostile(x);",
+        )?;
+        let planted = fs::read(directory.path().join("attacker.sqlite-wal"))?;
+        // Leaked deliberately: closing would checkpoint and empty the WAL.
+        std::mem::forget(staging);
+        assert!(!planted.is_empty());
+
+        // Victim: a healthy store holding secret state.
+        let victim = database(&directory, "victim.sqlite");
+        drop(ClientStateStore::create(
+            &victim,
+            TestProtector::new(53, 54),
+            b"irreplaceable-state",
+        )?);
+        let before = fs::read(&victim)?;
+        assert_eq!((before[18], before[19]), (1, 1));
+
+        // The whole attack: create one file. The database is never written.
+        fs::write(directory.path().join("victim.sqlite-wal"), &planted)?;
+
+        for _ in 0..3 {
+            assert!(matches!(
+                ClientStateStore::open(&victim, TestProtector::new(53, 54)),
+                Err(LabError::Storage)
+            ));
+        }
+
+        // Untouched: same bytes, same rollback-mode header.
+        let after = fs::read(&victim)?;
+        assert_eq!(after, before);
+        assert_eq!((after[18], after[19]), (1, 1));
+
+        // Deliberately NOT opened normally here — any SQLite client that opens
+        // this path while the planted file exists triggers the replay the
+        // refusal avoids, and would corrupt the very database under assertion.
+
+        // Recoverable: remove the planted file and the state is still there.
+        fs::remove_file(directory.path().join("victim.sqlite-wal"))?;
+        let reopened = ClientStateStore::open(&victim, TestProtector::new(53, 54))?;
+        assert_eq!(reopened.state()?, b"irreplaceable-state");
+        assert_eq!(reopened.generation()?, 1);
+        Ok(())
+    }
+
+    /// A WAL-mode store with a live `-wal` must still open. Without this the
+    /// pass-through arm is untested, and a guard that refused every WAL-mode
+    /// database would look green.
+    #[test]
+    fn wal_mode_state_store_with_live_wal_opens()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "wal-live.sqlite");
+        drop(ClientStateStore::create(
+            &path,
+            TestProtector::new(55, 56),
+            b"wal-mode-state",
+        )?);
+
+        // Real crash, so the companion is live and no lock is held.
+        let status = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("persistence::sqlite::tests::forced_death_child")
+            .arg("--nocapture")
+            .env(CHILD_PATH, &path)
+            .env(CHILD_OPERATION, "wal-crash")
+            .status()?;
+        assert!(!status.success());
+
+        let header = fs::read(&path)?;
+        assert_eq!((header[18], header[19]), (2, 2));
+        assert!(fs::metadata(directory.path().join("wal-live.sqlite-wal"))?.len() > 0);
+
+        // Must reach the pass-through arm and open, not be refused.
+        let opened = ClientStateStore::open(&path, TestProtector::new(55, 56))?;
+        assert_eq!(opened.state()?, b"wal-mode-state");
+        Ok(())
     }
 
     #[test]

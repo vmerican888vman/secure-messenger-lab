@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,6 +10,7 @@ use vodozemac::{Ed25519PublicKey, Ed25519Signature};
 use crate::capability::{
     AckRequest, DeleteMailboxRequest, FetchRequest, MailboxRegistration, SendRequest, digest,
 };
+use crate::companion::{database_header_uses_wal, nonempty_companion, reject_anomalous_wal};
 use crate::{EncryptedPacket, LabError, MessageId, Nonce, QueueId, Result};
 
 const MAX_PACKET_BYTES: usize = 1_048_576;
@@ -643,51 +644,6 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
     validate_schema_for_open(&connection)
 }
 
-/// Fail closed when a non-empty `-wal` sits beside a database whose own header
-/// is not in WAL mode, before anything opens the database normally.
-///
-/// `SQLite` opens a `-wal` on file existence alone and never consults the main
-/// header, so without this check the normal open replays whatever the file
-/// contains and checkpoints it in. Creating that one file — with no write
-/// access to the database itself — was enough to destroy a healthy relay
-/// permanently, because the foreign content landed in the database before
-/// validation could reject it and stayed there afterwards.
-///
-/// Refusing keeps the database byte-identical, which turns that into a
-/// recoverable condition: remove the stray file and the relay opens again. It
-/// does mean a planted file can stop the relay from starting, but a refusal
-/// that preserves the data is strictly better than an open that destroys it.
-///
-/// The relay never *leaves* a database in WAL mode: `initialize` sets
-/// `journal_mode = DELETE` on every open. It does accept one — a WAL-mode
-/// database opens successfully and is converted back — so this is not a claim
-/// that the header is always rollback-mode. What it does mean is that a relay
-/// open never *ends* in WAL mode, so a `-wal` beside a rollback-mode header
-/// did not come from this crate and is not legitimate recovery state. That
-/// holds because `SQLite` checkpoints and unlinks the `-wal` before flipping
-/// the header out of WAL mode, so a crash mid-conversion leaves a WAL-mode
-/// header with no companion, never the reverse: 1018 crash trials across both
-/// directions produced the refused combination zero times. A genuine WAL-mode
-/// database with a live `-wal` passes this check unharmed.
-///
-/// The guard covers the relay's open path only — not the filesystem, and not
-/// `ClientStateStore::open`, which has no comparable preflight. Any other
-/// `SQLite` client that opens the same path while the planted file exists still
-/// triggers the replay, because that decision belongs to whoever opens the
-/// database. Proving that is not hypothetical: an inspection helper inside
-/// `planted_wal_is_refused_without_touching_the_database` corrupted the very
-/// database the refusal had just preserved, until it was moved after cleanup.
-fn reject_anomalous_wal(path: &Path) -> Result<()> {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !nonempty_companion(&resolved, "-wal")? {
-        return Ok(());
-    }
-    if database_header_uses_wal(&resolved)? {
-        return Ok(());
-    }
-    Err(LabError::Storage)
-}
-
 /// Decides whether an exact-suffix companion is close enough to recoverable
 /// state to warrant skipping the immutable preflight. The two arms are
 /// deliberately asymmetric, and neither one determines whether `SQLite` would
@@ -727,27 +683,6 @@ fn has_nonempty_recovery_companion(path: &Path) -> Result<bool> {
         return Ok(true);
     }
     Ok(false)
-}
-
-fn nonempty_companion(path: &Path, suffix: &str) -> Result<bool> {
-    let mut companion = path.as_os_str().to_os_string();
-    companion.push(suffix);
-    match fs::metadata(Path::new(&companion)) {
-        Ok(metadata) => Ok(metadata.len() > 0),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(_) => Err(LabError::Storage),
-    }
-}
-
-fn database_header_uses_wal(path: &Path) -> Result<bool> {
-    let mut file = fs::File::open(path).map_err(|_| LabError::Storage)?;
-    let mut header = [0_u8; 20];
-    match file.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(false),
-        Err(_) => return Err(LabError::Storage),
-    }
-    Ok(header[..16] == *b"SQLite format 3\0" && header[18] == 2 && header[19] == 2)
 }
 
 fn immutable_uri(path: &Path) -> Result<String> {
