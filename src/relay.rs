@@ -629,11 +629,26 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
     validate_schema_for_open(&connection)
 }
 
-/// A non-empty exact-suffix companion only counts as a recovery companion when
-/// `SQLite` would actually replay it: a hot rollback journal always, but a WAL
-/// only when the main database header itself is in WAL mode. A stray WAL next
-/// to a rollback-mode database is an artifact, not recoverable state, and must
-/// not bypass the immutable preflight.
+/// Decides whether an exact-suffix companion is close enough to recoverable
+/// state to warrant skipping the immutable preflight. The two arms are
+/// deliberately asymmetric, and neither one determines whether `SQLite` would
+/// actually replay the companion:
+///
+/// - `-journal`: any non-empty rollback journal counts, hot or not. Deciding
+///   hotness means parsing the journal header and comparing it against the main
+///   database, which is `SQLite`'s job, not this function's. Counting a stray
+///   journal costs only a discarded file, whereas missing a genuine hot journal
+///   would reject a database that was fully recoverable, so this arm is
+///   deliberately permissive. `stray_journal_is_discarded_but_target_database_
+///   is_never_mutated` pins that a non-hot journal really does take this path.
+/// - `-wal`: gated additionally on the main database header being in WAL mode.
+///   A stray WAL beside a rollback-mode database is an artifact rather than
+///   recoverable state, and letting it through would allow a planted file to
+///   turn a read-only inspection into a mutating open.
+///
+/// Permissiveness here is safe because the bypass grants no capability:
+/// `validate_schema_for_open` still runs authoritatively on whatever image the
+/// normal open produces.
 ///
 /// Companion names are derived from the fully resolved path because `SQLite`
 /// names its journal after the link target, not the link. Deriving them from an
