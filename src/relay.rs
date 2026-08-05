@@ -621,6 +621,10 @@ fn validate_schema_for_open(connection: &Connection) -> Result<()> {
 ///   a stray non-hot journal is the exception: it consumes the companion but
 ///   leaves the main database byte-identical.
 fn preflight_existing_database(path: &Path) -> Result<()> {
+    // First, and on every path including a missing database: a non-empty `-wal`
+    // with no main database is never legitimate recovery state, and the state
+    // store refuses it, so the two stores must not disagree here.
+    reject_anomalous_wal(path)?;
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
@@ -630,9 +634,8 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
         return Err(LabError::Storage);
     }
     if metadata.len() == 0 {
-        return reject_anomalous_wal(path);
+        return Ok(());
     }
-    reject_anomalous_wal(path)?;
     if has_nonempty_recovery_companion(path)? {
         return Ok(());
     }

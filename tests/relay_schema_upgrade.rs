@@ -822,6 +822,34 @@ fn wal_mode_database_with_live_wal_opens_and_recovers() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// Both stores must refuse a non-empty `-wal` beside a path with NO database.
+/// The relay previously did not, because its preflight returned early when the
+/// database was absent while the state store reached the guard unconditionally.
+/// That divergence is closed: such a companion is never legitimate recovery
+/// state, so there is nothing to preserve by allowing the create.
+#[test]
+fn planted_wal_beside_absent_database_is_refused() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("absent.sqlite");
+    let companion = directory.path().join("absent.sqlite-wal");
+    fs::write(&companion, vec![0xEE_u8; 4096])?;
+    assert!(!database.exists());
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    // Refused without creating anything, and the companion is untouched.
+    assert!(!database.exists());
+    assert_eq!(fs::read(&companion)?.len(), 4096);
+
+    // Removing the stray file restores the ability to create.
+    fs::remove_file(&companion)?;
+    drop(Relay::open_at(&database, NOW)?);
+    assert!(database.exists());
+    Ok(())
+}
+
 /// Creating a single file beside a healthy relay — with no write access to the
 /// database itself — used to destroy it permanently: `SQLite` opens a `-wal` on
 /// existence alone, so the planted file was replayed and checkpointed in before

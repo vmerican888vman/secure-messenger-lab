@@ -39,16 +39,17 @@ use crate::{LabError, Result};
 /// is not legitimate recovery state. That holds because `SQLite` checkpoints
 /// and unlinks the `-wal` before flipping the header out of WAL mode, so a
 /// crash mid-conversion leaves a WAL-mode header with no companion, never the
-/// reverse: 1018 crash trials across both directions produced the refused
-/// combination zero times. A genuine WAL-mode database with a live `-wal`
-/// passes this check unharmed.
+/// reverse. That ordering is in the bundled engine, not inferred from crash
+/// sampling: in `libsqlite3-sys` 0.37.0 / `SQLite` 3.51.3, `OP_JournalMode`
+/// calls `sqlite3PagerCloseWal`, whose comment reads "checkpoints and deletes
+/// the write-ahead-log file", and only then calls `sqlite3PagerSetJournalMode`
+/// to change the header. Re-verify this on any `SQLite` bump. A genuine
+/// WAL-mode database with a live `-wal` passes this check unharmed.
 ///
-/// The two stores diverge on creation, because the relay reaches this guard
-/// through a preflight that returns early when the database is absent while
-/// the state store reaches it from `open_connection` unconditionally. So a
-/// stray non-empty `-wal` beside a path with no database refuses a state-store
-/// create and does not refuse a relay create. Both are fail-closed or harmless
-/// and neither is self-inflicted, since neither store ever enables WAL.
+/// Both stores refuse alike, including when the database itself is absent: a
+/// non-empty `-wal` with no main database is never legitimate recovery state,
+/// so there is nothing to preserve by allowing the open. Neither store ever
+/// enables WAL, so this cannot be self-inflicted.
 ///
 /// The guard covers this crate's own open paths, not the filesystem. Any other
 /// `SQLite` client that opens the same path while the planted file exists still
@@ -74,10 +75,17 @@ pub(crate) fn reject_anomalous_wal(path: &Path) -> Result<()> {
 
 /// Whether an exact-suffix companion exists and is non-empty.
 ///
-/// Companion names are derived from the fully resolved path because `SQLite`
-/// names its journal after the link target, not the link. Deriving them from an
-/// unresolved symlink would miss a genuine hot journal and reject a recoverable
-/// database.
+/// Callers resolve the path before calling this, because `SQLite` names its
+/// journal after the link target rather than the link, and deriving companion
+/// names from an unresolved symlink would miss a genuine hot journal and reject
+/// a recoverable database. This function itself performs no resolution and
+/// appends the suffix to whatever it is given.
+///
+/// Resolution is best-effort at the call site: [`reject_anomalous_wal`] falls
+/// back to the unresolved path when `canonicalize` fails, which it does for any
+/// path that does not exist — the normal case for a first create. A dangling
+/// symlink therefore escapes the guard, which is benign because the target is
+/// created fresh and a planted WAL's salts cannot match it.
 ///
 /// # Errors
 ///

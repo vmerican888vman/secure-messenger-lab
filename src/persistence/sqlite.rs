@@ -59,7 +59,10 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
     /// # Errors
     ///
     /// Returns a coarse storage error if protection, encryption, schema, RNG,
-    /// or the initial atomic write fails.
+    /// or the initial atomic write fails, and when the create is *refused* — a
+    /// non-empty `-wal` beside this path fails closed even with no database
+    /// present, because such a companion is never legitimate recovery state.
+    /// See [`reject_anomalous_wal`](crate::companion::reject_anomalous_wal).
     pub fn create(path: &Path, protector: P, state: &[u8]) -> Result<Self> {
         let mut rng = OsRng;
         Self::create_with_rng(path, protector, state, &mut rng)
@@ -138,7 +141,10 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
     /// # Errors
     ///
     /// Returns a coarse storage error for an invalid schema/binding/key or an
-    /// unauthenticated or malformed state envelope.
+    /// unauthenticated or malformed state envelope, and when the open is
+    /// *refused* — a non-empty `-wal` beside a database not in WAL mode fails
+    /// closed even though `SQLite` could have opened it.
+    /// See [`reject_anomalous_wal`](crate::companion::reject_anomalous_wal).
     pub fn open(path: &Path, protector: P) -> Result<Self> {
         // Expected binding must be loaded independently of, and before trusting,
         // any bytes supplied by the database.
