@@ -822,6 +822,117 @@ fn wal_mode_database_with_live_wal_opens_and_recovers() -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// Pins what the dangling-symlink escape actually does, because two earlier
+/// comments described it wrongly in opposite directions — first as benign for a
+/// false reason, then as a foreign-content replay that is not reachable.
+///
+/// The positive control is load-bearing: without it, "no foreign marker landed"
+/// is equally consistent with the guard having held, which is the reading that
+/// produced the first wrong comment.
+#[test]
+fn dangling_symlink_escapes_the_guard_but_cannot_replay() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+
+    // Build a genuinely replayable WAL carrying a recognizable schema object.
+    let source = directory.path().join("source.sqlite");
+    drop(Relay::open_at(&source, NOW)?);
+    let staging = Connection::open(&source)?;
+    staging.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA wal_autocheckpoint = 0;
+         CREATE TABLE marker_tbl(x);",
+    )?;
+    let planted = fs::read(directory.path().join("source.sqlite-wal"))?;
+    std::mem::forget(staging);
+    assert!(!planted.is_empty());
+
+    // POSITIVE CONTROL: against a target that already holds pages, this exact
+    // WAL really is replayed. Opened raw, deliberately bypassing the guard.
+    let control = directory.path().join("control.sqlite");
+    drop(Relay::open_at(&control, NOW)?);
+    fs::write(directory.path().join("control.sqlite-wal"), &planted)?;
+    let raw = Connection::open(&control)?;
+    let replayed = raw.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'marker_tbl'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    drop(raw);
+    assert_eq!(
+        replayed, 1,
+        "control must replay, or the fixture proves nothing"
+    );
+
+    // THE ESCAPE: dangling symlink, WAL planted at the resolved target name.
+    let target = directory.path().join("target.sqlite");
+    let link = directory.path().join("link.sqlite");
+    std::os::unix::fs::symlink(&target, &link)?;
+    assert!(!target.exists());
+    let target_wal = directory.path().join("target.sqlite-wal");
+    fs::write(&target_wal, &planted)?;
+
+    // The guard is bypassed: the open succeeds where it should have refused.
+    drop(Relay::open_at(&link, NOW)?);
+    assert!(target.exists());
+
+    // But nothing foreign is replayed, and the orphan companion is consumed.
+    assert!(!target_wal.exists());
+    let inspector = Connection::open(&target)?;
+    let leaked = inspector.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'marker_tbl'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    drop(inspector);
+    assert_eq!(leaked, 0);
+
+    // The window is exactly the first create: now the target exists, the guard
+    // resolves and applies.
+    fs::write(&target_wal, &planted)?;
+    assert!(matches!(
+        Relay::open_at(&link, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    Ok(())
+}
+
+/// The RELAY must refuse a non-empty `-wal` beside a path with NO database. It
+/// previously did not, because its preflight returned early when the database
+/// was absent while the state store reached the guard unconditionally. That
+/// divergence is closed: such a companion is never legitimate recovery state,
+/// so there is nothing to preserve by allowing the create. The state store half
+/// is pinned separately by
+/// `persistence::sqlite::tests::planted_wal_beside_absent_database_is_refused`.
+///
+/// The planted bytes are not a valid WAL, which is enough here because the
+/// guard tests only non-emptiness plus the main header. This therefore pins a
+/// store-consistency property — fail closed rather than create over an
+/// unexplained companion — and not resistance to replay, which
+/// `dangling_symlink_escapes_the_guard_but_cannot_replay` covers with a real
+/// WAL and a positive control.
+#[test]
+fn planted_wal_beside_absent_database_is_refused() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let database = directory.path().join("absent.sqlite");
+    let companion = directory.path().join("absent.sqlite-wal");
+    fs::write(&companion, vec![0xEE_u8; 4096])?;
+    assert!(!database.exists());
+
+    assert!(matches!(
+        Relay::open_at(&database, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+    // Refused without creating anything, and the companion is untouched.
+    assert!(!database.exists());
+    assert_eq!(fs::read(&companion)?.len(), 4096);
+
+    // Removing the stray file restores the ability to create.
+    fs::remove_file(&companion)?;
+    drop(Relay::open_at(&database, NOW)?);
+    assert!(database.exists());
+    Ok(())
+}
+
 /// Creating a single file beside a healthy relay — with no write access to the
 /// database itself — used to destroy it permanently: `SQLite` opens a `-wal` on
 /// existence alone, so the planted file was replayed and checkpointed in before

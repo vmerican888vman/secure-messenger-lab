@@ -59,7 +59,10 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
     /// # Errors
     ///
     /// Returns a coarse storage error if protection, encryption, schema, RNG,
-    /// or the initial atomic write fails.
+    /// or the initial atomic write fails, and when the create is *refused* — a
+    /// non-empty `-wal` beside this path fails closed even with no database
+    /// present, because such a companion is never legitimate recovery state.
+    /// See [`reject_anomalous_wal`](crate::companion::reject_anomalous_wal).
     pub fn create(path: &Path, protector: P, state: &[u8]) -> Result<Self> {
         let mut rng = OsRng;
         Self::create_with_rng(path, protector, state, &mut rng)
@@ -138,7 +141,10 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
     /// # Errors
     ///
     /// Returns a coarse storage error for an invalid schema/binding/key or an
-    /// unauthenticated or malformed state envelope.
+    /// unauthenticated or malformed state envelope, and when the open is
+    /// *refused* — a non-empty `-wal` beside a database not in WAL mode fails
+    /// closed even though `SQLite` could have opened it.
+    /// See [`reject_anomalous_wal`](crate::companion::reject_anomalous_wal).
     pub fn open(path: &Path, protector: P) -> Result<Self> {
         // Expected binding must be loaded independently of, and before trusting,
         // any bytes supplied by the database.
@@ -915,6 +921,35 @@ mod tests {
         let reopened = ClientStateStore::open(&victim, TestProtector::new(53, 54))?;
         assert_eq!(reopened.state()?, b"irreplaceable-state");
         assert_eq!(reopened.generation()?, 1);
+        Ok(())
+    }
+
+    /// The state-store half of the harmonized absent-database refusal. The
+    /// relay half is pinned by `planted_wal_beside_absent_database_is_refused`
+    /// in `tests/relay_schema_upgrade.rs`; this exists so the shared claim is
+    /// pinned on both routes rather than asserted for one and assumed for the
+    /// other.
+    #[test]
+    fn planted_wal_beside_absent_database_is_refused()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = database(&directory, "absent.sqlite");
+        let companion = directory.path().join("absent.sqlite-wal");
+        fs::write(&companion, vec![0xEE_u8; 4096])?;
+        assert!(!path.exists());
+
+        assert!(matches!(
+            ClientStateStore::create(&path, TestProtector::new(57, 58), b"state"),
+            Err(LabError::Storage)
+        ));
+        // Refused without creating anything; the companion is untouched.
+        assert!(!path.exists());
+        assert_eq!(fs::read(&companion)?.len(), 4096);
+
+        // Removing the stray file restores the ability to create.
+        fs::remove_file(&companion)?;
+        let created = ClientStateStore::create(&path, TestProtector::new(57, 58), b"state")?;
+        assert_eq!(created.state()?, b"state");
         Ok(())
     }
 

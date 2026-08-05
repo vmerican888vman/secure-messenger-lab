@@ -34,21 +34,38 @@ use crate::{LabError, Result};
 /// accept one, and convert it back, so this is not a claim that the header is
 /// always rollback-mode. A *failed* open does leave it: both stores validate
 /// before setting the pragma, so a rejected database keeps its WAL-mode header.
-/// What this does mean is that a SUCCESSFUL open never *ends* in WAL mode,
-/// so a `-wal` beside a rollback-mode header did not come from this crate and
-/// is not legitimate recovery state. That holds because `SQLite` checkpoints
-/// and unlinks the `-wal` before flipping the header out of WAL mode, so a
-/// crash mid-conversion leaves a WAL-mode header with no companion, never the
-/// reverse: 1018 crash trials across both directions produced the refused
-/// combination zero times. A genuine WAL-mode database with a live `-wal`
-/// passes this check unharmed.
+/// What this does mean is that a SUCCESSFUL open never *ends* in WAL mode, so
+/// a `-wal` beside a rollback-mode header is an AMBIGUOUS state that this crate
+/// deliberately refuses — not, as earlier versions of this comment claimed, a
+/// state this crate cannot produce.
 ///
-/// The two stores diverge on creation, because the relay reaches this guard
-/// through a preflight that returns early when the database is absent while
-/// the state store reaches it from `open_connection` unconditionally. So a
-/// stray non-empty `-wal` beside a path with no database refuses a state-store
-/// create and does not refuse a relay create. Both are fail-closed or harmless
-/// and neither is self-inflicted, since neither store ever enables WAL.
+/// The normal ordering does favour that reading: in `libsqlite3-sys` 0.37.0 /
+/// `SQLite` 3.51.3, `OP_JournalMode` calls `sqlite3PagerCloseWal` — whose
+/// call-site comment reads "checkpoints and deletes the write-ahead-log file" —
+/// and only afterwards calls `sqlite3BtreeSetVersion`, which assigns header
+/// bytes 18 and 19. (`sqlite3PagerSetJournalMode`, called in between, only
+/// updates an in-memory field on this path.) A non-OK result from the
+/// checkpoint skips the header write.
+///
+/// But the cleanup itself is best-effort, so the combination IS reachable
+/// without an attacker. `walLimitSize` states outright "If an error occurs
+/// while doing so, ignore it", and the unlink after a successful checkpoint is
+/// likewise not error-checked. A checkpoint that succeeds followed by a
+/// deletion or truncation that fails leaves exactly this state: header flipped
+/// out of WAL mode, non-empty `-wal` still present. Refusing is therefore
+/// fail-closed on an ambiguity, not detection of a foreign file. Re-verify on
+/// any `SQLite` bump.
+///
+/// Scope: that is the ordering for a journal-mode *change*. `SQLite` has other
+/// configurations this crate does not use where a WAL survives close —
+/// `SQLITE_FCNTL_PERSIST_WAL` with a negative `journal_size_limit` — so read
+/// the guarantee as covering this crate's usage, not `SQLite` universally. A
+/// genuine WAL-mode database with a live `-wal` passes this check unharmed.
+///
+/// Both stores refuse alike, including when the database itself is absent: a
+/// non-empty `-wal` with no main database is never legitimate recovery state,
+/// so there is nothing to preserve by allowing the open. Neither store ever
+/// enables WAL, so this cannot be self-inflicted.
 ///
 /// The guard covers this crate's own open paths, not the filesystem. Any other
 /// `SQLite` client that opens the same path while the planted file exists still
@@ -74,10 +91,52 @@ pub(crate) fn reject_anomalous_wal(path: &Path) -> Result<()> {
 
 /// Whether an exact-suffix companion exists and is non-empty.
 ///
-/// Companion names are derived from the fully resolved path because `SQLite`
-/// names its journal after the link target, not the link. Deriving them from an
-/// unresolved symlink would miss a genuine hot journal and reject a recoverable
-/// database.
+/// Callers resolve the path before calling this, because `SQLite` names its
+/// journal after the link target rather than the link, and deriving companion
+/// names from an unresolved symlink would miss a genuine hot journal and reject
+/// a recoverable database. This function itself performs no resolution and
+/// appends the suffix to whatever it is given.
+///
+/// Resolution is best-effort at the call site: [`reject_anomalous_wal`] falls
+/// back to the unresolved path when `canonicalize` fails, which it does for any
+/// path that does not exist — the normal case for a first create. A dangling
+/// symlink therefore escapes the guard entirely: the guard tests the link name
+/// while `SQLite` uses the target name.
+///
+/// That escape is a real gap, but a narrow one, and two earlier versions of
+/// this comment described it wrongly in opposite directions. Measured, with a
+/// positive control proving the fixture replays elsewhere:
+///
+/// The escape needs `canonicalize` to fail AND the guard's companion name to
+/// differ from `SQLite`'s, which requires the *final* path component to be a
+/// symlink — `fs::metadata` resolves intermediate ones, so a symlinked parent
+/// directory diverges not at all. If that symlink's target exists,
+/// `canonicalize` succeeds and the guard resolves correctly. So reaching the
+/// escape implies the target is absent, `SQLite` creates it at zero pages, and
+/// `pagerOpenWalIfPresent` *deletes* a planted WAL rather than opening it. No
+/// foreign content is replayed; that outcome was measured, not assumed.
+///
+/// What is actually lost is the refusal: instead of failing closed, the open
+/// succeeds and silently consumes the orphan companion. The window is exactly
+/// the first create — afterwards the target exists, `canonicalize` succeeds and
+/// the guard applies. The byte-preservation property stated above is not
+/// violated so much as inapplicable, since nothing is refused and no database
+/// bytes exist yet to preserve.
+///
+/// Do not read this as "a planted WAL is replayed through a symlink". That is
+/// true of a target that already holds pages, which is why this guard exists,
+/// and reaching it from this escape needs the target to acquire pages between
+/// the check and the open — a race or a retargeted link — not the plain case.
+///
+/// Nor is any of this prevented by WAL salts, whatever an earlier version of
+/// this comment implied in either direction. `SQLite` does compare frame salts,
+/// but only against the WAL's own header, so they authenticate a WAL's internal
+/// consistency and bind it to nothing in the adjacent database. A foreign WAL
+/// is internally consistent and passes that check.
+///
+/// Closing this needs the path boundary itself — refusing symlinked database
+/// paths and inspecting companions without following links — which belongs with
+/// the private-directory recovery boundary rather than a patch here.
 ///
 /// # Errors
 ///
