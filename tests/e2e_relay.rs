@@ -34,7 +34,7 @@ fn paired_clients() -> Result<(OlmClient, OlmClient, VerifiedPeerPreKey), Box<dy
 fn ciphertext_is_stored_then_logically_erased_after_recipient_ack() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("relay.sqlite");
-    let mut relay = Relay::open(&database)?;
+    let mut relay = Relay::open_with_path_for_test(&database)?;
     let (mut alice, mut bob, verified_alice) = paired_clients()?;
     let bob_inbox = MailboxOwner::new();
     relay.register(&bob_inbox.registration(NOW + 60), NOW)?;
@@ -84,7 +84,7 @@ fn ciphertext_is_stored_then_logically_erased_after_recipient_ack() -> Result<()
     assert!(!joined_events.contains(canary));
     assert!(!contains(joined_events.as_bytes(), packet.as_bytes()));
     drop(relay);
-    let mut reopened = Relay::open_at(&database, NOW + 1)?;
+    let mut reopened = Relay::open_at_with_path_for_test(&database, NOW + 1)?;
     assert_eq!(reopened.queued_message_count_at(NOW + 1)?, 0);
     assert_eq!(reopened.tombstone_count()?, 1);
     Ok(())
@@ -334,7 +334,7 @@ fn restart_sweeps_idle_expired_ciphertext_without_a_recipient_fetch() -> Result<
     let packet = EncryptedPacket::from_untrusted(b"restart-expiry-ciphertext".to_vec());
     let packet_bytes = packet.as_bytes().to_vec();
 
-    let mut relay = Relay::open_at(&database, NOW)?;
+    let mut relay = Relay::open_at_with_path_for_test(&database, NOW)?;
     relay.register(&mailbox.registration(NOW + 60), NOW)?;
     relay.enqueue(
         &mailbox
@@ -345,7 +345,7 @@ fn restart_sweeps_idle_expired_ciphertext_without_a_recipient_fetch() -> Result<
     drop(relay);
     assert!(contains(&fs::read(&database)?, &packet_bytes));
 
-    let relay = Relay::open_at(&database, NOW + 2)?;
+    let relay = Relay::open_at_with_path_for_test(&database, NOW + 2)?;
     drop(relay);
     let connection = Connection::open(&database)?;
     let queued = connection.query_row("SELECT COUNT(*) FROM messages", [], |row| {
@@ -390,7 +390,7 @@ fn concurrent_identical_sends_resolve_to_stored_plus_duplicate() -> Result<(), B
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("relay.sqlite");
     let mailbox = MailboxOwner::new();
-    let mut setup_relay = Relay::open_at(&database, NOW)?;
+    let mut setup_relay = Relay::open_at_with_path_for_test(&database, NOW)?;
     setup_relay.register(&mailbox.registration(NOW + 60), NOW)?;
     drop(setup_relay);
 
@@ -399,8 +399,8 @@ fn concurrent_identical_sends_resolve_to_stored_plus_duplicate() -> Result<(), B
         EncryptedPacket::from_untrusted(b"concurrent-ciphertext".to_vec()),
         NOW + 60,
     );
-    let mut relay_one = Relay::open_at(&database, NOW)?;
-    let mut relay_two = Relay::open_at(&database, NOW)?;
+    let mut relay_one = Relay::open_at_with_path_for_test(&database, NOW)?;
+    let mut relay_two = Relay::open_at_with_path_for_test(&database, NOW)?;
     let barrier = Arc::new(Barrier::new(3));
     let request_one = request.clone();
     let request_two = request;
@@ -427,7 +427,7 @@ fn concurrent_identical_sends_resolve_to_stored_plus_duplicate() -> Result<(), B
             || matches!(first, EnqueueOutcome::Duplicate)
                 && matches!(second, EnqueueOutcome::Stored)
     );
-    let mut verification = Relay::open_at(&database, NOW)?;
+    let mut verification = Relay::open_at_with_path_for_test(&database, NOW)?;
     assert_eq!(verification.queued_message_count_at(NOW)?, 1);
     Ok(())
 }
@@ -437,7 +437,7 @@ fn concurrent_conflicting_sends_resolve_to_stored_plus_conflict() -> Result<(), 
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("relay.sqlite");
     let mailbox = MailboxOwner::new();
-    let mut setup_relay = Relay::open_at(&database, NOW)?;
+    let mut setup_relay = Relay::open_at_with_path_for_test(&database, NOW)?;
     setup_relay.register(&mailbox.registration(NOW + 60), NOW)?;
     drop(setup_relay);
 
@@ -453,8 +453,8 @@ fn concurrent_conflicting_sends_resolve_to_stored_plus_conflict() -> Result<(), 
         EncryptedPacket::from_untrusted(b"concurrent-conflict-two".to_vec()),
         NOW + 60,
     );
-    let mut relay_one = Relay::open_at(&database, NOW)?;
-    let mut relay_two = Relay::open_at(&database, NOW)?;
+    let mut relay_one = Relay::open_at_with_path_for_test(&database, NOW)?;
+    let mut relay_two = Relay::open_at_with_path_for_test(&database, NOW)?;
     let barrier = Arc::new(Barrier::new(3));
 
     let (first, second) = thread::scope(|scope| {
@@ -489,7 +489,7 @@ fn concurrent_conflicting_sends_resolve_to_stored_plus_conflict() -> Result<(), 
             .count(),
         1
     );
-    let mut verification = Relay::open_at(&database, NOW)?;
+    let mut verification = Relay::open_at_with_path_for_test(&database, NOW)?;
     assert_eq!(verification.queued_message_count_at(NOW)?, 1);
     Ok(())
 }
@@ -499,7 +499,7 @@ fn relay_schema_has_no_users_contacts_conversations_or_plaintext_columns()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("relay.sqlite");
-    let relay = Relay::open(&database)?;
+    let relay = Relay::open_with_path_for_test(&database)?;
     drop(relay);
     let connection = Connection::open(database)?;
     let mut statement = connection.prepare(

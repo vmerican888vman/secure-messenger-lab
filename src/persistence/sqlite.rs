@@ -10,6 +10,7 @@ use super::envelope::{
 };
 use super::protector::{ProfileBinding, ProtectionLevel, StateKeyProtector};
 use crate::companion::reject_anomalous_wal;
+use crate::private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 use crate::{LabError, Result};
 
 const APPLICATION_ID: i64 = 0x534D_534C;
@@ -39,6 +40,11 @@ impl<T: CryptoRng + RngCore> RandomSource for T {}
 
 /// One encrypted, authenticated endpoint-state snapshot in a one-row `SQLite`
 /// database. Secret state is opaque to this layer.
+///
+/// Production construction goes through [`PrivateStoreDir`] only: the store
+/// owns the directory handle, holding the lifecycle lock for its own
+/// lifetime. The raw-path constructors are `#[cfg(test)]` and exist for the
+/// path-level hostile-fixture tests.
 pub struct ClientStateStore<P: StateKeyProtector> {
     connection: Connection,
     protector: P,
@@ -50,19 +56,71 @@ pub struct ClientStateStore<P: StateKeyProtector> {
     generation: u64,
     state: Zeroizing<Vec<u8>>,
     poisoned: bool,
+    // Held for the lifecycle lock and the boundary's entry validation. Only
+    // `None` through the cfg(test) raw-path constructors.
+    _dir: Option<PrivateStoreDir>,
 }
 
 impl<P: StateKeyProtector> ClientStateStore<P> {
-    /// Create generation one. The protector's independently held binding is
-    /// read before any state is written.
+    /// Create generation one inside a secured private directory. The
+    /// directory must contain no database or companion
+    /// ([`MainDatabase::Absent`]); the store takes ownership of the directory
+    /// handle and its lifecycle lock.
+    ///
+    /// The protector's independently held binding is read before any state is
+    /// written.
     ///
     /// # Errors
     ///
-    /// Returns a coarse storage error if protection, encryption, schema, RNG,
-    /// or the initial atomic write fails.
-    pub fn create(path: &Path, protector: P, state: &[u8]) -> Result<Self> {
+    /// Returns a coarse storage error if the directory already holds a
+    /// database or companion, or if protection, encryption, schema, RNG, or
+    /// the initial atomic write fails.
+    pub fn create(dir: PrivateStoreDir, protector: P, state: &[u8]) -> Result<Self> {
+        if dir.kind() != StoreKind::ClientState
+            || dir.main_database_at_open() != MainDatabase::Absent
+        {
+            return Err(LabError::Storage);
+        }
+        dir.create_main_database_file()?;
+        Self::create_at_path(&dir.database_path(), protector, state, Some(dir))
+    }
+
+    /// Open and authenticate the one authoritative snapshot inside a secured
+    /// private directory, which must hold a non-empty validated database
+    /// ([`MainDatabase::Present`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error when no usable database exists or for
+    /// an invalid schema/binding/key or an unauthenticated or malformed state
+    /// envelope.
+    pub fn open(dir: PrivateStoreDir, protector: P) -> Result<Self> {
+        if dir.kind() != StoreKind::ClientState
+            || dir.main_database_at_open() != MainDatabase::Present
+        {
+            return Err(LabError::Storage);
+        }
+        Self::open_at_path(&dir.database_path(), protector, Some(dir))
+    }
+
+    #[cfg(test)]
+    fn create_with_path(path: &Path, protector: P, state: &[u8]) -> Result<Self> {
+        Self::create_at_path(path, protector, state, None)
+    }
+
+    #[cfg(test)]
+    fn open_with_path(path: &Path, protector: P) -> Result<Self> {
+        Self::open_at_path(path, protector, None)
+    }
+
+    fn create_at_path(
+        path: &Path,
+        protector: P,
+        state: &[u8],
+        dir: Option<PrivateStoreDir>,
+    ) -> Result<Self> {
         let mut rng = OsRng;
-        Self::create_with_rng(path, protector, state, &mut rng)
+        Self::create_with_rng(path, protector, state, &mut rng, dir)
     }
 
     fn create_with_rng<R: RandomSource>(
@@ -70,6 +128,7 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
         protector: P,
         state: &[u8],
         rng: &mut R,
+        dir: Option<PrivateStoreDir>,
     ) -> Result<Self> {
         let binding = protector.expected_binding()?;
         let mut connection = open_connection(path)?;
@@ -130,16 +189,11 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
             generation: 1,
             state: candidate_state,
             poisoned: false,
+            _dir: dir,
         })
     }
 
-    /// Open and authenticate the one authoritative snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns a coarse storage error for an invalid schema/binding/key or an
-    /// unauthenticated or malformed state envelope.
-    pub fn open(path: &Path, protector: P) -> Result<Self> {
+    fn open_at_path(path: &Path, protector: P, dir: Option<PrivateStoreDir>) -> Result<Self> {
         // Expected binding must be loaded independently of, and before trusting,
         // any bytes supplied by the database.
         let binding = protector.expected_binding()?;
@@ -172,6 +226,7 @@ impl<P: StateKeyProtector> ClientStateStore<P> {
             generation: row.generation,
             state,
             poisoned: false,
+            _dir: dir,
         })
     }
 
@@ -821,7 +876,7 @@ mod tests {
         let operation = env::var(CHILD_OPERATION)?;
         match operation.as_str() {
             "create" => {
-                let _ = ClientStateStore::create(
+                let _ = ClientStateStore::create_with_path(
                     Path::new(&path),
                     TestProtector::new(31, 32),
                     b"created",
@@ -829,7 +884,7 @@ mod tests {
             }
             "commit" => {
                 let mut store =
-                    ClientStateStore::open(Path::new(&path), TestProtector::new(31, 32))?;
+                    ClientStateStore::open_with_path(Path::new(&path), TestProtector::new(31, 32))?;
                 store.commit(b"committed")?;
             }
             "wal-crash" => {
@@ -865,7 +920,7 @@ mod tests {
 
         // Stage a WAL elsewhere carrying a schema the store would reject.
         let attacker = database(&directory, "attacker.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &attacker,
             TestProtector::new(51, 52),
             b"attacker",
@@ -883,7 +938,7 @@ mod tests {
 
         // Victim: a healthy store holding secret state.
         let victim = database(&directory, "victim.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &victim,
             TestProtector::new(53, 54),
             b"irreplaceable-state",
@@ -896,7 +951,7 @@ mod tests {
 
         for _ in 0..3 {
             assert!(matches!(
-                ClientStateStore::open(&victim, TestProtector::new(53, 54)),
+                ClientStateStore::open_with_path(&victim, TestProtector::new(53, 54)),
                 Err(LabError::Storage)
             ));
         }
@@ -912,7 +967,7 @@ mod tests {
 
         // Recoverable: remove the planted file and the state is still there.
         fs::remove_file(directory.path().join("victim.sqlite-wal"))?;
-        let reopened = ClientStateStore::open(&victim, TestProtector::new(53, 54))?;
+        let reopened = ClientStateStore::open_with_path(&victim, TestProtector::new(53, 54))?;
         assert_eq!(reopened.state()?, b"irreplaceable-state");
         assert_eq!(reopened.generation()?, 1);
         Ok(())
@@ -932,7 +987,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "wal-live.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &path,
             TestProtector::new(55, 56),
             b"wal-mode-state",
@@ -953,7 +1008,7 @@ mod tests {
         assert!(fs::metadata(directory.path().join("wal-live.sqlite-wal"))?.len() > 0);
 
         // Must reach the pass-through arm and open, not be refused.
-        let opened = ClientStateStore::open(&path, TestProtector::new(55, 56))?;
+        let opened = ClientStateStore::open_with_path(&path, TestProtector::new(55, 56))?;
         assert_eq!(opened.state()?, b"wal-mode-state");
         Ok(())
     }
@@ -971,7 +1026,7 @@ mod tests {
         for canary in canaries {
             state.extend_from_slice(canary);
         }
-        let store = ClientStateStore::create(&path, TestProtector::new(1, 2), &state)?;
+        let store = ClientStateStore::create_with_path(&path, TestProtector::new(1, 2), &state)?;
         assert_eq!(store.state()?, state);
         assert_eq!(store.generation()?, 1);
         let debug = format!("{store:?}");
@@ -984,7 +1039,7 @@ mod tests {
             assert!(!error_debug.contains(text));
         }
         drop(store);
-        let reopened = ClientStateStore::open(&path, TestProtector::new(1, 2))?;
+        let reopened = ClientStateStore::open_with_path(&path, TestProtector::new(1, 2))?;
         assert_eq!(reopened.state()?, state);
         drop(reopened);
         for entry in fs::read_dir(directory.path())? {
@@ -1002,22 +1057,22 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
         let rollback = database(&directory, "rollback.sqlite");
-        let mut store = ClientStateStore::create(&path, TestProtector::new(3, 4), b"old")?;
+        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(3, 4), b"old")?;
         fs::copy(&path, &rollback)?;
         store.commit(b"new")?;
         drop(store);
         // This is deliberately an accepted, documented rollback limitation.
         fs::copy(&rollback, &path)?;
         assert_eq!(
-            ClientStateStore::open(&path, TestProtector::new(3, 4))?.state()?,
+            ClientStateStore::open_with_path(&path, TestProtector::new(3, 4))?.state()?,
             b"old"
         );
-        assert!(ClientStateStore::open(&path, TestProtector::new(9, 10)).is_err());
-        assert!(ClientStateStore::open(&path, TestProtector::with_mask(3, 4, 99)).is_err());
+        assert!(ClientStateStore::open_with_path(&path, TestProtector::new(9, 10)).is_err());
+        assert!(ClientStateStore::open_with_path(&path, TestProtector::with_mask(3, 4, 99)).is_err());
         let connection = Connection::open(&path)?;
         connection.execute("UPDATE client_state SET ciphertext = zeroblob(16)", [])?;
         drop(connection);
-        assert!(ClientStateStore::open(&path, TestProtector::new(3, 4)).is_err());
+        assert!(ClientStateStore::open_with_path(&path, TestProtector::new(3, 4)).is_err());
         Ok(())
     }
 
@@ -1031,7 +1086,7 @@ mod tests {
             fail: false,
         };
         let mut store =
-            ClientStateStore::create_with_rng(&path, TestProtector::new(5, 6), b"one", &mut rng)?;
+            ClientStateStore::create_with_rng(&path, TestProtector::new(5, 6), b"one", &mut rng, None)?;
         let first_nonce = store.connection.query_row(
             "SELECT nonce FROM client_state WHERE slot = 1",
             [],
@@ -1054,10 +1109,10 @@ mod tests {
         drop(store);
         let maximum = vec![7_u8; MAX_CIPHERTEXT_BYTES - 16];
         let max_path = database(&directory, "max.sqlite");
-        assert!(ClientStateStore::create(&max_path, TestProtector::new(7, 8), &maximum).is_ok());
+        assert!(ClientStateStore::create_with_path(&max_path, TestProtector::new(7, 8), &maximum).is_ok());
         let over_path = database(&directory, "over.sqlite");
         let over = vec![7_u8; MAX_CIPHERTEXT_BYTES - 15];
-        assert!(ClientStateStore::create(&over_path, TestProtector::new(9, 10), &over).is_err());
+        assert!(ClientStateStore::create_with_path(&over_path, TestProtector::new(9, 10), &over).is_err());
         let over_database = Connection::open(&over_path)?;
         assert_eq!(
             over_database.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
@@ -1083,6 +1138,7 @@ mod tests {
                 TestProtector::new(21, 22),
                 b"state",
                 &mut failing,
+                None,
             )
             .is_err()
         );
@@ -1112,6 +1168,7 @@ mod tests {
             TestProtector::new(21, 22),
             b"state",
             &mut good,
+            None,
         )?;
         assert_eq!(store.state()?, b"state");
         Ok(())
@@ -1130,12 +1187,12 @@ mod tests {
             let marker = database(&directory, &format!("{failpoint}.marker"));
             run_forced_death_child(&path, "create", failpoint, &marker)?;
             if failpoint == "create_after_commit" {
-                let store = ClientStateStore::open(&path, TestProtector::new(31, 32))?;
+                let store = ClientStateStore::open_with_path(&path, TestProtector::new(31, 32))?;
                 assert_eq!(store.state()?, b"created");
             } else {
-                assert!(ClientStateStore::open(&path, TestProtector::new(31, 32)).is_err());
+                assert!(ClientStateStore::open_with_path(&path, TestProtector::new(31, 32)).is_err());
                 let store =
-                    ClientStateStore::create(&path, TestProtector::new(31, 32), b"retried")?;
+                    ClientStateStore::create_with_path(&path, TestProtector::new(31, 32), b"retried")?;
                 assert_eq!(store.state()?, b"retried");
             }
         }
@@ -1153,13 +1210,13 @@ mod tests {
         ] {
             let path = database(&directory, &format!("{failpoint}.sqlite"));
             let marker = database(&directory, &format!("{failpoint}.marker"));
-            drop(ClientStateStore::create(
+            drop(ClientStateStore::create_with_path(
                 &path,
                 TestProtector::new(31, 32),
                 b"old",
             )?);
             run_forced_death_child(&path, "commit", failpoint, &marker)?;
-            let store = ClientStateStore::open(&path, TestProtector::new(31, 32))?;
+            let store = ClientStateStore::open_with_path(&path, TestProtector::new(31, 32))?;
             assert_eq!(store.state()?, expected);
         }
         Ok(())
@@ -1170,7 +1227,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "wrapper-race.sqlite");
-        let mut store = ClientStateStore::create(&path, TestProtector::new(23, 24), b"old")?;
+        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(23, 24), b"old")?;
         let attacker = Connection::open(&path)?;
         let wrapper_length = attacker.query_row(
             "SELECT length(wrapped_dek) FROM client_state WHERE slot = 1",
@@ -1198,7 +1255,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         for (name, tamper_nonce) in [("nonce.sqlite", true), ("ciphertext.sqlite", false)] {
             let path = database(&directory, name);
-            let mut store = ClientStateStore::create(&path, TestProtector::new(27, 28), b"old")?;
+            let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(27, 28), b"old")?;
             let attacker = Connection::open(&path)?;
             let column = if tamper_nonce { "nonce" } else { "ciphertext" };
             let query = format!("SELECT {column} FROM client_state WHERE slot = 1");
@@ -1240,6 +1297,7 @@ mod tests {
             TestProtector::new(25, 26),
             b"one",
             &mut first_rng,
+            None,
         )?;
         fs::copy(&path, &snapshot)?;
         first.commit_with_rng(b"first-generation-two", &mut first_rng)?;
@@ -1251,7 +1309,7 @@ mod tests {
         drop(first);
 
         fs::copy(&snapshot, &path)?;
-        let mut divergent = ClientStateStore::open(&path, TestProtector::new(25, 26))?;
+        let mut divergent = ClientStateStore::open_with_path(&path, TestProtector::new(25, 26))?;
         let mut second_rng = TestRng {
             next: 201,
             fail: false,
@@ -1271,7 +1329,7 @@ mod tests {
     fn committed_nonce_corpus_is_unique() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "nonce-corpus.sqlite");
-        let mut store = ClientStateStore::create(&path, TestProtector::new(33, 34), b"zero")?;
+        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(33, 34), b"zero")?;
         let mut seen = HashSet::new();
         assert!(seen.insert(store.nonce.to_vec()));
         for generation in 2_u64..=128 {
@@ -1286,12 +1344,12 @@ mod tests {
     fn exact_schema_rejects_extra_objects() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
-        let store = ClientStateStore::create(&path, TestProtector::new(13, 14), b"state")?;
+        let store = ClientStateStore::create_with_path(&path, TestProtector::new(13, 14), b"state")?;
         drop(store);
         let connection = Connection::open(&path)?;
         connection.execute_batch("CREATE TABLE extra_state(value INTEGER) STRICT;")?;
         drop(connection);
-        assert!(ClientStateStore::open(&path, TestProtector::new(13, 14)).is_err());
+        assert!(ClientStateStore::open_with_path(&path, TestProtector::new(13, 14)).is_err());
         Ok(())
     }
 
@@ -1365,7 +1423,7 @@ mod tests {
         before: &FullRow,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         assert!(matches!(
-            ClientStateStore::open(path, protector),
+            ClientStateStore::open_with_path(path, protector),
             Err(LabError::Storage)
         ));
         let verifier = Connection::open(path)?;
@@ -1382,7 +1440,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "evil-delete-trigger.sqlite");
-        let mut store = ClientStateStore::create(&path, TestProtector::new(41, 42), b"guarded")?;
+        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(41, 42), b"guarded")?;
         let inspector = Connection::open(&path)?;
         let before = full_row(&inspector)?;
         drop(inspector);
@@ -1410,7 +1468,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "evil-ignore-trigger.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &path,
             TestProtector::new(43, 44),
             b"guarded",
@@ -1435,7 +1493,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "evil-view.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &path,
             TestProtector::new(45, 46),
             b"guarded",
@@ -1459,7 +1517,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "evil-table.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &path,
             TestProtector::new(47, 48),
             b"guarded",
@@ -1492,15 +1550,15 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "clean-control.sqlite");
-        drop(ClientStateStore::create(
+        drop(ClientStateStore::create_with_path(
             &path,
             TestProtector::new(49, 50),
             b"first",
         )?);
-        let mut store = ClientStateStore::open(&path, TestProtector::new(49, 50))?;
+        let mut store = ClientStateStore::open_with_path(&path, TestProtector::new(49, 50))?;
         store.commit(b"second")?;
         drop(store);
-        let store = ClientStateStore::open(&path, TestProtector::new(49, 50))?;
+        let store = ClientStateStore::open_with_path(&path, TestProtector::new(49, 50))?;
         assert_eq!(store.state()?, b"second");
         assert_eq!(store.generation()?, 2);
         Ok(())
@@ -1512,7 +1570,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         for (name, oversized_wrapper) in [("wrapper.sqlite", true), ("ciphertext.sqlite", false)] {
             let path = database(&directory, name);
-            let store = ClientStateStore::create(&path, TestProtector::new(29, 30), b"state")?;
+            let store = ClientStateStore::create_with_path(&path, TestProtector::new(29, 30), b"state")?;
             let binding = store.binding()?;
             drop(store);
             let connection = Connection::open(&path)?;
@@ -1541,8 +1599,8 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
-        let mut first = ClientStateStore::create(&path, TestProtector::new(11, 12), b"one")?;
-        let second = ClientStateStore::open(&path, TestProtector::new(11, 12))?;
+        let mut first = ClientStateStore::create_with_path(&path, TestProtector::new(11, 12), b"one")?;
+        let second = ClientStateStore::open_with_path(&path, TestProtector::new(11, 12))?;
         first.commit(b"two")?;
         let mut stale = second;
         assert!(stale.commit(b"three").is_err());
@@ -1551,9 +1609,56 @@ mod tests {
         assert!(stale.generation().is_err());
         assert!(stale.binding().is_err());
         assert_eq!(
-            ClientStateStore::open(&path, TestProtector::new(11, 12))?.state()?,
+            ClientStateStore::open_with_path(&path, TestProtector::new(11, 12))?.state()?,
             b"two"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn private_dir_create_open_round_trip() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store_path = directory.path().join("state-store");
+        let dir = PrivateStoreDir::create(&store_path, crate::StoreKind::ClientState)?;
+        let mut store = ClientStateStore::create(dir, TestProtector::new(71, 72), b"secured")?;
+        store.commit(b"secured-two")?;
+        drop(store);
+
+        let dir = PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState)?;
+        let reopened = ClientStateStore::open(dir, TestProtector::new(71, 72))?;
+        assert_eq!(reopened.state()?, b"secured-two");
+        assert_eq!(reopened.generation()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn private_dir_split_create_from_open() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        // Create over an existing database refuses.
+        let store_path = directory.path().join("occupied");
+        let dir = PrivateStoreDir::create(&store_path, crate::StoreKind::ClientState)?;
+        drop(ClientStateStore::create(dir, TestProtector::new(73, 74), b"one")?);
+        let dir = PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState)?;
+        assert!(ClientStateStore::create(dir, TestProtector::new(73, 74), b"two").is_err());
+
+        // Open without a database refuses.
+        let empty_path = directory.path().join("empty");
+        let dir = PrivateStoreDir::create(&empty_path, crate::StoreKind::ClientState)?;
+        assert!(ClientStateStore::open(dir, TestProtector::new(73, 74)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn store_holds_the_lifecycle_lock() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store_path = directory.path().join("locked");
+        let dir = PrivateStoreDir::create(&store_path, crate::StoreKind::ClientState)?;
+        let store = ClientStateStore::create(dir, TestProtector::new(75, 76), b"held")?;
+
+        assert!(PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState).is_err());
+
+        drop(store);
+        assert!(PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState).is_ok());
         Ok(())
     }
 }

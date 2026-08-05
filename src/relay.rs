@@ -11,6 +11,7 @@ use crate::capability::{
     AckRequest, DeleteMailboxRequest, FetchRequest, MailboxRegistration, SendRequest, digest,
 };
 use crate::companion::{database_header_uses_wal, nonempty_companion, reject_anomalous_wal};
+use crate::private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 use crate::{EncryptedPacket, LabError, MessageId, Nonce, QueueId, Result};
 
 const MAX_PACKET_BYTES: usize = 1_048_576;
@@ -57,22 +58,65 @@ impl std::fmt::Debug for StoredEnvelope {
 /// The schema intentionally has no users, contacts, conversations, groups, or
 /// plaintext columns. It stores per-mailbox public authorization keys, opaque
 /// queue/message identifiers, ciphertext, expiries, and bounded tombstones.
+///
+/// Production construction goes through [`PrivateStoreDir`] only, split into
+/// [`Relay::create`] (directory must hold no database) and [`Relay::open`]
+/// (directory must hold one validated non-empty database). The store owns the
+/// directory handle, holding the lifecycle lock for its own lifetime. The
+/// raw-path constructors are doc-hidden and exist for the path-level
+/// hostile-fixture tests.
 pub struct Relay {
     connection: Connection,
     audit_events: Vec<&'static str>,
+    // Held for the lifecycle lock and the boundary's entry validation. Only
+    // `None` for in-memory relays and the doc-hidden test constructors.
+    _dir: Option<PrivateStoreDir>,
 }
 
 impl Relay {
-    /// Open or create a file-backed relay database.
+    /// Create a file-backed relay database inside a secured private
+    /// directory. The directory must contain no database or companion
+    /// ([`MainDatabase::Absent`]).
     ///
     /// # Errors
     ///
-    /// Returns [`LabError::Storage`] if `SQLite` cannot open or initialize the
-    /// database, and also when the open is *refused* — a non-empty `-wal`
-    /// beside a database not in WAL mode fails closed even though `SQLite`
-    /// could have opened it. See [`reject_anomalous_wal`].
-    pub fn open(path: &Path) -> Result<Self> {
-        Self::open_at(path, unix_now()?)
+    /// Returns [`LabError::Storage`] if the directory already holds a
+    /// database or `SQLite` cannot initialize the schema.
+    pub fn create(dir: PrivateStoreDir) -> Result<Self> {
+        Self::create_at(dir, unix_now()?)
+    }
+
+    /// Create a file-backed relay using an explicit clock value for its first
+    /// global expiry sweep. This keeps startup behavior testable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::Storage`] if the directory already holds a
+    /// database or `SQLite` cannot initialize the schema.
+    pub fn create_at(dir: PrivateStoreDir, now: u64) -> Result<Self> {
+        if dir.kind() != StoreKind::Relay
+            || dir.main_database_at_open() != MainDatabase::Absent
+        {
+            return Err(LabError::Storage);
+        }
+        dir.create_main_database_file()?;
+        let connection = Connection::open(dir.database_path())?;
+        Self::initialize(connection, now, Some(dir))
+    }
+
+    /// Open the existing file-backed relay database inside a secured private
+    /// directory. The directory must hold one validated non-empty database
+    /// ([`MainDatabase::Present`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::Storage`] if no usable database exists, if
+    /// `SQLite` cannot open or migrate it, and also when the open is
+    /// *refused* — a non-empty `-wal` beside a database not in WAL mode fails
+    /// closed even though `SQLite` could have opened it. See
+    /// [`reject_anomalous_wal`].
+    pub fn open(dir: PrivateStoreDir) -> Result<Self> {
+        Self::open_at(dir, unix_now()?)
     }
 
     /// Open a file-backed relay and run its global expiry sweep using an
@@ -80,15 +124,40 @@ impl Relay {
     ///
     /// # Errors
     ///
-    /// Returns [`LabError::Storage`] if `SQLite` cannot open, initialize, or
-    /// sweep the database, and also when the open is *refused* — a non-empty
-    /// `-wal` beside a database not in WAL mode fails closed even though
-    /// `SQLite` could have opened it, including when the database file is
-    /// zero-length. See [`reject_anomalous_wal`].
-    pub fn open_at(path: &Path, now: u64) -> Result<Self> {
+    /// Returns [`LabError::Storage`] if no usable database exists, if
+    /// `SQLite` cannot open, migrate, or sweep it, and also when the open is
+    /// *refused* — a non-empty `-wal` beside a database not in WAL mode fails
+    /// closed even though `SQLite` could have opened it. See
+    /// [`reject_anomalous_wal`].
+    pub fn open_at(dir: PrivateStoreDir, now: u64) -> Result<Self> {
+        if dir.kind() != StoreKind::Relay
+            || dir.main_database_at_open() != MainDatabase::Present
+        {
+            return Err(LabError::Storage);
+        }
+        Self::open_at_path(&dir.database_path(), now, Some(dir))
+    }
+
+    /// Test-only raw-path constructor for the path-level hostile-fixture
+    /// integration tests, bypassing the [`PrivateStoreDir`] boundary. Not a
+    /// production entry point.
+    #[doc(hidden)]
+    pub fn open_with_path_for_test(path: &Path) -> Result<Self> {
+        Self::open_at_path(path, unix_now()?, None)
+    }
+
+    /// Test-only raw-path constructor for the path-level hostile-fixture
+    /// integration tests, bypassing the [`PrivateStoreDir`] boundary. Not a
+    /// production entry point.
+    #[doc(hidden)]
+    pub fn open_at_with_path_for_test(path: &Path, now: u64) -> Result<Self> {
+        Self::open_at_path(path, now, None)
+    }
+
+    fn open_at_path(path: &Path, now: u64, dir: Option<PrivateStoreDir>) -> Result<Self> {
         preflight_existing_database(path)?;
         let connection = Connection::open(path)?;
-        Self::initialize(connection, now)
+        Self::initialize(connection, now, dir)
     }
 
     /// Open an ephemeral in-memory relay database.
@@ -98,10 +167,10 @@ impl Relay {
     /// Returns [`LabError::Storage`] if `SQLite` cannot initialize the schema.
     pub fn open_in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
-        Self::initialize(connection, unix_now()?)
+        Self::initialize(connection, unix_now()?, None)
     }
 
-    fn initialize(mut connection: Connection, now: u64) -> Result<Self> {
+    fn initialize(mut connection: Connection, now: u64, dir: Option<PrivateStoreDir>) -> Result<Self> {
         connection.busy_timeout(Duration::from_secs(2))?;
         // Do not change journal mode or begin a migration until the opened
         // database has passed the exact schema/version preflight.
@@ -124,6 +193,7 @@ impl Relay {
         Ok(Self {
             connection,
             audit_events: Vec::new(),
+            _dir: dir,
         })
     }
 

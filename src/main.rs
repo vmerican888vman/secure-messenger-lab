@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use secure_messenger_lab::{
-    AckOutcome, ConversationId, EnqueueOutcome, LabError, MailboxOwner, OlmClient, Relay, Result,
+    AckOutcome, ConversationId, EnqueueOutcome, LabError, MailboxOwner, OlmClient, PrivateStoreDir,
+    Relay, Result, StoreKind,
 };
 
 fn main() {
@@ -17,8 +18,8 @@ fn run_demo() -> Result<()> {
         .map_err(|_| LabError::InvalidPayload)?
         .as_secs();
     let directory = tempfile::tempdir().map_err(|_| LabError::Storage)?;
-    let database = directory.path().join("relay.sqlite");
-    let mut relay = Relay::open(&database)?;
+    let store_dir = PrivateStoreDir::create(&directory.path().join("relay"), StoreKind::Relay)?;
+    let mut relay = Relay::create(store_dir)?;
 
     let conversation = ConversationId::random();
     let mut alice = OlmClient::new(conversation);

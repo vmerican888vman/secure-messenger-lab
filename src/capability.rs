@@ -452,7 +452,7 @@ mod tests {
     -> std::result::Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("relay.sqlite");
-        let mut relay = Relay::open(&database)?;
+        let mut relay = Relay::open_with_path_for_test(&database)?;
         let owner = MailboxOwner::new();
         let private_material = owner.serialized_private_material();
         relay.register(&owner.registration(1_800_000_060), 1_800_000_000)?;

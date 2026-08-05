@@ -10,6 +10,7 @@ mod companion;
 pub mod error;
 pub mod ids;
 pub mod persistence;
+mod private_store_dir;
 pub mod relay;
 
 pub use capability::{
@@ -22,6 +23,7 @@ pub use client::{
 pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
 pub use persistence::{ClientStateStore, ProfileBinding, ProtectionLevel, StateKeyProtector};
+pub use private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 pub use relay::{AckOutcome, EnqueueOutcome, Relay, StoredEnvelope};
 
 /// Protocol-domain label used by every signed relay command.

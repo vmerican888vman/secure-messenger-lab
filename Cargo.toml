@@ -11,6 +11,7 @@ description = "Disposable Phase 0 harness for testing an end-to-end encrypted ma
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
 rand = "=0.8.7"
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"

@@ -120,7 +120,7 @@ fn message_id(index: usize) -> Result<[u8; 16], Box<dyn Error>> {
 }
 
 fn seed_current_large_messages(database: &Path) -> Result<(), Box<dyn Error>> {
-    drop(Relay::open_at(database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(database, NOW)?);
     let mut connection = Connection::open(database)?;
     let transaction = connection.transaction()?;
     transaction.execute(
@@ -368,7 +368,7 @@ fn upgrade_discards_unverifiable_legacy_messages_and_preserves_relay_state()
         &legacy_ciphertext,
     )?;
 
-    let mut relay = Relay::open_at(&database, NOW)?;
+    let mut relay = Relay::open_at_with_path_for_test(&database, NOW)?;
     assert_eq!(relay.queued_message_count_at(NOW)?, 0);
     assert_eq!(relay.tombstone_count()?, 1);
     drop(relay);
@@ -403,7 +403,7 @@ fn future_schema_version_fails_closed() -> Result<(), Box<dyn Error>> {
     drop(connection);
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     Ok(())
@@ -429,7 +429,7 @@ fn current_schema_version_without_sender_signatures_fails_closed() -> Result<(),
     drop(connection);
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     assert!(contains(&fs::read(&database)?, &legacy_ciphertext));
@@ -480,7 +480,7 @@ fn current_schema_with_sender_signature_but_missing_constraints_fails_closed()
 
     let before = fs::read(&database)?;
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, before);
@@ -492,24 +492,24 @@ fn current_schema_rejects_extra_trigger_and_version_shape_disagreement()
 -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("extra-trigger.sqlite");
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
     let connection = Connection::open(&database)?;
     connection.execute_batch(
         "CREATE TRIGGER messages_noop AFTER INSERT ON messages BEGIN SELECT 1; END;",
     )?;
     drop(connection);
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
 
     let clean = directory.path().join("current-as-v1.sqlite");
-    drop(Relay::open_at(&clean, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&clean, NOW)?);
     let connection = Connection::open(&clean)?;
     connection.pragma_update(None, "user_version", 1_i64)?;
     drop(connection);
     assert!(matches!(
-        Relay::open_at(&clean, NOW),
+        Relay::open_at_with_path_for_test(&clean, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     Ok(())
@@ -535,7 +535,7 @@ fn historical_v2_if_not_exists_shape_remains_compatible() -> Result<(), Box<dyn 
     )?;
     drop(connection);
 
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
     Ok(())
 }
 
@@ -544,7 +544,7 @@ fn valid_hot_rollback_journal_recovers_complete_pretransaction_state() -> Result
 {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("valid-hot-journal.sqlite");
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
     let connection = Connection::open(&database)?;
     connection.execute(
         "INSERT INTO mailboxes(queue_id, send_key, receive_key, manage_key, created_at)
@@ -571,7 +571,7 @@ fn valid_hot_rollback_journal_recovers_complete_pretransaction_state() -> Result
     assert!(journal.is_file());
     assert!(fs::metadata(&journal)?.len() > 0);
 
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
     let recovered = Connection::open(&database)?;
     let created_at = recovered.query_row(
         "SELECT created_at FROM mailboxes WHERE queue_id = ?1",
@@ -604,7 +604,7 @@ fn hot_journal_from_aborted_bulk_delete_recovers_all_current_messages() -> Resul
     assert!(fs::metadata(&journal)?.len() > 0);
     assert!(!immutable_integrity_is_ok(&database)?);
 
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
 
     assert!(immutable_integrity_is_ok(&database)?);
     let recovered = Connection::open(&database)?;
@@ -631,7 +631,7 @@ fn hot_journal_from_aborted_legacy_migration_recovers_then_migrates() -> Result<
     assert!(fs::metadata(&journal)?.len() > 0);
     assert!(!immutable_integrity_is_ok(&database)?);
 
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
 
     assert!(immutable_integrity_is_ok(&database)?);
     let recovered = Connection::open(&database)?;
@@ -686,7 +686,7 @@ fn symlinked_database_recovers_its_hot_journal_from_the_resolved_path() -> Resul
     assert!(!immutable_integrity_is_ok(&target)?);
 
     // Opening through the link must still find and recover that journal.
-    drop(Relay::open_at(&link, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&link, NOW)?);
 
     assert!(immutable_integrity_is_ok(&target)?);
     let recovered = Connection::open(&target)?;
@@ -723,7 +723,7 @@ fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Resul
 
     let before = fs::read(&database)?;
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     let after = fs::read(&database)?;
@@ -760,7 +760,7 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
 
     // Victim: an unrelated, freshly created relay that never held these pages.
     let victim = directory.path().join("foreign-victim.sqlite");
-    drop(Relay::open_at(&victim, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&victim, NOW)?);
     let victim_before = fs::read(&victim)?;
     let source_marker = vec![0xA5_u8; 2048];
     assert!(!contains(&victim_before, &source_marker));
@@ -772,7 +772,7 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
 
     // Acceptance is what is guaranteed: the victim is still rejected.
     assert!(matches!(
-        Relay::open_at(&victim, NOW),
+        Relay::open_at_with_path_for_test(&victim, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
 
@@ -806,7 +806,7 @@ fn wal_mode_database_with_live_wal_opens_and_recovers() -> Result<(), Box<dyn Er
     assert!(fs::metadata(&wal)?.len() > 0);
 
     // Must open, not be refused by the anomalous-WAL guard.
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
 
     // The committed delete was recovered, not lost, and the relay converted
     // the database back out of WAL mode.
@@ -837,7 +837,7 @@ fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn 
 
     // Attacker prepares a WAL elsewhere carrying a schema the relay rejects.
     let attacker = directory.path().join("attacker.sqlite");
-    drop(Relay::open_at(&attacker, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&attacker, NOW)?);
     let staging = Connection::open(&attacker)?;
     staging.execute_batch(
         "PRAGMA journal_mode = WAL;
@@ -851,8 +851,8 @@ fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn 
 
     // Victim: a healthy rollback-mode relay that opens cleanly.
     let victim = directory.path().join("victim.sqlite");
-    drop(Relay::open_at(&victim, NOW)?);
-    drop(Relay::open_at(&victim, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&victim, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&victim, NOW)?);
     let before = fs::read(&victim)?;
     assert_eq!((before[18], before[19]), (1, 1));
 
@@ -862,7 +862,7 @@ fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn 
     // Refused, repeatedly, without ever opening the database normally.
     for _ in 0..3 {
         assert!(matches!(
-            Relay::open_at(&victim, NOW),
+            Relay::open_at_with_path_for_test(&victim, NOW),
             Err(secure_messenger_lab::LabError::Storage)
         ));
     }
@@ -881,7 +881,7 @@ fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn 
     // Recoverable: removing the planted file restores service, and the
     // foreign schema never landed.
     fs::remove_file(directory.path().join("victim.sqlite-wal"))?;
-    drop(Relay::open_at(&victim, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&victim, NOW)?);
     let inspector = Connection::open(&victim)?;
     let hostile = inspector.query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'extra_hostile'",
@@ -925,7 +925,7 @@ fn rejected_wal_open_checkpoints_and_removes_both_companions() -> Result<(), Box
     let before = fs::read(&database)?;
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
 
@@ -955,7 +955,7 @@ fn stray_journal_is_discarded_but_target_database_is_never_mutated() -> Result<(
     let database_before = fs::read(&database)?;
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
 
@@ -982,7 +982,7 @@ fn malformed_schema_with_wal_artifact_is_rejected_without_target_mutation()
     let companion_before = fs::read(&companion)?;
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, database_before);
@@ -994,7 +994,7 @@ fn malformed_schema_with_wal_artifact_is_rejected_without_target_mutation()
 fn integrity_check_rejects_constraint_poison_without_mutation() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("constraint-poison.sqlite");
-    drop(Relay::open_at(&database, NOW)?);
+    drop(Relay::open_at_with_path_for_test(&database, NOW)?);
     let connection = Connection::open(&database)?;
     connection.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
     connection.execute(
@@ -1023,7 +1023,7 @@ fn integrity_check_rejects_constraint_poison_without_mutation() -> Result<(), Bo
     let before = fs::read(&database)?;
 
     assert!(matches!(
-        Relay::open_at(&database, NOW),
+        Relay::open_at_with_path_for_test(&database, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, before);
@@ -1064,7 +1064,7 @@ fn hostile_fixture_source_is_immutable_while_disposable_copy_is_rejected()
     let working_copy = work_directory.path().join("hostile.sqlite");
     fs::copy(&source, &working_copy)?;
     assert!(matches!(
-        Relay::open_at(&working_copy, NOW),
+        Relay::open_at_with_path_for_test(&working_copy, NOW),
         Err(secure_messenger_lab::LabError::Storage)
     ));
     assert_eq!(fs::read(&source)?, original);
