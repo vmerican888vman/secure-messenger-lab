@@ -701,9 +701,11 @@ fn symlinked_database_recovers_its_hot_journal_from_the_resolved_path() -> Resul
 
 /// Pins the true bypass-path behavior: replaying a genuine hot journal writes
 /// recovered pages into the main database BEFORE validation runs, and does so
-/// even when validation then rejects the schema. Recovery restores only the
-/// last committed state, so this is accepted rather than fixed, but it must
-/// never be silently reduced to "the main database is never mutated".
+/// even when validation then rejects the schema. This is accepted rather than
+/// fixed, but it must never be silently reduced to "the main database is never
+/// mutated". Recovery replays what the companion records; that it is this
+/// database's own committed state is a property of this fixture, not a
+/// guarantee — see `foreign_journal_is_replayed_into_an_unrelated_database`.
 #[test]
 fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Result<(), Box<dyn Error>>
 {
@@ -734,6 +736,50 @@ fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Resul
         row.get::<_, i64>(0)
     })?;
     assert_eq!(messages, i64::try_from(LARGE_MESSAGE_COUNT)?);
+    Ok(())
+}
+
+/// Pins that recovery replays whatever the companion records rather than this
+/// database's own history. A rollback journal is matched by header and page
+/// checksums, with no binding to the database beside it, so a GENUINE journal
+/// lifted from an unrelated database is replayed into the victim. The open is
+/// still rejected — acceptance, not the bytes on disk, is what the preflight
+/// guarantees. This exists so the doc comment cannot drift back to claiming
+/// recovery only ever materializes the last committed state.
+#[test]
+fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+
+    // Source: 64 large messages, then a genuine hot journal from a real abort.
+    let source = directory.path().join("foreign-source.sqlite");
+    seed_current_large_messages(&source)?;
+    run_hot_journal_child(&source, "bulk-delete")?;
+    let source_journal = directory.path().join("foreign-source.sqlite-journal");
+    let genuine_journal = fs::read(&source_journal)?;
+    assert!(!genuine_journal.is_empty());
+
+    // Victim: an unrelated, freshly created relay that never held these pages.
+    let victim = directory.path().join("foreign-victim.sqlite");
+    drop(Relay::open_at(&victim, NOW)?);
+    let victim_before = fs::read(&victim)?;
+    let source_marker = vec![0xA5_u8; 2048];
+    assert!(!contains(&victim_before, &source_marker));
+
+    fs::write(
+        directory.path().join("foreign-victim.sqlite-journal"),
+        &genuine_journal,
+    )?;
+
+    // Acceptance is what is guaranteed: the victim is still rejected.
+    assert!(matches!(
+        Relay::open_at(&victim, NOW),
+        Err(secure_messenger_lab::LabError::Storage)
+    ));
+
+    // But its bytes are not preserved: it now holds the source's pages.
+    let victim_after = fs::read(&victim)?;
+    assert_ne!(victim_after, victim_before);
+    assert!(contains(&victim_after, &source_marker));
     Ok(())
 }
 
