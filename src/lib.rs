@@ -6,6 +6,7 @@
 
 pub mod capability;
 pub mod client;
+mod companion;
 pub mod error;
 pub mod ids;
 pub mod persistence;
