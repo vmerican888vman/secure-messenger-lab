@@ -70,7 +70,9 @@ impl Relay {
     /// Returns [`LabError::Storage`] if `SQLite` cannot open or initialize the
     /// database, and also when the open is *refused* — a non-empty `-wal`
     /// beside a database not in WAL mode fails closed even though `SQLite`
-    /// could have opened it. See [`reject_anomalous_wal`].
+    /// could have opened it. The refusal applies to *creating* a relay too: a
+    /// non-empty `-wal` beside a path with no database at all is rejected
+    /// rather than created over. See [`reject_anomalous_wal`].
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_at(path, unix_now()?)
     }
@@ -84,7 +86,8 @@ impl Relay {
     /// sweep the database, and also when the open is *refused* — a non-empty
     /// `-wal` beside a database not in WAL mode fails closed even though
     /// `SQLite` could have opened it, including when the database file is
-    /// zero-length. See [`reject_anomalous_wal`].
+    /// zero-length or absent entirely — so a create is refused on that path as
+    /// well, not only an open. See [`reject_anomalous_wal`].
     pub fn open_at(path: &Path, now: u64) -> Result<Self> {
         preflight_existing_database(path)?;
         let connection = Connection::open(path)?;

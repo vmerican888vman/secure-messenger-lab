@@ -41,10 +41,18 @@ use crate::{LabError, Result};
 /// crash mid-conversion leaves a WAL-mode header with no companion, never the
 /// reverse. That ordering is in the bundled engine, not inferred from crash
 /// sampling: in `libsqlite3-sys` 0.37.0 / `SQLite` 3.51.3, `OP_JournalMode`
-/// calls `sqlite3PagerCloseWal`, whose comment reads "checkpoints and deletes
-/// the write-ahead-log file", and only then calls `sqlite3PagerSetJournalMode`
-/// to change the header. Re-verify this on any `SQLite` bump. A genuine
-/// WAL-mode database with a live `-wal` passes this check unharmed.
+/// calls `sqlite3PagerCloseWal` — whose comment reads "checkpoints and deletes
+/// the write-ahead-log file" — and only afterwards calls
+/// `sqlite3BtreeSetVersion`, which is what actually assigns header bytes 18 and
+/// 19. (`sqlite3PagerSetJournalMode`, called in between, only updates an
+/// in-memory field.) Every error path in that sequence fails safe: a non-OK
+/// result skips the header write. Re-verify on any `SQLite` bump.
+///
+/// Scope: that is the ordering for a journal-mode *change*. `SQLite` has other
+/// configurations this crate does not use where a WAL survives close —
+/// `SQLITE_FCNTL_PERSIST_WAL` with a negative `journal_size_limit` — so read
+/// the guarantee as covering this crate's usage, not `SQLite` universally. A
+/// genuine WAL-mode database with a live `-wal` passes this check unharmed.
 ///
 /// Both stores refuse alike, including when the database itself is absent: a
 /// non-empty `-wal` with no main database is never legitimate recovery state,
@@ -84,8 +92,18 @@ pub(crate) fn reject_anomalous_wal(path: &Path) -> Result<()> {
 /// Resolution is best-effort at the call site: [`reject_anomalous_wal`] falls
 /// back to the unresolved path when `canonicalize` fails, which it does for any
 /// path that does not exist — the normal case for a first create. A dangling
-/// symlink therefore escapes the guard, which is benign because the target is
-/// created fresh and a planted WAL's salts cannot match it.
+/// symlink therefore escapes the guard entirely: the guard tests the link name
+/// while `SQLite` uses the target name.
+///
+/// That escape is a real gap, not a benign one, and an earlier version of this
+/// comment wrongly called it benign on the grounds that a planted WAL's salts
+/// could not match a fresh target. Salts are not consulted. `SQLite` discards a
+/// WAL only when the target has zero pages; once the target holds any page, a
+/// planted WAL is replayed into it — the same mechanism this guard exists to
+/// stop, and one already measured elsewhere in this crate. The escape also
+/// consumes the companion, so the byte-preservation property stated above does
+/// not hold on this path. Resolving the link before deriving companion names
+/// would close it; that is deferred with the wider recovery-boundary work.
 ///
 /// # Errors
 ///
