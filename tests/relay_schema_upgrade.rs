@@ -783,18 +783,17 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
     Ok(())
 }
 
-/// Pins a pre-existing availability weakness so it cannot be mistaken for a
-/// guarantee. Creating a single file beside a healthy relay — never writing the
-/// database itself — is enough to make every later open fail. The companion
-/// check reports "no companion" here, because the main header is rollback-mode,
-/// yet `SQLite` opens a `-wal` on existence alone, replays it, and checkpoints
-/// the foreign schema in. This reproduces identically at ea69c07, so it is not
-/// something the companion gating introduced.
+/// Creating a single file beside a healthy relay — with no write access to the
+/// database itself — used to destroy it permanently: `SQLite` opens a `-wal` on
+/// existence alone, so the planted file was replayed and checkpointed in before
+/// validation could reject it, and every later open failed. Reproduced
+/// identically at ea69c07, so it predated the companion gating.
 ///
-/// This test asserts current behavior, not desired behavior. If the planted-WAL
-/// weakness is ever addressed, this test SHOULD fail and be rewritten.
+/// `reject_anomalous_wal` now fails closed first. This asserts the two things
+/// that make the difference: the database is left byte-identical, and removing
+/// the planted file restores service.
 #[test]
-fn planted_wal_durably_rejects_a_previously_healthy_relay() -> Result<(), Box<dyn Error>> {
+fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
 
     // Attacker prepares a WAL elsewhere carrying a schema the relay rejects.
@@ -821,14 +820,29 @@ fn planted_wal_durably_rejects_a_previously_healthy_relay() -> Result<(), Box<dy
     // The whole attack: create one file. The database is never written.
     fs::write(directory.path().join("victim.sqlite-wal"), &planted)?;
 
-    assert!(matches!(
-        Relay::open_at(&victim, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
-    ));
+    // Refused, repeatedly, without ever opening the database normally.
+    for _ in 0..3 {
+        assert!(matches!(
+            Relay::open_at(&victim, NOW),
+            Err(secure_messenger_lab::LabError::Storage)
+        ));
+    }
 
+    // The database is untouched: same bytes, same rollback-mode header.
     let after = fs::read(&victim)?;
-    assert_ne!(after, before);
-    assert_eq!((after[18], after[19]), (2, 2));
+    assert_eq!(after, before);
+    assert_eq!((after[18], after[19]), (1, 1));
+
+    // Deliberately NOT opened normally here. Any SQLite client that opens this
+    // path while the planted file exists would itself trigger the replay this
+    // refusal avoids — the guard covers the relay's own open path, not the
+    // filesystem. Checking the schema now would corrupt the victim and pass for
+    // the wrong reason.
+
+    // Recoverable: removing the planted file restores service, and the
+    // foreign schema never landed.
+    fs::remove_file(directory.path().join("victim.sqlite-wal"))?;
+    drop(Relay::open_at(&victim, NOW)?);
     let inspector = Connection::open(&victim)?;
     let hostile = inspector.query_row(
         "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'extra_hostile'",
@@ -836,12 +850,7 @@ fn planted_wal_durably_rejects_a_previously_healthy_relay() -> Result<(), Box<dy
         |row| row.get::<_, i64>(0),
     )?;
     drop(inspector);
-    assert_eq!(hostile, 1);
-
-    // Durable: removing the planted file does not restore service.
-    fs::remove_file(directory.path().join("victim.sqlite-wal")).ok();
-    assert!(Relay::open_at(&victim, NOW).is_err());
-    assert!(Relay::open_at(&victim, NOW).is_err());
+    assert_eq!(hostile, 0);
     Ok(())
 }
 
