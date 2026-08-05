@@ -34,19 +34,27 @@ use crate::{LabError, Result};
 /// accept one, and convert it back, so this is not a claim that the header is
 /// always rollback-mode. A *failed* open does leave it: both stores validate
 /// before setting the pragma, so a rejected database keeps its WAL-mode header.
-/// What this does mean is that a SUCCESSFUL open never *ends* in WAL mode,
-/// so a `-wal` beside a rollback-mode header did not come from this crate and
-/// is not legitimate recovery state. That holds because `SQLite` checkpoints
-/// and unlinks the `-wal` before flipping the header out of WAL mode, so a
-/// crash mid-conversion leaves a WAL-mode header with no companion, never the
-/// reverse. That ordering is in the bundled engine, not inferred from crash
-/// sampling: in `libsqlite3-sys` 0.37.0 / `SQLite` 3.51.3, `OP_JournalMode`
-/// calls `sqlite3PagerCloseWal` — whose comment reads "checkpoints and deletes
-/// the write-ahead-log file" — and only afterwards calls
-/// `sqlite3BtreeSetVersion`, which is what actually assigns header bytes 18 and
-/// 19. (`sqlite3PagerSetJournalMode`, called in between, only updates an
-/// in-memory field.) Every error path in that sequence fails safe: a non-OK
-/// result skips the header write. Re-verify on any `SQLite` bump.
+/// What this does mean is that a SUCCESSFUL open never *ends* in WAL mode, so
+/// a `-wal` beside a rollback-mode header is an AMBIGUOUS state that this crate
+/// deliberately refuses — not, as earlier versions of this comment claimed, a
+/// state this crate cannot produce.
+///
+/// The normal ordering does favour that reading: in `libsqlite3-sys` 0.37.0 /
+/// `SQLite` 3.51.3, `OP_JournalMode` calls `sqlite3PagerCloseWal` — whose
+/// call-site comment reads "checkpoints and deletes the write-ahead-log file" —
+/// and only afterwards calls `sqlite3BtreeSetVersion`, which assigns header
+/// bytes 18 and 19. (`sqlite3PagerSetJournalMode`, called in between, only
+/// updates an in-memory field on this path.) A non-OK result from the
+/// checkpoint skips the header write.
+///
+/// But the cleanup itself is best-effort, so the combination IS reachable
+/// without an attacker. `walLimitSize` states outright "If an error occurs
+/// while doing so, ignore it", and the unlink after a successful checkpoint is
+/// likewise not error-checked. A checkpoint that succeeds followed by a
+/// deletion or truncation that fails leaves exactly this state: header flipped
+/// out of WAL mode, non-empty `-wal` still present. Refusing is therefore
+/// fail-closed on an ambiguity, not detection of a foreign file. Re-verify on
+/// any `SQLite` bump.
 ///
 /// Scope: that is the ordering for a journal-mode *change*. `SQLite` has other
 /// configurations this crate does not use where a WAL survives close —
@@ -117,9 +125,18 @@ pub(crate) fn reject_anomalous_wal(path: &Path) -> Result<()> {
 ///
 /// Do not read this as "a planted WAL is replayed through a symlink". That is
 /// true of a target that already holds pages, which is why this guard exists,
-/// and it is not reachable by this escape. Resolving the link before deriving
-/// companion names would close the gap; deferred with the recovery-boundary
-/// work.
+/// and reaching it from this escape needs the target to acquire pages between
+/// the check and the open — a race or a retargeted link — not the plain case.
+///
+/// Nor is any of this prevented by WAL salts, whatever an earlier version of
+/// this comment implied in either direction. `SQLite` does compare frame salts,
+/// but only against the WAL's own header, so they authenticate a WAL's internal
+/// consistency and bind it to nothing in the adjacent database. A foreign WAL
+/// is internally consistent and passes that check.
+///
+/// Closing this needs the path boundary itself — refusing symlinked database
+/// paths and inspecting companions without following links — which belongs with
+/// the private-directory recovery boundary rather than a patch here.
 ///
 /// # Errors
 ///
