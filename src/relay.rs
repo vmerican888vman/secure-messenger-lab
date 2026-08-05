@@ -622,8 +622,9 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
         return Err(LabError::Storage);
     }
     if metadata.len() == 0 {
-        return Ok(());
+        return reject_anomalous_wal(path);
     }
+    reject_anomalous_wal(path)?;
     if has_nonempty_recovery_companion(path)? {
         return Ok(());
     }
@@ -633,6 +634,42 @@ fn preflight_existing_database(path: &Path) -> Result<()> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )?;
     validate_schema_for_open(&connection)
+}
+
+/// Fail closed when a non-empty `-wal` sits beside a database whose own header
+/// is not in WAL mode, before anything opens the database normally.
+///
+/// `SQLite` opens a `-wal` on file existence alone and never consults the main
+/// header, so without this check the normal open replays whatever the file
+/// contains and checkpoints it in. Creating that one file — with no write
+/// access to the database itself — was enough to destroy a healthy relay
+/// permanently, because the foreign content landed in the database before
+/// validation could reject it and stayed there afterwards.
+///
+/// Refusing keeps the database byte-identical, which turns that into a
+/// recoverable condition: remove the stray file and the relay opens again. It
+/// does mean a planted file can stop the relay from starting, but a refusal
+/// that preserves the data is strictly better than an open that destroys it.
+///
+/// A relay database is never in WAL mode — `initialize` sets
+/// `journal_mode = DELETE` — so a `-wal` beside a rollback-mode header is
+/// always anomalous and never legitimate recovery state.
+///
+/// The guard covers this crate's open path, not the filesystem. Any other
+/// `SQLite` client that opens the same path while the planted file exists still
+/// triggers the replay, because that decision belongs to whoever opens the
+/// database. Proving that is not hypothetical: an inspection helper inside
+/// `planted_wal_is_refused_without_touching_the_database` corrupted the very
+/// database the refusal had just preserved, until it was moved after cleanup.
+fn reject_anomalous_wal(path: &Path) -> Result<()> {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !nonempty_companion(&resolved, "-wal")? {
+        return Ok(());
+    }
+    if database_header_uses_wal(&resolved)? {
+        return Ok(());
+    }
+    Err(LabError::Storage)
 }
 
 /// Decides whether an exact-suffix companion is close enough to recoverable
