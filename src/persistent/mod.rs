@@ -1118,18 +1118,36 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 if record.state != AckState::Pending {
                     return Err(LabError::MessageGone);
                 }
-                let presented = AckIntent {
-                    message_id: record.message_id,
-                    epoch_id: record.epoch_id,
-                    sequence: record.sequence,
-                    queue_id: action.request.queue_id,
-                    packet_digest: action.request.packet_hash,
-                    valid_until: action.request.valid_until,
-                    state: AckState::Pending,
-                };
-                if digest(&presented.encode()?) != digest(&record.encode()?) {
+                // The presented request must bind completely: message ID
+                // to the token and the durable intent, queue/digest/
+                // expiry to the durable fields, and the signature
+                // verified against our receive-capability public key over
+                // the exact ACK signing bytes (mirroring
+                // `authorize_ack`).
+                let request = &action.request;
+                if request.message_id.as_bytes() != &action.token
+                    || request.message_id != record.message_id
+                    || request.queue_id != record.queue_id
+                    || request.packet_hash != record.packet_digest
+                    || request.valid_until != record.valid_until
+                {
                     return Err(LabError::Unauthorized);
                 }
+                let signing_bytes = canonical(
+                    ACK_ACTION,
+                    &[
+                        record.queue_id.as_bytes(),
+                        record.message_id.as_bytes(),
+                        &record.packet_digest,
+                        &record.valid_until.to_be_bytes(),
+                    ],
+                );
+                current
+                    .state
+                    .registration
+                    .receive_key
+                    .verify(&signing_bytes, &request.signature)
+                    .map_err(|_| LabError::Unauthorized)?;
                 Ok(())
             },
             |candidate, _keypairs| {
@@ -1276,6 +1294,14 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 let record = &current.state.sends[index];
                 if record.state != SendState::Pending {
                     return Err(LabError::MessageGone);
+                }
+                // The presented request's message ID must bind to the
+                // token AND the durable record (review finding: no
+                // substitution of the stored ID).
+                if action.request.message_id.as_bytes() != &action.token
+                    || action.request.message_id != record.message_id
+                {
+                    return Err(LabError::Unauthorized);
                 }
                 let presented = SendRecord {
                     message_id: record.message_id,
@@ -1548,6 +1574,40 @@ fn sweep_expired_sends(candidate: &mut Candidate, now: u64) -> Result<()> {
     Ok(())
 }
 
+/// D2b: sweep expired `Pending` ACK intents in clock-taking mutators
+/// (same pattern as the send expiry sweep): the intent is removed and its
+/// dedup record becomes `Expired`. Unexpired intents are never swept;
+/// high-water and budget state are never touched.
+fn sweep_expired_acks(candidate: &mut Candidate, now: u64) -> Result<()> {
+    let mut expired = Vec::new();
+    for record in &candidate.state.acks {
+        if record.state == AckState::Pending && record.valid_until <= now {
+            expired.push(record.message_id);
+        }
+    }
+    for message_id in expired {
+        let index = candidate
+            .state
+            .acks
+            .iter()
+            .position(|record| record.message_id == message_id)
+            .ok_or(LabError::Storage)?;
+        let record = candidate.state.acks.remove(index);
+        let dedup_index = candidate
+            .state
+            .dedup
+            .binary_search_by(|probe| {
+                probe
+                    .message_id
+                    .as_bytes()
+                    .cmp(record.message_id.as_bytes())
+            })
+            .map_err(|_| LabError::Storage)?;
+        candidate.state.dedup[dedup_index].state = DedupState::Expired;
+    }
+    Ok(())
+}
+
 /// §4 mode recomputation after each committed mutation: the budget modes
 /// derive from outstanding = `last_assigned_send_seq` −
 /// `peer_contiguous_high_water`; `RekeyRequired` dominates and is never
@@ -1578,6 +1638,7 @@ fn stage_send_operation(
 ) -> Result<DurableAction<SendRequest>> {
     sweep_expired_sends(candidate, now)?;
     prune_terminal_sends(candidate, now);
+    sweep_expired_acks(candidate, now)?;
     let (epoch_id, send_seq, conversation_id) = {
         let active = candidate
             .state
@@ -1840,6 +1901,8 @@ fn accept_envelope_operation(
     expires_at: u64,
     now: u64,
 ) -> Result<AcceptArtifact> {
+    // Clock-taking mutator: expired pending ACK intents are swept first.
+    sweep_expired_acks(candidate, now)?;
     // (d) Decode the Olm message and establish or advance the ratchet.
     let olm_message: OlmMessage =
         serde_json::from_slice(packet.as_bytes()).map_err(|_| LabError::Encoding)?;
@@ -1979,6 +2042,7 @@ fn consume_inbound_operation(
 ) -> Result<()> {
     sweep_expired_sends(candidate, now)?;
     prune_terminal_sends(candidate, now);
+    sweep_expired_acks(candidate, now)?;
     let index = candidate
         .state
         .inbound
