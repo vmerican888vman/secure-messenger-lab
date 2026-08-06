@@ -364,10 +364,15 @@ fn wrong_kind_directory_is_rejected_for_a_relay() -> Result<(), Box<dyn Error>> 
 /// reject, for both store kinds.
 #[test]
 fn companion_only_directory_is_rejected_for_both_kinds() -> Result<(), Box<dyn Error>> {
-    for kind in [StoreKind::Relay, StoreKind::ClientState] {
+    for kind in [
+        StoreKind::Relay,
+        StoreKind::ClientState,
+        StoreKind::Lifecycle,
+    ] {
         let (base, companions): (&str, [&str; 3]) = match kind {
             StoreKind::Relay => ("relay.sqlite3", ["-journal", "-wal", "-shm"]),
             StoreKind::ClientState => ("client-state.sqlite3", ["-journal", "-wal", "-shm"]),
+            StoreKind::Lifecycle => ("lifecycle.sqlite3", ["-journal", "-wal", "-shm"]),
         };
         for suffix in companions {
             let temp = TempDir::new()?;
@@ -482,6 +487,39 @@ impl secure_messenger_lab::StateKeyProtector for TestProtector {
             *target = value ^ mask;
         }
         Ok(())
+    }
+
+    /// Static test protector: lifecycle operations are unsupported and
+    /// fail closed; the fixed binding is always present.
+    fn provision_key(
+        &self,
+        _binding: secure_messenger_lab::ProfileBinding,
+    ) -> secure_messenger_lab::Result<()> {
+        Err(secure_messenger_lab::LabError::Storage)
+    }
+
+    fn key_status(
+        &self,
+        _binding: secure_messenger_lab::ProfileBinding,
+    ) -> secure_messenger_lab::Result<secure_messenger_lab::KeyStatus> {
+        Ok(secure_messenger_lab::KeyStatus::Present)
+    }
+
+    fn select_binding(
+        &self,
+        binding: secure_messenger_lab::ProfileBinding,
+    ) -> secure_messenger_lab::Result<()> {
+        if binding != self.binding {
+            return Err(secure_messenger_lab::LabError::Storage);
+        }
+        Ok(())
+    }
+
+    fn delete_key(
+        &self,
+        _binding: secure_messenger_lab::ProfileBinding,
+    ) -> secure_messenger_lab::Result<()> {
+        Err(secure_messenger_lab::LabError::Storage)
     }
 }
 

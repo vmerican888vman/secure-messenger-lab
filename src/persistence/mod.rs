@@ -9,5 +9,5 @@ mod envelope;
 mod protector;
 mod sqlite;
 
-pub use protector::{ProfileBinding, ProtectionLevel, StateKeyProtector};
+pub use protector::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector};
 pub use sqlite::ClientStateStore;

@@ -712,6 +712,7 @@ fn validate_ciphertext_len(length: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::persistence::KeyStatus;
     use std::collections::HashSet;
     use std::env;
     use std::fs;
@@ -788,6 +789,27 @@ mod tests {
                 *target = value ^ mask;
             }
             Ok(())
+        }
+
+        /// Static test protector: lifecycle operations are unsupported
+        /// and fail closed; the fixed binding is always present.
+        fn provision_key(&self, _binding: ProfileBinding) -> Result<()> {
+            Err(LabError::Storage)
+        }
+
+        fn key_status(&self, _binding: ProfileBinding) -> Result<KeyStatus> {
+            Ok(KeyStatus::Present)
+        }
+
+        fn select_binding(&self, binding: ProfileBinding) -> Result<()> {
+            if binding != self.binding {
+                return Err(LabError::Storage);
+            }
+            Ok(())
+        }
+
+        fn delete_key(&self, _binding: ProfileBinding) -> Result<()> {
+            Err(LabError::Storage)
         }
     }
 

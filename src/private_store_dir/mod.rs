@@ -76,6 +76,8 @@ use crate::{LabError, Result};
 pub enum StoreKind {
     Relay,
     ClientState,
+    /// The platform-key lifecycle registry (`src/lifecycle.rs`).
+    Lifecycle,
 }
 
 impl StoreKind {
@@ -83,6 +85,7 @@ impl StoreKind {
         match self {
             Self::Relay => b"relay.sqlite3",
             Self::ClientState => b"client-state.sqlite3",
+            Self::Lifecycle => b"lifecycle.sqlite3",
         }
     }
 }
@@ -220,6 +223,28 @@ impl PrivateStoreDir {
         let file = File::from(fd);
         verify_regular_file(&file)?;
         Ok(())
+    }
+
+    /// Delete exactly the main database and the three allowed companions,
+    /// descriptor-relative, then durably sync the directory. Missing entries
+    /// are skipped, so a partially completed delete resumes idempotently
+    /// (used by the lifecycle manager's destructive reset).
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error if an unlink or the directory sync
+    /// fails.
+    pub(crate) fn delete_database_and_companions_synced(&self) -> Result<()> {
+        for suffix in [b"".as_slice(), b"-journal", b"-wal", b"-shm"] {
+            let mut name = self.kind.main_basename().to_vec();
+            name.extend_from_slice(suffix);
+            let c_name = std::ffi::CString::new(name).map_err(|_| LabError::Storage)?;
+            match fs::unlinkat(&self.dir, c_name.as_c_str(), fs::AtFlags::empty()) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+                Err(_) => return Err(LabError::Storage),
+            }
+        }
+        fs::fsync(&self.dir).map_err(|_| LabError::Storage)
     }
 
     /// Shared tail of `create`/`open`: verify the directory itself, take the

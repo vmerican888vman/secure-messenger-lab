@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use zeroize::Zeroizing;
 
 use super::{PersistentClient, RegistrationOutcome};
-use crate::persistence::{ProfileBinding, ProtectionLevel, StateKeyProtector};
+use crate::persistence::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector};
 use crate::{LabError, PrivateStoreDir, StoreKind};
 
 const NOW: u64 = 1_800_000_000;
@@ -73,6 +73,27 @@ impl StateKeyProtector for TestProtector {
             *target = value ^ mask;
         }
         Ok(())
+    }
+
+    /// Static test protector: lifecycle operations are unsupported and
+    /// fail closed; the fixed binding is always present.
+    fn provision_key(&self, _binding: ProfileBinding) -> crate::Result<()> {
+        Err(LabError::Storage)
+    }
+
+    fn key_status(&self, _binding: ProfileBinding) -> crate::Result<KeyStatus> {
+        Ok(KeyStatus::Present)
+    }
+
+    fn select_binding(&self, binding: ProfileBinding) -> crate::Result<()> {
+        if binding != self.binding {
+            return Err(LabError::Storage);
+        }
+        Ok(())
+    }
+
+    fn delete_key(&self, _binding: ProfileBinding) -> crate::Result<()> {
+        Err(LabError::Storage)
     }
 }
 

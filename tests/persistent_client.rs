@@ -74,6 +74,30 @@ impl StateKeyProtector for TestProtector {
         }
         Ok(())
     }
+
+    /// Static test protector: lifecycle operations are unsupported and
+    /// fail closed; the fixed binding is always present.
+    fn provision_key(&self, _binding: ProfileBinding) -> secure_messenger_lab::Result<()> {
+        Err(secure_messenger_lab::LabError::Storage)
+    }
+
+    fn key_status(
+        &self,
+        _binding: ProfileBinding,
+    ) -> secure_messenger_lab::Result<secure_messenger_lab::KeyStatus> {
+        Ok(secure_messenger_lab::KeyStatus::Present)
+    }
+
+    fn select_binding(&self, binding: ProfileBinding) -> secure_messenger_lab::Result<()> {
+        if binding != self.binding {
+            return Err(secure_messenger_lab::LabError::Storage);
+        }
+        Ok(())
+    }
+
+    fn delete_key(&self, _binding: ProfileBinding) -> secure_messenger_lab::Result<()> {
+        Err(secure_messenger_lab::LabError::Storage)
+    }
 }
 
 /// Replica of `capability::canonical` (crate-private); the signing-byte

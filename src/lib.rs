@@ -9,6 +9,7 @@ pub mod client;
 mod companion;
 pub mod error;
 pub mod ids;
+mod lifecycle;
 mod payload;
 pub mod persistence;
 mod persistent;
@@ -25,7 +26,12 @@ pub use client::{
 };
 pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
-pub use persistence::{ClientStateStore, ProfileBinding, ProtectionLevel, StateKeyProtector};
+pub use lifecycle::{
+    DestructiveResetAuth, LifecycleManager, LifecycleState, LockReason, ProvisionOutcome,
+};
+pub use persistence::{
+    ClientStateStore, KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector,
+};
 pub use persistent::{
     AcceptOutcome, AckOutcomeView, DeliveryUnknownView, DurableAction, InboundView,
     PersistentClient, PublicIdentity, RedactedContactOffer, RegistrationOutcome, SendOutcome,
