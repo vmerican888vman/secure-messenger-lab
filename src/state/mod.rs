@@ -285,13 +285,16 @@ impl ClientStateV1 {
                 (19, &dedup[..]),
             ],
         )?;
+        // The assembled object is the complete plaintext snapshot: keep it
+        // zeroized before it is framed into the output buffer.
+        let object = Zeroizing::new(object);
         let total = MAGIC.len() + object.len();
         if total > MAX_TOTAL_PLAINTEXT {
             return Err(LabError::Storage);
         }
         let mut out = Vec::with_capacity(total);
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&object);
+        out.extend_from_slice(&object[..]);
         Ok(Zeroizing::new(out))
     }
 

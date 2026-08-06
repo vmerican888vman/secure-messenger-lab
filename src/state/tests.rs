@@ -2563,3 +2563,117 @@ fn accepted_boundary_pickle_generates_without_key_loss() -> Result<(), Box<dyn E
     assert!(account.contains_one_time_key(new_key));
     Ok(())
 }
+
+// --- review v5 remediation tests -------------------------------------------
+
+/// Review v5 finding 1: a counter near the `wrapping_add` wrap is hostile
+/// and rejects; exactly `u64::MAX - 1_000_000_000` leaves the full
+/// headroom and accepts.
+#[test]
+fn next_key_id_wrap_headroom_enforced() -> Result<(), Box<dyn Error>> {
+    for hostile in [u64::MAX, u64::MAX - 5, u64::MAX - 999_999_999] {
+        let mut fixture = populated_fixture()?;
+        let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+        let spliced = splice_next_key_id(&json, 1, hostile)?;
+        assert_canonical_pickle(&spliced)?;
+        fixture.state.account_pickle = Zeroizing::new(spliced.into_bytes());
+        assert!(
+            fixture.state.encode().is_err(),
+            "next_key_id {hostile} accepted"
+        );
+    }
+    // Exactly at the boundary the full headroom remains: accepted.
+    let mut fixture = populated_fixture()?;
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let boundary = splice_next_key_id(&json, 1, u64::MAX - 1_000_000_000)?;
+    assert_canonical_pickle(&boundary)?;
+    fixture.state.account_pickle = Zeroizing::new(boundary.into_bytes());
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+    Ok(())
+}
+
+/// Build a minimal state with explicit mailbox keypairs and a matching
+/// manage-signed registration, for the capability-collapse fixtures.
+fn state_with_raw_keypairs(
+    send: &vodozemac::Ed25519Keypair,
+    receive: &vodozemac::Ed25519Keypair,
+    manage: &vodozemac::Ed25519Keypair,
+) -> Result<ClientStateV1, Box<dyn Error>> {
+    let account = Account::new();
+    let queue_id = QueueId::random();
+    let mut registration = crate::MailboxRegistration {
+        queue_id,
+        send_key: send.public_key(),
+        receive_key: receive.public_key(),
+        manage_key: manage.public_key(),
+        nonce: crate::Nonce::random(),
+        valid_until: NOW + 3_600,
+        signature: manage.sign(b""),
+    };
+    registration.signature = manage.sign(&registration.signing_bytes());
+    Ok(ClientStateV1 {
+        profile_id: [0x33; 16],
+        key_ref: [0x44; 16],
+        generation: 1,
+        conversation_id: ConversationId::random(),
+        account_pickle: Zeroizing::new(serde_json::to_vec(&account.pickle())?),
+        own_ed25519_identity: account.ed25519_key(),
+        own_curve_identity: account.curve25519_key(),
+        mailbox_queue_id: queue_id,
+        send_keypair_json: Zeroizing::new(serde_json::to_vec(send)?),
+        receive_keypair_json: Zeroizing::new(serde_json::to_vec(receive)?),
+        manage_keypair_json: Zeroizing::new(serde_json::to_vec(manage)?),
+        registration: RegistrationRecord {
+            queue_id: registration.queue_id,
+            send_key: registration.send_key,
+            receive_key: registration.receive_key,
+            manage_key: registration.manage_key,
+            nonce: registration.nonce,
+            valid_until: registration.valid_until,
+            signature: registration.signature,
+        },
+        pending_prekey: None,
+        peer_binding: None,
+        active_session: None,
+        inbound: Vec::new(),
+        sends: Vec::new(),
+        acks: Vec::new(),
+        dedup: Vec::new(),
+    })
+}
+
+/// Review v5 finding 3: the three mailbox capability public keys must be
+/// distinct and correspond to the registration intent.
+#[test]
+fn mailbox_capability_collapse_rejected() -> Result<(), Box<dyn Error>> {
+    // Genuine state (three distinct keypairs) is accepted.
+    let genuine = state_with_raw_keypairs(
+        &vodozemac::Ed25519Keypair::new(),
+        &vodozemac::Ed25519Keypair::new(),
+        &vodozemac::Ed25519Keypair::new(),
+    )?;
+    let encoded = genuine.encode()?;
+    ClientStateV1::decode(&encoded)?;
+
+    // One keypair serving all three capabilities.
+    let shared = vodozemac::Ed25519Keypair::new();
+    let collapsed = state_with_raw_keypairs(&shared, &shared, &shared)?;
+    assert!(collapsed.encode().is_err(), "all-same-key mailbox accepted");
+
+    // Two capabilities sharing a keypair.
+    let shared = vodozemac::Ed25519Keypair::new();
+    let collapsed = state_with_raw_keypairs(&shared, &shared, &vodozemac::Ed25519Keypair::new())?;
+    assert!(collapsed.encode().is_err(), "two-same-key mailbox accepted");
+
+    // Permuted slots: the receive slot holds the send keypair while the
+    // registration keeps the genuine correspondence.
+    let send = vodozemac::Ed25519Keypair::new();
+    let receive = vodozemac::Ed25519Keypair::new();
+    let manage = vodozemac::Ed25519Keypair::new();
+    let mut permuted = state_with_raw_keypairs(&send, &receive, &manage)?;
+    permuted.send_keypair_json = Zeroizing::new(serde_json::to_vec(&receive)?);
+    permuted.receive_keypair_json = Zeroizing::new(serde_json::to_vec(&send)?);
+    assert!(permuted.encode().is_err(), "permuted keypairs accepted");
+    Ok(())
+}

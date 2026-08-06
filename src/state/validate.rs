@@ -213,6 +213,9 @@ fn check_account(state: &ClientStateV1) -> Result<Account> {
     Ok(account)
 }
 
+/// Wrap headroom for `next_key_id` (see `check_one_time_key_consistency`).
+const NEXT_KEY_ID_HEADROOM: u64 = 1_000_000_000;
+
 /// One-time-key store consistency, checked against the already-canonical
 /// account pickle bytes (review v3 finding 3; vodozemac's pickle field
 /// types are private, so the JSON is navigated directly):
@@ -229,7 +232,15 @@ fn check_account(state: &ClientStateV1) -> Result<Account> {
 ///   retained id makes the next generation select the occupied id and
 ///   silently replace its secret). Gaps are legitimate (consumption and
 ///   eviction leave them), so larger values are never rejected; an empty
-///   store accepts any `next_key_id`.
+///   store accepts any `next_key_id`;
+/// - `next_key_id` must also leave wrap headroom (review v5): vodozemac
+///   generates with `wrapping_add`, so a counter near `u64::MAX` wraps to
+///   small ids and can replace retained key 0. The rule rejects counters
+///   above `u64::MAX - NEXT_KEY_ID_HEADROOM`. The headroom is arbitrary
+///   but safe: one billion generations vastly exceeds anything a
+///   peer-scoped account can legitimately produce (each conversation
+///   consumes a handful of one-time keys), so a counter that close to the
+///   wrap is hostile, never real.
 fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(canonical_pickle).map_err(|_| LabError::Storage)?;
@@ -270,6 +281,9 @@ fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
         .get("next_key_id")
         .and_then(serde_json::Value::as_u64)
         .ok_or(LabError::Storage)?;
+    if next_key_id > u64::MAX - NEXT_KEY_ID_HEADROOM {
+        return Err(LabError::Storage);
+    }
     for map_name in ["private_keys", "public_keys"] {
         let entries = one_time_keys
             .get(map_name)
@@ -286,7 +300,11 @@ fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
 }
 
 /// The three reconstructed capability public keys must match the
-/// registration intent, and the mailbox queue must be the registered one.
+/// registration intent, the mailbox queue must be the registered one, and
+/// the three capability public keys must be DISTINCT from each other
+/// (review v5 finding 3: a collapsed mailbox where one keypair serves
+/// send, receive and manage destroys the capability separation the
+/// mailbox design exists for).
 fn check_mailbox(state: &ClientStateV1) -> Result<()> {
     let send = keypair(&state.send_keypair_json)?;
     let receive = keypair(&state.receive_keypair_json)?;
@@ -294,6 +312,12 @@ fn check_mailbox(state: &ClientStateV1) -> Result<()> {
     if send.public_key() != state.registration.send_key
         || receive.public_key() != state.registration.receive_key
         || manage.public_key() != state.registration.manage_key
+    {
+        return Err(LabError::Storage);
+    }
+    if state.registration.send_key == state.registration.receive_key
+        || state.registration.send_key == state.registration.manage_key
+        || state.registration.receive_key == state.registration.manage_key
     {
         return Err(LabError::Storage);
     }
