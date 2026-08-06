@@ -1,5 +1,37 @@
 # Independent review — Phase 2 private-store boundary (`PrivateStoreDir`)
 
+## Remediation history (v2)
+
+Version 1 (head `09dc706607dc33387097e0eb613b7fe6c67e4747`) was PASSed by
+Fable and RETURNED by Sol with four blockers (verdicts in
+`reviews/REVIEW-fable-private-store-dir.md` and
+`reviews/REVIEW-sol-private-store-dir.md`). The amended head under review now
+fixes all four:
+
+1. Companion-only directories (any `-journal/-wal/-shm` with no main) are
+   rejected inside the boundary, so no store create can ever observe
+   `Absent`+companions (§1's "main and all companions absent" rule).
+2. The raw-path store constructors are now `#[cfg(test)] pub(crate)`; the
+   path-level hostile-fixture tests moved in-crate (`src/relay/` test
+   submodules) so the gate command still exercises them. Normal builds
+   contain no path-based store constructor (verified by symbol check).
+3. Owner-only now means mode bits AND no extended ACL: macOS uses a minimal
+   two-symbol FFI shim (`acl_get_fd`/`acl_free`, detect-only, nothing
+   stripped) in `src/private_store_dir/acl.rs` — the crate's only `unsafe`,
+   enabled by relaxing `unsafe_code` from `forbid` to `deny` with a scoped
+   `#![allow]`; Linux parses `system.posix_acl_access` via rustix (minimal
+   mode-equivalent ACL accepted, anything else rejected); other Unix rejects
+   unconditionally. Inherited ACLs fail the create path as well.
+4. The lifecycle lock is strictly non-blocking again: exactly one
+   `flock(LOCK_EX|LOCK_NB)` attempt. The macOS vnode release-lag is handled
+   only in tests (a bounded grace helper on immediate drop→reopen sites);
+   production documents the transient fail-closed reopen as caller-retryable.
+
+One prior decision is superseded: the bounded `WouldBlock` retry (v1
+decision 1) is removed per finding 4. The lock target (flock on the
+directory descriptor) is unchanged and was confirmed by both reviewers'
+probes.
+
 Review `secure-messenger-lab` at the exact head SHA supplied with this brief. Confirm the
 checked-out SHA and that the worktree is clean before reviewing. This same brief is being sent
 separately to Fable and Sol; do not seek, read, summarize, or defer to the other reviewer's response

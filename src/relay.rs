@@ -14,6 +14,14 @@ use crate::companion::{database_header_uses_wal, nonempty_companion, reject_anom
 use crate::private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 use crate::{EncryptedPacket, LabError, MessageId, Nonce, QueueId, Result};
 
+// The path-level hostile-fixture tests moved in-crate with the raw-path
+// constructors they exercise (review remediation: those constructors are
+// `#[cfg(test)] pub(crate)`, so their tests must be too).
+#[cfg(test)]
+mod file_backed_tests;
+#[cfg(test)]
+mod schema_upgrade_tests;
+
 const MAX_PACKET_BYTES: usize = 1_048_576;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const TOMBSTONE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -63,13 +71,14 @@ impl std::fmt::Debug for StoredEnvelope {
 /// [`Relay::create`] (directory must hold no database) and [`Relay::open`]
 /// (directory must hold one validated non-empty database). The store owns the
 /// directory handle, holding the lifecycle lock for its own lifetime. The
-/// raw-path constructors are doc-hidden and exist for the path-level
-/// hostile-fixture tests.
+/// raw-path constructors are `#[cfg(test)]` and exist for the path-level
+/// hostile-fixture tests, which live in-crate for that reason; normal builds
+/// contain no path-based store constructor.
 pub struct Relay {
     connection: Connection,
     audit_events: Vec<&'static str>,
     // Held for the lifecycle lock and the boundary's entry validation. Only
-    // `None` for in-memory relays and the doc-hidden test constructors.
+    // `None` for in-memory relays and the cfg(test) path constructors.
     _dir: Option<PrivateStoreDir>,
 }
 
@@ -139,18 +148,20 @@ impl Relay {
     }
 
     /// Test-only raw-path constructor for the path-level hostile-fixture
-    /// integration tests, bypassing the [`PrivateStoreDir`] boundary. Not a
-    /// production entry point.
-    #[doc(hidden)]
-    pub fn open_with_path_for_test(path: &Path) -> Result<Self> {
+    /// tests (now in-crate), bypassing the [`PrivateStoreDir`] boundary.
+    /// Compiled only under `cfg(test)`: normal builds contain no
+    /// path-based store constructor at all.
+    #[cfg(test)]
+    pub(crate) fn open_with_path_for_test(path: &Path) -> Result<Self> {
         Self::open_at_path(path, unix_now()?, None)
     }
 
     /// Test-only raw-path constructor for the path-level hostile-fixture
-    /// integration tests, bypassing the [`PrivateStoreDir`] boundary. Not a
-    /// production entry point.
-    #[doc(hidden)]
-    pub fn open_at_with_path_for_test(path: &Path, now: u64) -> Result<Self> {
+    /// tests (now in-crate), bypassing the [`PrivateStoreDir`] boundary.
+    /// Compiled only under `cfg(test)`: normal builds contain no
+    /// path-based store constructor at all.
+    #[cfg(test)]
+    pub(crate) fn open_at_with_path_for_test(path: &Path, now: u64) -> Result<Self> {
         Self::open_at_path(path, now, None)
     }
 

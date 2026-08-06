@@ -5,7 +5,8 @@ use std::path::Path;
 use std::process::Command;
 
 use rusqlite::{Connection, OpenFlags, params};
-use secure_messenger_lab::Relay;
+
+use crate::Relay;
 
 const NOW: u64 = 1_800_000_000;
 const HOT_JOURNAL_CHILD_PATH: &str = "SECURE_MESSENGER_HOT_JOURNAL_CHILD_PATH";
@@ -185,7 +186,7 @@ fn seed_legacy_large_messages(database: &Path) -> Result<(), Box<dyn Error>> {
 fn run_hot_journal_child(database: &Path, operation: &str) -> Result<(), Box<dyn Error>> {
     let status = Command::new(env::current_exe()?)
         .arg("--exact")
-        .arg("hot_rollback_journal_child")
+        .arg("relay::schema_upgrade_tests::hot_rollback_journal_child")
         .arg("--nocapture")
         .env(HOT_JOURNAL_CHILD_PATH, database)
         .env(HOT_JOURNAL_CHILD_OPERATION, operation)
@@ -404,7 +405,7 @@ fn future_schema_version_fails_closed() -> Result<(), Box<dyn Error>> {
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     Ok(())
 }
@@ -430,7 +431,7 @@ fn current_schema_version_without_sender_signatures_fails_closed() -> Result<(),
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     assert!(contains(&fs::read(&database)?, &legacy_ciphertext));
     Ok(())
@@ -481,7 +482,7 @@ fn current_schema_with_sender_signature_but_missing_constraints_fails_closed()
     let before = fs::read(&database)?;
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, before);
     Ok(())
@@ -500,7 +501,7 @@ fn current_schema_rejects_extra_trigger_and_version_shape_disagreement()
     drop(connection);
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
 
     let clean = directory.path().join("current-as-v1.sqlite");
@@ -510,7 +511,7 @@ fn current_schema_rejects_extra_trigger_and_version_shape_disagreement()
     drop(connection);
     assert!(matches!(
         Relay::open_at_with_path_for_test(&clean, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     Ok(())
 }
@@ -561,7 +562,7 @@ fn valid_hot_rollback_journal_recovers_complete_pretransaction_state() -> Result
 
     let status = Command::new(env::current_exe()?)
         .arg("--exact")
-        .arg("hot_rollback_journal_child")
+        .arg("relay::schema_upgrade_tests::hot_rollback_journal_child")
         .arg("--nocapture")
         .env(HOT_JOURNAL_CHILD_PATH, &database)
         .status()?;
@@ -724,7 +725,7 @@ fn hot_journal_replay_mutates_main_database_before_validation_rejects() -> Resul
     let before = fs::read(&database)?;
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     let after = fs::read(&database)?;
 
@@ -773,7 +774,7 @@ fn foreign_journal_is_replayed_into_an_unrelated_database() -> Result<(), Box<dy
     // Acceptance is what is guaranteed: the victim is still rejected.
     assert!(matches!(
         Relay::open_at_with_path_for_test(&victim, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
 
     // But its bytes are not preserved: it now holds the source's pages.
@@ -863,7 +864,7 @@ fn planted_wal_is_refused_without_touching_the_database() -> Result<(), Box<dyn 
     for _ in 0..3 {
         assert!(matches!(
             Relay::open_at_with_path_for_test(&victim, NOW),
-            Err(secure_messenger_lab::LabError::Storage)
+            Err(crate::LabError::Storage)
         ));
     }
 
@@ -926,7 +927,7 @@ fn rejected_wal_open_checkpoints_and_removes_both_companions() -> Result<(), Box
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
 
     // Rejection on this path rewrites the main database and consumes both
@@ -956,7 +957,7 @@ fn stray_journal_is_discarded_but_target_database_is_never_mutated() -> Result<(
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
 
     // The rejection must not have touched the database the caller named.
@@ -983,7 +984,7 @@ fn malformed_schema_with_wal_artifact_is_rejected_without_target_mutation()
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, database_before);
     assert_eq!(fs::read(&companion)?, companion_before);
@@ -1024,7 +1025,7 @@ fn integrity_check_rejects_constraint_poison_without_mutation() -> Result<(), Bo
 
     assert!(matches!(
         Relay::open_at_with_path_for_test(&database, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     assert_eq!(fs::read(&database)?, before);
     Ok(())
@@ -1065,7 +1066,7 @@ fn hostile_fixture_source_is_immutable_while_disposable_copy_is_rejected()
     fs::copy(&source, &working_copy)?;
     assert!(matches!(
         Relay::open_at_with_path_for_test(&working_copy, NOW),
-        Err(secure_messenger_lab::LabError::Storage)
+        Err(crate::LabError::Storage)
     ));
     assert_eq!(fs::read(&source)?, original);
     assert_eq!(fs::read(&companion)?, original_companion);

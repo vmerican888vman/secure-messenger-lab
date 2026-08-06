@@ -8,7 +8,14 @@
 //! - the directory is owned by the application UID with no group or other
 //!   access;
 //! - the directory and every expected file are regular, owner-only,
-//!   same-owner and single-link;
+//!   same-owner and single-link, and carry NO access-control entries beyond
+//!   what the mode bits express (POSIX ACLs bypass owner-only mode checks
+//!   on macOS and survive `fchmod`; detection is fail-closed and nothing is
+//!   ever stripped — see `acl.rs`);
+//! - a directory containing any companion (`-journal`/`-wal`/`-shm`) while
+//!   the main database is absent is torn/anomalous state and is rejected —
+//!   create requires the main database and all companions absent, and a
+//!   lone companion is never auto-deleted (§1);
 //! - every symlink, hardlink, device, FIFO, socket and unexpected entry is
 //!   rejected;
 //! - an exclusive non-blocking lifecycle lock is acquired before any database
@@ -23,6 +30,15 @@
 //! because it is description-scoped, so a second open by the *same* process
 //! still conflicts — `fcntl` locks are process-scoped and would silently
 //! admit a duplicate live store.
+//!
+//! The lock is strictly non-blocking: exactly one
+//! `flock(NonBlockingLockExclusive)` attempt, and contention or any error
+//! fails immediately. Consequence, measured on this codebase's own suite:
+//! on macOS an immediate drop-then-reopen can transiently fail closed under
+//! filesystem churn (vnode release lag). That is fail-closed and retryable
+//! by the caller — the façade's reconcile path surfaces it as an ordinary
+//! storage error — so production code never retries inside the boundary and
+//! only tests reopen through a bounded grace helper.
 //!
 //! What this boundary deliberately does not defend against (frozen in §1):
 //! root or OS compromise, arbitrary code running under the application UID,
@@ -40,6 +56,8 @@
 //! Only Unix is supported in Phase 2: this module uses descriptor-relative
 //! POSIX operations throughout, and the crate's stores depend on it, so the
 //! crate does not build on non-Unix targets.
+
+mod acl;
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File};
@@ -133,11 +151,18 @@ impl PrivateStoreDir {
     /// The caller then decides from [`Self::main_database_at_open`] whether a
     /// store create or store open is permitted.
     ///
+    /// The lock is strictly non-blocking. On macOS, an immediate reopen
+    /// after dropping the previous handle can transiently fail closed under
+    /// filesystem churn (vnode release lag, measured in this repository).
+    /// That failure is an ordinary retryable storage error; the façade's
+    /// reconcile path surfaces it as one. Production callers retry at their
+    /// own cadence; this boundary never retries internally.
+    ///
     /// # Errors
     ///
     /// Returns a coarse storage error on any violated invariant: missing or
-    /// misowned directory, anomalous entry, symlink, hardlink, or lock
-    /// contention.
+    /// misowned directory, anomalous entry, symlink, hardlink, ACL beyond
+    /// the mode bits, torn companions, or lock contention.
     pub fn open(path: &Path, kind: StoreKind) -> Result<Self> {
         let path = canonical(path)?;
         let dir = open_dir(&path)?;
@@ -237,7 +262,7 @@ fn open_dir(path: &Path) -> Result<File> {
 }
 
 /// The directory must be a real directory, owned by this UID, with no group
-/// or other access bits.
+/// or other access bits and no ACL beyond what the mode bits express.
 fn verify_directory(dir: &File) -> Result<()> {
     let stat = fs::fstat(dir).map_err(|_| LabError::Storage)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
@@ -249,39 +274,21 @@ fn verify_directory(dir: &File) -> Result<()> {
     if stat.st_mode & 0o077 != 0 {
         return Err(LabError::Storage);
     }
-    Ok(())
+    acl::reject_extended_acl(dir)
 }
 
 /// Take the exclusive lifecycle lock on the directory descriptor.
 ///
-/// The lock is non-blocking in the design sense: it never waits on a
-/// legitimate holder. There is one bounded exception. On macOS, a contended
-/// vnode's `flock` release can lag the closing of the description that held
-/// it — measured on this codebase's own test suite as a `WouldBlock` on an
-/// immediate close-then-relock of a directory no descriptor in the process
-/// still held open, only under heavy parallel vnode churn. A legitimate
-/// holder keeps its lock for the entire store lifetime, so a short grace
-/// window (10 attempts, 5 ms apart) cannot mask real contention; it only
-/// absorbs the kernel's release lag. Any error other than contention fails
-/// immediately.
+/// Strictly non-blocking: exactly one `flock(NonBlockingLockExclusive)`
+/// attempt; contention or any error fails immediately. See the module docs
+/// for the measured macOS vnode-release-lag consequence and where the
+/// resulting transient failure is absorbed (callers/tests, never here).
 fn lock_directory(dir: &File) -> Result<()> {
-    for attempt in 0..10 {
-        match fs::flock(dir, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(()),
-            Err(rustix::io::Errno::WOULDBLOCK) => {
-                if attempt == 9 {
-                    return Err(LabError::Storage);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(_) => return Err(LabError::Storage),
-        }
-    }
-    Err(LabError::Storage)
+    fs::flock(dir, FlockOperation::NonBlockingLockExclusive).map_err(|_| LabError::Storage)
 }
 
 /// An expected file must be a regular file, owned by this UID, single-link,
-/// and owner-only.
+/// owner-only, and free of any ACL beyond what the mode bits express.
 fn verify_regular_file(file: &File) -> Result<()> {
     let stat = fs::fstat(file).map_err(|_| LabError::Storage)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
@@ -296,15 +303,18 @@ fn verify_regular_file(file: &File) -> Result<()> {
     if stat.st_mode & 0o077 != 0 {
         return Err(LabError::Storage);
     }
-    Ok(())
+    acl::reject_extended_acl(file)
 }
 
 /// Enumerate the directory descriptor-relative and validate every entry.
 /// Anything that is not the main database or an exact-suffix companion of it
-/// rejects the whole directory.
+/// rejects the whole directory. A companion present while the main database
+/// is absent is torn/anomalous state and also rejects: create requires the
+/// main database and all companions absent, and nothing is auto-deleted.
 fn validate_entries(dir: &File, kind: StoreKind) -> Result<MainDatabase> {
     let mut listing = fs::Dir::read_from(dir).map_err(|_| LabError::Storage)?;
     let mut main: Option<u64> = None;
+    let mut companion_seen = false;
     while let Some(entry) = listing.read() {
         let entry = entry.map_err(|_| LabError::Storage)?;
         let name = entry.file_name().to_bytes();
@@ -326,10 +336,14 @@ fn validate_entries(dir: &File, kind: StoreKind) -> Result<MainDatabase> {
         });
         if is_companion {
             let _ = probe(dir, name)?;
+            companion_seen = true;
             continue;
         }
         // Any other entry — including subdirectories, devices, FIFOs,
         // sockets, dangling paths and plain unexpected files — fails closed.
+        return Err(LabError::Storage);
+    }
+    if companion_seen && main.is_none() {
         return Err(LabError::Storage);
     }
     Ok(match main {
@@ -354,4 +368,24 @@ fn probe(dir: &File, name: &[u8]) -> Result<File> {
     let file = File::from(fd);
     verify_regular_file(&file)?;
     Ok(file)
+}
+
+/// Test-only open with a bounded grace window for the macOS vnode release
+/// lag (see the module docs): retries `open` for up to 500 ms in 10 ms
+/// steps. In-crate tests that reopen immediately after dropping a handle
+/// use this; assertions that a CONTENDED open fails must keep using the
+/// plain single-attempt [`PrivateStoreDir::open`]. Integration tests carry
+/// their own copy (they cannot reach crate-private items).
+#[cfg(test)]
+pub(crate) fn open_with_release_grace(
+    path: &Path,
+    kind: StoreKind,
+) -> Result<PrivateStoreDir> {
+    for _ in 0..50 {
+        match PrivateStoreDir::open(path, kind) {
+            Ok(dir) => return Ok(dir),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    PrivateStoreDir::open(path, kind)
 }

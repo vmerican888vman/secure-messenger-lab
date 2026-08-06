@@ -1624,7 +1624,12 @@ mod tests {
         store.commit(b"secured-two")?;
         drop(store);
 
-        let dir = PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState)?;
+        // Grace helper for the macOS vnode release lag: this is an
+        // immediate drop-then-reopen, not a contention assertion.
+        let dir = crate::private_store_dir::open_with_release_grace(
+            &store_path,
+            crate::StoreKind::ClientState,
+        )?;
         let reopened = ClientStateStore::open(dir, TestProtector::new(71, 72))?;
         assert_eq!(reopened.state()?, b"secured-two");
         assert_eq!(reopened.generation()?, 2);
@@ -1638,7 +1643,10 @@ mod tests {
         let store_path = directory.path().join("occupied");
         let dir = PrivateStoreDir::create(&store_path, crate::StoreKind::ClientState)?;
         drop(ClientStateStore::create(dir, TestProtector::new(73, 74), b"one")?);
-        let dir = PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState)?;
+        let dir = crate::private_store_dir::open_with_release_grace(
+            &store_path,
+            crate::StoreKind::ClientState,
+        )?;
         assert!(ClientStateStore::create(dir, TestProtector::new(73, 74), b"two").is_err());
 
         // Open without a database refuses.
@@ -1658,7 +1666,13 @@ mod tests {
         assert!(PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState).is_err());
 
         drop(store);
-        assert!(PrivateStoreDir::open(&store_path, crate::StoreKind::ClientState).is_ok());
+        assert!(
+            crate::private_store_dir::open_with_release_grace(
+                &store_path,
+                crate::StoreKind::ClientState,
+            )
+            .is_ok()
+        );
         Ok(())
     }
 }

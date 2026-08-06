@@ -9,6 +9,11 @@ description = "Disposable Phase 0 harness for testing an end-to-end encrypted ma
 
 [dependencies]
 chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+# The review authorized =0.2.175; that version does not resolve because
+# pinned rustix 1.1.4 requires libc ^0.2.182. =0.2.189 is the closest that
+# resolves and is the version already locked transitively, so the lockfile
+# is unchanged. Noted in the remediation report.
+libc = "=0.2.189"
 rand = "=0.8.7"
 rusqlite = { version = "=0.39.0", features = ["bundled"] }
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process"] }
@@ -33,7 +38,10 @@ panic = "abort"
 strip = true
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so exactly one module can scope an allow: the
+# macOS POSIX-ACL FFI shim in `src/private_store_dir/acl.rs`. That shim is
+# the only `unsafe` in the crate; see its module docs for the policy.
+unsafe_code = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

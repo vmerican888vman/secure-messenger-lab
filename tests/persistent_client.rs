@@ -171,6 +171,14 @@ fn create_dir(temp: &TempDir) -> Result<PrivateStoreDir, Box<dyn Error>> {
 }
 
 fn open_dir(temp: &TempDir) -> Result<PrivateStoreDir, Box<dyn Error>> {
+    // Grace window for the macOS vnode release lag on immediate
+    // drop-then-reopen (see the boundary's module docs).
+    for _ in 0..50 {
+        match PrivateStoreDir::open(&store_path(temp), StoreKind::ClientState) {
+            Ok(dir) => return Ok(dir),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
     Ok(PrivateStoreDir::open(&store_path(temp), StoreKind::ClientState)?)
 }
 
