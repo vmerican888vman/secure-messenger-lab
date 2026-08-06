@@ -91,6 +91,10 @@ pub(crate) struct ClientPayloadV2 {
 }
 
 /// An application payload; the body is bounded at 65,536 UTF-8 bytes.
+/// Escape inflation (D2a carry-over): a legal body can exceed the payload
+/// bound after JSON escaping, so the encoded size is computed here and
+/// now, and any overflow rejects with [`LabError::InvalidPayload`] before
+/// any sequence assignment. The decode path enforces the same bound.
 pub(crate) fn application(
     conversation_id: ConversationId,
     message_id: MessageId,
@@ -102,7 +106,7 @@ pub(crate) fn application(
     if body.len() > MAX_BODY {
         return Err(LabError::InvalidPayload);
     }
-    Ok(ClientPayloadV2 {
+    let payload = ClientPayloadV2 {
         version: PAYLOAD_VERSION,
         conversation_id,
         message_id,
@@ -112,7 +116,13 @@ pub(crate) fn application(
         kind: KIND_APPLICATION,
         body: Some(body),
         receipt: None,
-    })
+    };
+    let size =
+        Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| LabError::InvalidPayload)?).len();
+    if size > MAX_PAYLOAD_BYTES {
+        return Err(LabError::InvalidPayload);
+    }
+    Ok(payload)
 }
 
 /// Arm, version and size validation, shared by encode and decode.
@@ -392,6 +402,35 @@ mod tests {
         let stored = receipt.to_stored()?;
         let back = ReceiptV2::from(&stored);
         assert_eq!(back, receipt);
+        Ok(())
+    }
+
+    #[test]
+    fn escape_inflated_body_rejected_as_invalid_payload() -> std::result::Result<(), Box<dyn Error>>
+    {
+        // A body of 40,000 quotes is within the 65,536-byte body bound but
+        // doubles under JSON escaping, exceeding the payload bound.
+        let heavy = "\"".repeat(40_000);
+        let result = application(
+            ConversationId::random(),
+            MessageId::random(),
+            [0x07; 32],
+            1,
+            1,
+            heavy,
+        );
+        assert!(matches!(result, Err(LabError::InvalidPayload)));
+        // A same-length body without escapes stays under the bound.
+        let light = "x".repeat(40_000);
+        let ok = application(
+            ConversationId::random(),
+            MessageId::random(),
+            [0x07; 32],
+            1,
+            1,
+            light,
+        )?;
+        assert!(decode(&encode(&ok)?).is_ok());
         Ok(())
     }
 }

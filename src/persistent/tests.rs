@@ -184,7 +184,7 @@ fn payload_generation_tracks_store_generation() -> std::result::Result<(), Box<d
     assert_eq!(client.state.generation, client.store.generation()?);
     assert_eq!(client.state.generation, 2);
 
-    let action = client.registration_action(NOW + 3_600)?;
+    let action = client.registration_action(NOW + 60)?;
     client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
     assert_eq!(client.state.generation, client.store.generation()?);
     assert_eq!(client.state.generation, 4);
@@ -302,6 +302,7 @@ fn establish_session(
     client.commit_verified_contact(
         offer.signing_identity,
         offer,
+        crate::ConversationId::random(),
         QueueId::random(),
         Zeroizing::new(serde_json::to_vec(&keypair)?),
         NOW,
@@ -354,5 +355,614 @@ fn rekey_required_blocks_all_staging() -> std::result::Result<(), Box<dyn Error>
             .stage_send("still blocked", NOW, NOW + 3_600, NOW)
             .is_err()
     );
+    Ok(())
+}
+
+// --- D2b: inbound path, receipts, ACKs --------------------------------------
+
+use vodozemac::olm::SessionConfig;
+
+use super::{AcceptOutcome, AckOutcomeView, SendOutcome};
+use crate::payload;
+use crate::state::DedupState;
+use crate::{ConversationId, EncryptedPacket, MessageId, Relay};
+
+/// Share a conversation ID and exchange verified contacts both ways, then
+/// establish B's outbound session to A.
+fn connect(
+    a: &mut PersistentClient<TestProtector>,
+    b: &mut PersistentClient<TestProtector>,
+    conversation_id: ConversationId,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let offer_a = a.prekey_action(NOW + 300)?;
+    let offer_b = b.prekey_action(NOW + 300)?;
+    let identity_a = a.public_identity()?;
+    let identity_b = b.public_identity()?;
+    let queue_a = a.state.mailbox_queue_id;
+    let queue_b = b.state.mailbox_queue_id;
+    b.commit_verified_contact(
+        identity_a.ed25519,
+        offer_a,
+        conversation_id,
+        queue_a,
+        Zeroizing::new(serde_json::to_vec(&a.keypairs.send)?),
+        NOW,
+    )?;
+    a.commit_verified_contact(
+        identity_b.ed25519,
+        offer_b,
+        conversation_id,
+        queue_b,
+        Zeroizing::new(serde_json::to_vec(&b.keypairs.send)?),
+        NOW,
+    )?;
+    b.establish_outbound_session(NOW)?;
+    Ok(())
+}
+
+/// Register both clients on the in-memory relay and confirm.
+fn register_on_relay(
+    client: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let action = client.registration_action(NOW + 60)?;
+    relay.register(&action.request, NOW)?;
+    client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
+    Ok(())
+}
+
+/// B stages `count` application sends to A's mailbox through the real
+/// relay, confirming each as stored.
+fn stage_to_relay(
+    b: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    bodies: &[&str],
+) -> std::result::Result<(), Box<dyn Error>> {
+    for body in bodies {
+        let action = b.stage_send(body, NOW, NOW + 3_600, NOW)?;
+        relay.enqueue(&action.request, NOW)?;
+        b.record_send_result(&action, SendOutcome::Stored)?;
+    }
+    Ok(())
+}
+
+/// Fetch A's mailbox through the real relay and accept the envelopes in
+/// the given order, returning per-envelope results (Err entries keep
+/// going so out-of-order and duplicate cases can assert per envelope).
+fn deliver(
+    a: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    order: &[usize],
+) -> std::result::Result<Vec<std::result::Result<AcceptOutcome, LabError>>, Box<dyn Error>> {
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let mut outcomes = Vec::new();
+    for &index in order {
+        let envelope = envelopes.get(index).ok_or("missing envelope")?;
+        outcomes.push(a.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            NOW,
+        ));
+    }
+    Ok(outcomes)
+}
+
+fn active_mode(
+    client: &PersistentClient<TestProtector>,
+) -> std::result::Result<SessionMode, Box<dyn Error>> {
+    Ok(client
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no active session")?
+        .mode)
+}
+
+/// Two registered, contact-bound clients on an in-memory relay with B's
+/// outbound session to A established, plus four staged-and-stored
+/// application messages from B.
+type ConversationFixture = (
+    TempDir,
+    TempDir,
+    PersistentClient<TestProtector>,
+    PersistentClient<TestProtector>,
+    Relay,
+);
+
+fn conversation_fixture() -> std::result::Result<ConversationFixture, Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+    stage_to_relay(&mut b, &mut relay, &["m1", "m2", "m3", "m4"])?;
+    Ok((a_dir, b_dir, a, b, relay))
+}
+
+#[test]
+fn two_client_conversation_over_real_relay() -> std::result::Result<(), Box<dyn Error>> {
+    let (a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+
+    // A accepts 1, then 3, then 4, then 2 (out-of-order), then a
+    // duplicate of 2.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(matches!(
+        outcomes.first(),
+        Some(Ok(AcceptOutcome::Application(_)))
+    ));
+    // Crash/reopen mid-spine: only committed state survives.
+    drop(a);
+    let mut a = open_client(&a_dir)?;
+    let outcomes = deliver(&mut a, &mut relay, &[2, 3])?;
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "out-of-order accepts failed: {outcomes:?}"
+    );
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.highest_contiguous_received_seq, 1);
+        assert_eq!(active.received_above_high_water, vec![3, 4]);
+    }
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(matches!(outcomes.first(), Some(Ok(_))));
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.highest_contiguous_received_seq, 4);
+        assert!(active.received_above_high_water.is_empty());
+    }
+    // Duplicate envelope: rejected, no ratchet touch.
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(matches!(
+        outcomes.first(),
+        Some(Err(LabError::DuplicateMessage))
+    ));
+
+    // Inbound views carry the bodies in acceptance order.
+    let inbound = a.pending_inbound()?;
+    assert_eq!(inbound.len(), 4);
+    let mut bodies: Vec<&str> = inbound.iter().map(|view| view.body.as_str()).collect();
+    bodies.sort_unstable();
+    assert_eq!(bodies, ["m1", "m2", "m3", "m4"]);
+    Ok(())
+}
+
+#[test]
+fn ack_and_receipt_flow_over_real_relay() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0, 1, 2, 3])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+
+    // Consume m1: ACK intent plus a staged receipt (control send).
+    let inbound = a.pending_inbound()?;
+    let message_id = inbound
+        .iter()
+        .find(|view| view.body == "m1")
+        .ok_or("m1 missing")?
+        .message_id;
+    a.consume_inbound(message_id, NOW + 60, NOW)?;
+    assert_eq!(a.pending_inbound()?.len(), 3);
+    assert_eq!(a.pending_send_actions()?.len(), 1, "one coalesced receipt");
+
+    // The ACK flows through the real relay and its result lands.
+    let ack_actions = a.ack_actions(NOW)?;
+    assert_eq!(ack_actions.len(), 1);
+    let ack_action = ack_actions.first().ok_or("no ack action")?;
+    relay.acknowledge(&ack_action.request, NOW)?;
+    a.record_ack_result(ack_action, AckOutcomeView::Deleted)?;
+    assert!(a.ack_actions(NOW)?.is_empty());
+    assert!(
+        a.state
+            .dedup
+            .iter()
+            .any(|record| record.message_id == message_id && record.state == DedupState::Acked),
+        "dedup record not Acked"
+    );
+    assert!(
+        a.record_ack_result(ack_action, AckOutcomeView::Deleted)
+            .is_err(),
+        "replayed ack result accepted"
+    );
+
+    // Deliver A's staged receipt to B through the relay: B's high water
+    // advances to 4 and the send budget recovers.
+    let receipt_action = a
+        .pending_send_actions()?
+        .first()
+        .ok_or("no receipt staged")?
+        .clone();
+    relay.enqueue(&receipt_action.request, NOW)?;
+    a.record_send_result(&receipt_action, SendOutcome::Stored)?;
+    let fetch = b.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let receipt_envelope = envelopes.first().ok_or("no receipt envelope")?;
+    let outcome = b.accept_envelope(
+        receipt_envelope.queue_id,
+        receipt_envelope.message_id,
+        receipt_envelope.packet.clone(),
+        receipt_envelope.expires_at,
+        receipt_envelope.sender_signature,
+        NOW,
+    )?;
+    assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
+    {
+        let active = b.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.peer_contiguous_high_water, 4);
+        assert_eq!(active.last_assigned_send_seq, 4);
+    }
+
+    // Re-accepting the same receipt envelope rejects as a duplicate; a
+    // second consume-driven receipt with the same water is idempotent.
+    let outcome = b.accept_envelope(
+        receipt_envelope.queue_id,
+        receipt_envelope.message_id,
+        receipt_envelope.packet.clone(),
+        receipt_envelope.expires_at,
+        receipt_envelope.sender_signature,
+        NOW,
+    );
+    assert!(matches!(outcome, Err(LabError::DuplicateMessage)));
+    Ok(())
+}
+
+#[test]
+fn second_receipt_at_same_high_water_is_idempotent() -> std::result::Result<(), Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+    stage_to_relay(&mut b, &mut relay, &["one", "two"])?;
+    let outcomes = deliver(&mut a, &mut relay, &[0, 1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+
+    // Two consumes, no new accepts: two receipts, both reporting HCR 2.
+    let inbound = a.pending_inbound()?;
+    for view in &inbound {
+        a.consume_inbound(view.message_id, NOW + 60, NOW)?;
+    }
+    assert_eq!(a.pending_send_actions()?.len(), 2);
+    let actions = a.pending_send_actions()?;
+    let mut outcomes = Vec::new();
+    for action in &actions {
+        relay.enqueue(&action.request, NOW)?;
+        a.record_send_result(action, SendOutcome::Stored)?;
+    }
+    let fetch = b.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    assert_eq!(envelopes.len(), 2);
+    for envelope in &envelopes {
+        outcomes.push(b.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            NOW,
+        )?);
+    }
+    assert!(outcomes.contains(&AcceptOutcome::ReceiptApplied));
+    assert!(outcomes.contains(&AcceptOutcome::ReceiptIdempotent));
+    Ok(())
+}
+
+#[test]
+fn accept_envelope_rejects_forgery_expiry_and_wrong_variant()
+-> std::result::Result<(), Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+    stage_to_relay(&mut b, &mut relay, &["genuine"])?;
+
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let envelope = envelopes.first().ok_or("no envelope")?;
+
+    // Forged outer signature.
+    let forged = Ed25519Keypair::new().sign(b"wrong bytes");
+    assert!(matches!(
+        a.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            forged,
+            NOW,
+        ),
+        Err(LabError::Unauthorized)
+    ));
+    // Expired envelope.
+    assert!(matches!(
+        a.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            NOW,
+            envelope.sender_signature,
+            NOW,
+        ),
+        Err(LabError::RequestExpired)
+    ));
+    // The failures mutated nothing: the genuine envelope still accepts.
+    let outcome = a.accept_envelope(
+        envelope.queue_id,
+        envelope.message_id,
+        envelope.packet.clone(),
+        envelope.expires_at,
+        envelope.sender_signature,
+        NOW,
+    )?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+    Ok(())
+}
+
+/// Signed envelope around a genuine payload from a raw peer session.
+fn raw_peer_envelope(
+    peer_session: &mut vodozemac::olm::Session,
+    a: &PersistentClient<TestProtector>,
+    conversation_id: ConversationId,
+    seq: u64,
+) -> std::result::Result<(MessageId, EncryptedPacket, vodozemac::Ed25519Signature), Box<dyn Error>>
+{
+    let epoch_id = super::epoch_of(peer_session.session_keys());
+    let queue_a = a.state.mailbox_queue_id;
+    let message_id = MessageId::random();
+    let outgoing = payload::application(
+        conversation_id,
+        message_id,
+        epoch_id,
+        seq,
+        NOW,
+        format!("gap-message-{seq}"),
+    )?;
+    let encoded = payload::encode(&outgoing)?;
+    let message = peer_session.encrypt(&encoded[..])?;
+    let packet = EncryptedPacket::from_untrusted(serde_json::to_vec(&message)?);
+    let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+        queue_a,
+        message_id,
+        &packet.digest(),
+        NOW + 3_600,
+    ));
+    Ok((message_id, packet, signature))
+}
+
+/// A raw vodozemac peer drives a genuine message gap past vodozemac's
+/// 40-retained-skipped-keys horizon; the accept must fail AND durably
+/// commit `RekeyRequired`.
+#[test]
+fn gap_failure_commits_rekey_required() -> std::result::Result<(), Box<dyn Error>> {
+    let a_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let conversation_id = ConversationId::random();
+    let offer_a = a.prekey_action(NOW + 300)?;
+    let queue_a = a.state.mailbox_queue_id;
+
+    // A raw test peer (no façade budget on its side) establishes a real
+    // outbound session against A's published one-time key. A commits the
+    // peer's verified contact first (the accept path needs the binding).
+    let mut peer_account = Account::new();
+    let peer_otk = *peer_account
+        .generate_one_time_keys(1)
+        .created
+        .first()
+        .ok_or("no peer one-time key")?;
+    peer_account.mark_keys_as_published();
+    let mut peer_offer = RedactedContactOffer {
+        signing_identity: peer_account.ed25519_key(),
+        curve_identity: peer_account.curve25519_key(),
+        one_time_key: peer_otk,
+        valid_until: NOW + 300,
+        signature: peer_account.sign(b""),
+    };
+    peer_offer.signature = peer_account.sign(in_crate_prekey_signing_bytes(
+        &peer_offer.signing_identity,
+        &peer_offer.curve_identity,
+        &peer_offer.one_time_key,
+        NOW + 300,
+    ));
+    a.commit_verified_contact(
+        peer_offer.signing_identity,
+        peer_offer,
+        conversation_id,
+        QueueId::random(),
+        Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
+        NOW,
+    )?;
+    let mut peer_session = peer_account.create_outbound_session(
+        SessionConfig::version_1(),
+        offer_a.curve_identity,
+        offer_a.one_time_key,
+    )?;
+
+    // Message 1 establishes A's inbound session.
+    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1)?;
+    let outcome = a.accept_envelope(queue_a, id1, packet1, NOW + 3_600, sig1, NOW)?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+
+    // The peer keeps encrypting through seq 45. Deliver seq 45 first: the
+    // 43-message gap is within vodozemac's 2000-gap tolerance, so it
+    // decrypts and lands in the out-of-order set — but its chain advance
+    // evicts the oldest skipped keys (only 40 retained).
+    let mut second = None;
+    let mut last = None;
+    for seq in 2..=45 {
+        let envelope = raw_peer_envelope(&mut peer_session, &a, conversation_id, seq)?;
+        if seq == 2 {
+            second = Some(envelope);
+        } else if seq == 45 {
+            last = Some(envelope);
+        }
+    }
+    let (id45, packet45, sig45) = last.ok_or("no seq-45 envelope")?;
+    let outcome = a.accept_envelope(queue_a, id45, packet45, NOW + 3_600, sig45, NOW)?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .received_above_high_water,
+        vec![45]
+    );
+
+    // Now deliver the previously-unseen seq 2: its skipped key was
+    // evicted, a genuine MissingMessageKey — RekeyRequired commits.
+    let (id2, packet2, sig2) = second.ok_or("no seq-2 envelope")?;
+    let generation_before = a.store.generation()?;
+    let result = a.accept_envelope(queue_a, id2, packet2, NOW + 3_600, sig2, NOW);
+    assert!(result.is_err(), "gap packet accepted");
+
+    // The failure committed RekeyRequired (generation advanced by one).
+    assert_eq!(active_mode(&a)?, SessionMode::RekeyRequired);
+    assert_eq!(a.store.generation()?, generation_before + 1);
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq,
+        1,
+        "the failed message moved the receive high water"
+    );
+
+    // Durable across reopen; all staging stays blocked.
+    drop(a);
+    let mut a = open_client(&a_dir)?;
+    assert_eq!(active_mode(&a)?, SessionMode::RekeyRequired);
+    assert!(a.stage_send("blocked", NOW, NOW + 3_600, NOW).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn terminal_send_records_are_pruned_after_the_tombstone_window()
+-> std::result::Result<(), Box<dyn Error>> {
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    // Record 1: staged with a short expiry, terminally stored.
+    let first = b.stage_send("terminal", NOW, NOW + 60, NOW)?;
+    b.record_send_result(&first, SendOutcome::Stored)?;
+    assert_eq!(b.state.sends.len(), 1, "terminal record retained in window");
+
+    // Inside the tombstone window the record survives a send-path
+    // mutator.
+    let second = b.stage_send("in window", NOW + 120, NOW + 120 + 3_600, NOW + 120)?;
+    assert_eq!(b.state.sends.len(), 2);
+
+    // Past the window, the next send-path mutator prunes record 1. Record
+    // 2's own expiry passes first (swept to Expired), but ITS tombstone
+    // window has not, so only record 1 leaves.
+    let past_window = NOW + 60 + 7 * 24 * 60 * 60 + 1;
+    let third = b.stage_send(
+        "after window",
+        past_window,
+        past_window + 3_600,
+        past_window,
+    )?;
+    let records = &b.state.sends;
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.message_id != first.request.message_id),
+        "record 1 not pruned"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.message_id == second.request.message_id)
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.message_id == third.request.message_id)
+    );
+    // The high-water state is untouched by pruning.
+    let active = b.state.active_session.as_ref().ok_or("no session")?;
+    assert_eq!(active.peer_contiguous_high_water, 0);
+    assert_eq!(active.last_assigned_send_seq, 3);
+    let _ = a;
+    Ok(())
+}
+
+#[test]
+fn accept_path_reconcile_required_on_commit_failure() -> std::result::Result<(), Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+    stage_to_relay(&mut b, &mut relay, &["doomed-accept"])?;
+
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let envelope = envelopes.first().ok_or("no envelope")?;
+
+    let connection = Connection::open(a_dir.path().join("client").join("client-state.sqlite3"))?;
+    let nonce: Vec<u8> =
+        connection.query_row("SELECT nonce FROM client_state WHERE slot = 1", [], |row| {
+            row.get(0)
+        })?;
+    let mut tampered = nonce.clone();
+    *tampered.first_mut().ok_or("empty nonce")? ^= 0x01;
+    connection.execute(
+        "UPDATE client_state SET nonce = ?1 WHERE slot = 1",
+        params![tampered],
+    )?;
+
+    assert!(
+        a.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            NOW,
+        )
+        .is_err()
+    );
+    assert!(a.pending_inbound().is_err());
+    assert!(a.ack_actions(NOW).is_err());
+    assert!(a.fetch_request(NOW + 60, NOW).is_err());
+
+    connection.execute(
+        "UPDATE client_state SET nonce = ?1 WHERE slot = 1",
+        params![nonce],
+    )?;
+    drop(connection);
+    drop(a);
+    let mut a = open_client(&a_dir)?;
+    // The envelope was never committed; accepting it now succeeds.
+    let outcome = a.accept_envelope(
+        envelope.queue_id,
+        envelope.message_id,
+        envelope.packet.clone(),
+        envelope.expires_at,
+        envelope.sender_signature,
+        NOW,
+    )?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
     Ok(())
 }

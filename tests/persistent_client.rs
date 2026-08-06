@@ -213,6 +213,7 @@ fn commit_contact_and_establish(
     client.commit_verified_contact(
         peer.offer.signing_identity,
         peer.offer,
+        secure_messenger_lab::ConversationId::random(),
         peer.queue_id,
         Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
         NOW,
@@ -266,6 +267,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     client.commit_verified_contact(
         peer.offer.signing_identity,
         peer.offer,
+        secure_messenger_lab::ConversationId::random(),
         peer.queue_id,
         Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
         NOW,
@@ -300,6 +302,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
             .commit_verified_contact(
                 peer2.offer.signing_identity,
                 peer2.offer,
+                secure_messenger_lab::ConversationId::random(),
                 peer2.queue_id,
                 Zeroizing::new(serde_json::to_vec(&peer2.send_keypair)?),
                 NOW,
@@ -407,6 +410,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
             .commit_verified_contact(
                 peer.offer.signing_identity,
                 peer.offer,
+                secure_messenger_lab::ConversationId::random(),
                 peer.queue_id,
                 Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
                 NOW,
@@ -519,6 +523,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
             .commit_verified_contact(
                 impostor.ed25519_key(),
                 peer.offer,
+                secure_messenger_lab::ConversationId::random(),
                 peer.queue_id,
                 Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW,
@@ -531,6 +536,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
             .commit_verified_contact(
                 peer.offer.signing_identity,
                 peer.offer,
+                secure_messenger_lab::ConversationId::random(),
                 peer.queue_id,
                 Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW + 300,
@@ -544,6 +550,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
             .commit_verified_contact(
                 wide.offer.signing_identity,
                 wide.offer,
+                secure_messenger_lab::ConversationId::random(),
                 wide.queue_id,
                 Zeroizing::new(serde_json::to_vec(&wide.send_keypair)?),
                 NOW,
@@ -560,6 +567,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
             .commit_verified_contact(
                 broken.signing_identity,
                 broken,
+                secure_messenger_lab::ConversationId::random(),
                 peer.queue_id,
                 Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW,
@@ -581,6 +589,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
     client2.commit_verified_contact(
         expiring.offer.signing_identity,
         expiring.offer,
+        secure_messenger_lab::ConversationId::random(),
         expiring.queue_id,
         Zeroizing::new(serde_json::to_vec(&expiring.send_keypair)?),
         NOW,
@@ -626,7 +635,7 @@ fn persistent_client_is_neither_sync_nor_clone() {
 
 // --- D2a: outbound send path ------------------------------------------------
 
-use secure_messenger_lab::{DurableAction, SendOutcome};
+use secure_messenger_lab::{DurableAction, LabError, SendOutcome};
 use vodozemac::olm::{OlmMessage, SessionConfig};
 
 fn send_signing_bytes(
@@ -930,5 +939,56 @@ fn send_reconcile_required_on_commit_failure() -> Result<(), Box<dyn Error>> {
     let pending = client.pending_send_actions()?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending.first().ok_or("no pending")?.token, action.token);
+    Ok(())
+}
+
+// --- D2b additions testable at the public API --------------------------------
+
+/// A fetch request signed by the façade verifies against the real relay
+/// (empty mailbox), and expiry sanity is enforced before signing.
+#[test]
+fn fetch_request_verifies_against_real_relay() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let mut relay = secure_messenger_lab::Relay::open_in_memory()?;
+    let mut client = create_client(&temp)?;
+    let registration = client.registration_action(NOW + 60)?;
+    relay.register(&registration.request, NOW)?;
+    client.record_registration_result(&registration, RegistrationOutcome::Confirmed)?;
+
+    let action = client.fetch_request(NOW + 60, NOW)?;
+    assert_eq!(action.request.nonce.as_bytes(), &action.token);
+    let envelopes = relay.fetch(&action.request, NOW)?;
+    assert!(envelopes.is_empty());
+
+    // Non-future validity rejects before any signing.
+    assert!(client.fetch_request(NOW, NOW).is_err());
+    Ok(())
+}
+
+/// Escape-inflation carry-over: a quote-heavy body within the body bound
+/// exceeds the payload bound after JSON escaping and must reject with
+/// `InvalidPayload` before any sequence assignment.
+#[test]
+fn escape_inflated_body_rejected_as_invalid_payload() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, mut peer) = send_ready_client(&temp)?;
+    let heavy = "\"".repeat(40_000);
+    assert!(matches!(
+        client.stage_send(&heavy, NOW, NOW + 3_600, NOW),
+        Err(LabError::InvalidPayload)
+    ));
+    // The rejection assigned nothing: the next send still gets sequence 1.
+    let action = client.stage_send("clean", NOW, NOW + 3_600, NOW)?;
+    let olm_message: OlmMessage = serde_json::from_slice(action.request.packet.as_bytes())?;
+    let OlmMessage::PreKey(pre_key) = olm_message else {
+        return Err("first staged packet must be a pre-key message".into());
+    };
+    let creation = peer.account.create_inbound_session(
+        SessionConfig::version_1(),
+        client.public_identity()?.curve25519,
+        &pre_key,
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&creation.plaintext)?;
+    assert_eq!(payload["send_seq"], 1);
     Ok(())
 }

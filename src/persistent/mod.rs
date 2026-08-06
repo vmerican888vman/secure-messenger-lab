@@ -105,6 +105,41 @@
 //!   authenticated committed snapshot read back through the same handle.
 //! - **`PendingPreKey.created_at` is 0.** `prekey_action` receives no
 //!   clock; the codec only requires `created_at < valid_until`.
+//!
+//! # D2b decisions (inbound path, receipts, ACKs)
+//!
+//! - **Fetch and ACK minting keep no durable record.** §2 defines result
+//!   recorders only for registration, send and ACK intents; a fetch
+//!   mutates no crypto state and `ack_actions` re-signs the durable
+//!   intent's exact request. Both are read-only operations that require
+//!   `Ready` and never commit. Their tokens (the fetch nonce / the
+//!   message ID) are purely correlational.
+//! - **Receipt staging is per-consume and best-effort-coalesced.**
+//!   `consume_inbound` stages one receipt send (a control advance on the
+//!   shared send counter, payload kind `Receipt`, riding the unchanged
+//!   D2a send machinery) when the contiguous received high water is
+//!   nonzero and the mode allows control traffic. In `ReceiptLocked` and
+//!   `RekeyRequired` all encryption is blocked per §4, so staging is
+//!   silently skipped. Receipts are idempotent at the peer; finer
+//!   coalescing needs a durable last-staged-HCR field the frozen codec
+//!   lacks (noted for D2c).
+//! - **Gap failure commits.** A previously unseen, peer-authenticated
+//!   packet on the current session whose decrypt fails with
+//!   `TooBigMessageGap`/`MissingMessageKey` commits `RekeyRequired` and
+//!   only then reports `LabError::Crypto` — the mode change IS the
+//!   durable outcome (§4). "Current-epoch" is structural: the façade
+//!   keeps exactly one session, so every accepted candidate packet is
+//!   current-epoch by construction.
+//! - **Terminal-record pruning** runs in the send-path mutators that take
+//!   a clock (`stage_send`, `consume_inbound`): terminal records
+//!   (`Stored`/`Duplicate`/`Expired`) are removed once
+//!   `expires_at + tombstone TTL` has passed. `record_send_result` has no
+//!   clock and never prunes.
+//! - **Conversation binding is adopted at contact commit.** The
+//!   out-of-band offer carries no conversation ID, so
+//!   `commit_verified_contact` takes it as a parameter (single-assignment:
+//!   a peer binding exists at most once). Without this, two façade
+//!   clients could never share a conversation binding.
 
 use std::marker::PhantomData;
 
@@ -112,18 +147,19 @@ use std::marker::PhantomData;
 mod tests;
 
 use serde::Deserialize;
-use vodozemac::olm::{Account, Session, SessionConfig};
+use vodozemac::olm::{Account, DecryptionError, OlmMessage, Session, SessionConfig};
 use vodozemac::{Curve25519PublicKey, Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
 use zeroize::Zeroizing;
 
-use crate::capability::{SendRequest, canonical, digest};
+use crate::capability::{AckRequest, FetchRequest, SendRequest, canonical, digest};
 use crate::ids::{ConversationId, MessageId, Nonce, QueueId};
 use crate::payload;
 use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
 use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
-    ActiveSession, ClientStateV1, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, PeerBinding, PeerBundle,
-    PendingPreKey, RegistrationRecord, Role, SendRecord, SendState, SessionMode,
+    AckIntent, AckState, ActiveSession, ClientStateV1, DedupRecord, DedupState, HighWaterReceipt,
+    InboundRecord, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, PeerBinding,
+    PeerBundle, PendingPreKey, RegistrationRecord, Role, SendRecord, SendState, SessionMode,
 };
 use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
@@ -134,9 +170,16 @@ const CONTACT_OFFER_MAX_VALIDITY_SECONDS: u64 = 5 * 60;
 
 const PREKEY_ACTION: &[u8] = b"peer-prekey";
 const SEND_ACTION: &[u8] = b"send";
+const FETCH_ACTION: &[u8] = b"fetch";
+const ACK_ACTION: &[u8] = b"ack";
+const RECEIPT_ACTION: &[u8] = b"session-high-water/v1";
+const RECEIPT_VERSION: u8 = 1;
 
 /// The relay's per-message TTL bound (private in `relay.rs`; mirrored).
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// The relay's tombstone TTL (private in `relay.rs`; mirrored) — terminal
+/// send records are pruned this long after their expiry.
+const TOMBSTONE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Section 4 budget: 24 application advances, then `ControlOnly`.
 const CONTROL_ONLY_THRESHOLD: u64 = 24;
 /// Section 4 absolute maximum outstanding; `ReceiptLocked` at 32.
@@ -217,6 +260,43 @@ pub enum SendOutcome {
     Stored,
     Duplicate,
     DeliveryUnknown,
+}
+
+/// The outcome of `accept_envelope`: a minimal owned view — the decrypted
+/// body reaches callers only through `pending_inbound` after the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptOutcome {
+    /// An application payload was accepted; the message ID indexes
+    /// `pending_inbound`.
+    Application(MessageId),
+    /// A peer receipt advanced our peer-contiguous high water.
+    ReceiptApplied,
+    /// A peer receipt equal to the current high water; accepted as a
+    /// no-op (deduped so its replay is rejected).
+    ReceiptIdempotent,
+}
+
+/// Owned view of an unconsumed inbound record. The frozen `InboundRecord`
+/// layout has no `sent_at`, so the view carries the persisted times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundView {
+    pub message_id: MessageId,
+    pub body: String,
+    pub sender_sequence: u64,
+    pub accepted_at: u64,
+    pub expires_at: u64,
+}
+
+/// The relay's answer to a durable ACK action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcomeView {
+    /// Relay confirmed the deletion.
+    Deleted,
+    /// The message was already gone; terminal handling is identical.
+    AlreadyGone,
+    /// Transport failure: the intent stays `Pending` (retryable); no
+    /// mutation and no commit happen for this outcome.
+    Failed,
 }
 
 /// Owned view of a `DeliveryUnknown` send record (digest+expiry arm).
@@ -534,6 +614,12 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// typed keypair is constructed only inside the façade and never
     /// exported (see the module docs).
     ///
+    /// `conversation_id` (D2b amendment): the contact exchange is
+    /// out-of-band and the offer carries no conversation ID, so the
+    /// verified-contact commit is where the shared conversation binding
+    /// is adopted. It can be committed at most once (a peer binding
+    /// exists at most once), so the adoption is single-assignment.
+    ///
     /// All validation runs inside the mutator, after the Ready gate.
     ///
     /// # Errors
@@ -545,6 +631,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         &mut self,
         pinned_signing_identity: Ed25519PublicKey,
         offer: RedactedContactOffer,
+        conversation_id: ConversationId,
         peer_queue_id: QueueId,
         peer_send_keypair: Zeroizing<Vec<u8>>,
         now: u64,
@@ -575,6 +662,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     .verify(&prekey_signing_bytes(&bundle), &offer.signature)
                     .map_err(|_| LabError::PeerVerificationFailed)?;
                 let send_public_key = parse_capability_keypair(&peer_send_keypair)?.public_key();
+                candidate.state.conversation_id = conversation_id;
                 candidate.state.peer_binding = Some(PeerBinding {
                     bundle,
                     queue_id: peer_queue_id,
@@ -751,6 +839,320 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     valid_until,
                 );
                 candidate.state.registration = successor;
+                Ok(())
+            },
+        )
+    }
+
+    /// Sign a fetch request for our mailbox with the receive-capability
+    /// keypair. §2 defines no result recorder for fetches and a fetch
+    /// mutates no crypto state, so this D1-pattern action keeps NO durable
+    /// record (documented reading of §2): the token is the fresh random
+    /// fetch nonce and is purely correlational for the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::InvalidExpiry`] for a non-future expiry, or a
+    /// coarse storage error while the façade is not `Ready`.
+    pub fn fetch_request(&self, valid_until: u64, now: u64) -> Result<DurableAction<FetchRequest>> {
+        self.ensure_ready()?;
+        if valid_until <= now {
+            return Err(LabError::InvalidExpiry);
+        }
+        let nonce = Nonce::random();
+        let queue_id = self.state.mailbox_queue_id;
+        let signing_bytes = canonical(
+            FETCH_ACTION,
+            &[
+                queue_id.as_bytes(),
+                nonce.as_bytes(),
+                &valid_until.to_be_bytes(),
+            ],
+        );
+        let signature = self.keypairs.receive.sign(&signing_bytes);
+        Ok(DurableAction {
+            token: *nonce.as_bytes(),
+            request: FetchRequest {
+                queue_id,
+                nonce,
+                valid_until,
+                signature,
+            },
+        })
+    }
+
+    /// Accept a fetched envelope: authenticate, establish or advance the
+    /// ratchet, strictly decode the payload, track the sender sequence,
+    /// and durably record the outcome. The lettered steps of the D2b
+    /// specification map onto the mutator discipline as: (a) bounds, (b)
+    /// dedup and (c) envelope signature verification in the step-2 bounds
+    /// closure (rejection there touches nothing); (d) ratchet, (e) strict
+    /// payload decode, (f) sequence tracking, (h) record writes inside
+    /// step 4; (g) the gap-failure durable `RekeyRequired` commit is the
+    /// one path where the commit succeeds and the error is reported
+    /// afterwards (the mode change IS the durable outcome, per §4); (i)
+    /// mode recompute runs before every commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns coarse errors for envelope authentication failure
+    /// ([`LabError::Unauthorized`]), duplicates
+    /// ([`LabError::DuplicateMessage`]), decoding and crypto failures, or
+    /// storage failures. A gap failure returns [`LabError::Crypto`] AFTER
+    /// the `RekeyRequired` mode change has committed.
+    // The packet arrives by value per the frozen family signature; only
+    // its digest is persisted (the inbound record holds digest+expiry).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn accept_envelope(
+        &mut self,
+        queue_id: QueueId,
+        message_id: MessageId,
+        packet: EncryptedPacket,
+        expires_at: u64,
+        sender_signature: Ed25519Signature,
+        now: u64,
+    ) -> Result<AcceptOutcome> {
+        let packet_digest = packet.digest();
+        let artifact = self.mutate(
+            |current| {
+                // (a) bounds.
+                if expires_at <= now {
+                    return Err(LabError::RequestExpired);
+                }
+                if packet.as_bytes().len() > MAX_PACKET {
+                    return Err(LabError::InvalidPayload);
+                }
+                if queue_id != current.state.mailbox_queue_id {
+                    return Err(LabError::Unauthorized);
+                }
+                // (c) the outer envelope signature against OUR mailbox's
+                // send public key (the capability we issued the peer).
+                current
+                    .state
+                    .registration
+                    .send_key
+                    .verify(
+                        &send_signing_bytes(queue_id, message_id, &packet_digest, expires_at),
+                        &sender_signature,
+                    )
+                    .map_err(|_| LabError::Unauthorized)?;
+                // (b) dedup first: a matching message ID, or a matching
+                // packet digest within the current epoch, rejects without
+                // any ratchet touch.
+                for record in &current.state.dedup {
+                    if record.message_id == message_id {
+                        return Err(LabError::DuplicateMessage);
+                    }
+                    if let Some(active) = &current.state.active_session {
+                        if record.epoch_id == active.epoch_id
+                            && record.packet_digest == packet_digest
+                        {
+                            return Err(LabError::DuplicateMessage);
+                        }
+                    }
+                }
+                // Session or pre-key establishment must be possible.
+                if current.state.active_session.is_none()
+                    && (current.state.peer_binding.is_none()
+                        || current.state.pending_prekey.is_none())
+                {
+                    return Err(LabError::MissingSession);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| {
+                accept_envelope_operation(
+                    candidate,
+                    queue_id,
+                    message_id,
+                    &packet,
+                    packet_digest,
+                    expires_at,
+                    now,
+                )
+            },
+        )?;
+        match artifact {
+            AcceptArtifact::Outcome(outcome) => Ok(outcome),
+            AcceptArtifact::GapFailure => Err(LabError::Crypto),
+        }
+    }
+
+    /// Owned views of every unconsumed inbound record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`.
+    pub fn pending_inbound(&self) -> Result<Vec<InboundView>> {
+        self.ensure_ready()?;
+        Ok(self
+            .state
+            .inbound
+            .iter()
+            .map(|record| InboundView {
+                message_id: record.message_id,
+                body: record.body.clone(),
+                sender_sequence: record.sender_sequence,
+                accepted_at: record.accepted_at,
+                expires_at: record.expires_at,
+            })
+            .collect())
+    }
+
+    /// The displayed transition: remove the inbound record (freeing the
+    /// 32-slot bound) and create a `Pending` ACK intent. Also stages the
+    /// coalesced receipt (D2b decision): when the contiguous received high
+    /// water is nonzero and the mode allows control traffic
+    /// (`Ready`/`ControlOnly`; in `ReceiptLocked`/`RekeyRequired` all
+    /// encryption is blocked and the receipt is silently skipped, per
+    /// §4), one receipt send is staged per consume, reporting the current
+    /// HCR. Receipts are idempotent at the peer, so per-consume staging
+    /// is safe; finer coalescing would need a durable last-staged-HCR
+    /// field the frozen codec lacks (noted for D2c). The receipt rides
+    /// the unchanged D2a send machinery as a `Pending` send record whose
+    /// payload is a `Receipt` kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown or already
+    /// consumed ID, [`LabError::InvalidExpiry`] for a non-future ACK
+    /// expiry, or a coarse error for crypto/commit failures.
+    pub fn consume_inbound(
+        &mut self,
+        message_id: MessageId,
+        valid_until: u64,
+        now: u64,
+    ) -> Result<()> {
+        self.mutate(
+            |current| {
+                if !current
+                    .state
+                    .inbound
+                    .iter()
+                    .any(|record| record.message_id == message_id)
+                {
+                    return Err(LabError::MessageNotFound);
+                }
+                if valid_until <= now {
+                    return Err(LabError::InvalidExpiry);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| {
+                consume_inbound_operation(candidate, message_id, valid_until, now)
+            },
+        )
+    }
+
+    /// The exact ACK requests for every `Pending` ACK intent, signed with
+    /// the receive-capability keypair (mirroring `authorize_ack`).
+    /// Read-only signing: no mutation, no commit. Intents at or past their
+    /// validity are skipped (the relay would reject them); they are swept
+    /// by the expiry machinery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`.
+    pub fn ack_actions(&self, now: u64) -> Result<Vec<DurableAction<AckRequest>>> {
+        self.ensure_ready()?;
+        let mut actions = Vec::new();
+        for record in &self.state.acks {
+            if record.state != AckState::Pending || record.valid_until <= now {
+                continue;
+            }
+            let signing_bytes = canonical(
+                ACK_ACTION,
+                &[
+                    record.queue_id.as_bytes(),
+                    record.message_id.as_bytes(),
+                    &record.packet_digest,
+                    &record.valid_until.to_be_bytes(),
+                ],
+            );
+            let signature = self.keypairs.receive.sign(&signing_bytes);
+            actions.push(DurableAction {
+                token: *record.message_id.as_bytes(),
+                request: AckRequest {
+                    queue_id: record.queue_id,
+                    message_id: record.message_id,
+                    packet_hash: record.packet_digest,
+                    valid_until: record.valid_until,
+                    signature,
+                },
+            });
+        }
+        Ok(actions)
+    }
+
+    /// Record the relay's answer to a durable ACK action: token (message
+    /// ID) lookup plus the digest check against the durable intent's
+    /// canonical bytes run before staging, and the intent must still be
+    /// `Pending`. `Deleted` and `AlreadyGone` share the terminal handling:
+    /// the intent is removed and the matching dedup record becomes
+    /// `Acked`. `Failed` leaves the intent untouched — no mutation, no
+    /// commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown token,
+    /// [`LabError::MessageGone`] when the intent is no longer `Pending`,
+    /// [`LabError::Unauthorized`] on a request mismatch, or a coarse
+    /// storage error when the commit fails.
+    pub fn record_ack_result(
+        &mut self,
+        action: &DurableAction<AckRequest>,
+        outcome: AckOutcomeView,
+    ) -> Result<()> {
+        if matches!(outcome, AckOutcomeView::Failed) {
+            self.ensure_ready()?;
+            return Ok(());
+        }
+        self.mutate(
+            |current| {
+                let index = current
+                    .state
+                    .acks
+                    .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
+                    .map_err(|_| LabError::MessageNotFound)?;
+                let record = &current.state.acks[index];
+                if record.state != AckState::Pending {
+                    return Err(LabError::MessageGone);
+                }
+                let presented = AckIntent {
+                    message_id: record.message_id,
+                    epoch_id: record.epoch_id,
+                    sequence: record.sequence,
+                    queue_id: action.request.queue_id,
+                    packet_digest: action.request.packet_hash,
+                    valid_until: action.request.valid_until,
+                    state: AckState::Pending,
+                };
+                if digest(&presented.encode()?) != digest(&record.encode()?) {
+                    return Err(LabError::Unauthorized);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| {
+                let index = candidate
+                    .state
+                    .acks
+                    .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
+                    .map_err(|_| LabError::MessageNotFound)?;
+                let record = candidate.state.acks.remove(index);
+                let dedup_index = candidate
+                    .state
+                    .dedup
+                    .binary_search_by(|probe| {
+                        probe
+                            .message_id
+                            .as_bytes()
+                            .cmp(record.message_id.as_bytes())
+                    })
+                    .map_err(|_| LabError::Storage)?;
+                candidate.state.dedup[dedup_index].state = DedupState::Acked;
+                if let Some(active) = candidate.state.active_session.as_mut() {
+                    recompute_mode(active);
+                }
                 Ok(())
             },
         )
@@ -1175,6 +1577,7 @@ fn stage_send_operation(
     now: u64,
 ) -> Result<DurableAction<SendRequest>> {
     sweep_expired_sends(candidate, now)?;
+    prune_terminal_sends(candidate, now);
     let (epoch_id, send_seq, conversation_id) = {
         let active = candidate
             .state
@@ -1256,4 +1659,480 @@ fn stage_send_operation(
         token: *message_id.as_bytes(),
         request,
     })
+}
+
+/// Internal artifact of `accept_envelope`: either an accepted outcome or
+/// the §4 gap failure (which commits the `RekeyRequired` mode change and
+/// reports the failure afterwards).
+enum AcceptArtifact {
+    Outcome(AcceptOutcome),
+    GapFailure,
+}
+
+/// Canonical length-prefixed receipt signing bytes; the SAME part order
+/// the codec's `validate.rs` verifies (version, conversation, epoch,
+/// acknowledged sender curve, issuer curve, high water) over the
+/// `session-high-water/v1` domain.
+fn receipt_signing_bytes(receipt: &HighWaterReceipt) -> Vec<u8> {
+    canonical(
+        RECEIPT_ACTION,
+        &[
+            &[RECEIPT_VERSION],
+            receipt.conversation_id.as_bytes(),
+            &receipt.epoch_id,
+            receipt.acknowledged_sender_curve.as_bytes(),
+            receipt.issuer_curve.as_bytes(),
+            &receipt.high_water.to_be_bytes(),
+        ],
+    )
+}
+
+/// Step 4 of `accept_envelope`: ratchet, payload, sequence, records.
+/// The ratchet step's product: the decrypted plaintext, or the §4 gap
+/// failure (whose mode change is the durable outcome).
+enum RatchetStep {
+    Plaintext(Vec<u8>),
+    GapFailure,
+}
+
+/// Step (d) of accept: decode the Olm message and establish or advance
+/// the ratchet on the candidate.
+fn ratchet_step(candidate: &mut Candidate, olm_message: &OlmMessage) -> Result<RatchetStep> {
+    if candidate.state.active_session.is_none() {
+        let OlmMessage::PreKey(pre_key) = olm_message else {
+            return Err(LabError::ExpectedPreKey);
+        };
+        let binding = candidate
+            .state
+            .peer_binding
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        let pending = candidate
+            .state
+            .pending_prekey
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        let creation = candidate
+            .account
+            .create_inbound_session(
+                SessionConfig::version_1(),
+                binding.bundle.curve_identity,
+                pre_key,
+            )
+            .map_err(|_| LabError::Crypto)?;
+        let session = creation.session;
+        let plaintext = creation.plaintext;
+        let keys = session.session_keys();
+        // The transcript is OUR consumed prekey bundle; its advertised
+        // one-time key must be the one the session consumed.
+        if keys.one_time_key != pending.one_time_key {
+            return Err(LabError::Crypto);
+        }
+        let transcript = pending.bundle();
+        // The one-time key is consumed; the pending-prekey record must go.
+        candidate.state.pending_prekey = None;
+        candidate.state.active_session = Some(ActiveSession {
+            role: Role::Inbound,
+            session_pickle: Zeroizing::new(
+                serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?,
+            ),
+            identity_key: keys.identity_key,
+            base_key: keys.base_key,
+            one_time_key: keys.one_time_key,
+            transcript,
+            epoch_id: epoch_of(keys),
+            last_assigned_send_seq: 0,
+            peer_contiguous_high_water: 0,
+            highest_contiguous_received_seq: 0,
+            mode: SessionMode::Ready,
+            receipt: None,
+            received_above_high_water: Vec::new(),
+            conversation_id: candidate.state.conversation_id,
+        });
+        candidate.session = Some(session);
+        return Ok(RatchetStep::Plaintext(plaintext));
+    }
+    // On an established session, vodozemac decrypts both message
+    // variants (the initiator keeps sending PreKey messages until it
+    // receives a reply), mirroring `OlmClient::open`.
+    let session = candidate.session.as_mut().ok_or(LabError::MissingSession)?;
+    match session.decrypt(olm_message) {
+        Ok(bytes) => Ok(RatchetStep::Plaintext(bytes)),
+        Err(DecryptionError::MissingMessageKey(_) | DecryptionError::TooBigMessageGap(..)) => {
+            // (g) §4: a previously unseen, peer-authenticated packet on
+            // the current session failing with a gap error moves the
+            // session durably to RekeyRequired. The candidate commits;
+            // the caller reports the failure after commit.
+            let active = candidate
+                .state
+                .active_session
+                .as_mut()
+                .ok_or(LabError::MissingSession)?;
+            active.mode = SessionMode::RekeyRequired;
+            Ok(RatchetStep::GapFailure)
+        }
+        Err(_) => Err(LabError::Crypto),
+    }
+}
+
+/// Envelope fields carried through the accept record writes.
+struct EnvelopeContext {
+    message_id: MessageId,
+    epoch_id: [u8; 32],
+    send_seq: u64,
+    queue_id: QueueId,
+    packet_digest: [u8; 32],
+    expires_at: u64,
+}
+
+/// The receipt arm of accept: verify, apply §4 acceptance, record dedup.
+fn apply_receipt(
+    candidate: &mut Candidate,
+    receipt_v2: &payload::ReceiptV2,
+    context: &EnvelopeContext,
+) -> Result<AcceptOutcome> {
+    let receipt = receipt_v2.to_stored()?;
+    let binding = candidate
+        .state
+        .peer_binding
+        .as_ref()
+        .ok_or(LabError::MissingSession)?;
+    if receipt.conversation_id != candidate.state.conversation_id
+        || receipt.epoch_id != context.epoch_id
+        || receipt.issuer_curve != binding.bundle.curve_identity
+        || receipt.acknowledged_sender_curve != candidate.account.curve25519_key()
+    {
+        return Err(LabError::PeerVerificationFailed);
+    }
+    binding
+        .bundle
+        .signing_identity
+        .verify(&receipt_signing_bytes(&receipt), &receipt.signature)
+        .map_err(|_| LabError::PeerVerificationFailed)?;
+    // The dedup record is written for both receipt outcomes.
+    push_dedup(candidate, context);
+    let active = candidate
+        .state
+        .active_session
+        .as_mut()
+        .ok_or(LabError::MissingSession)?;
+    let old_high_water = active.peer_contiguous_high_water;
+    if receipt.high_water < old_high_water || receipt.high_water > active.last_assigned_send_seq {
+        // Regression and future values reject (§4).
+        return Err(LabError::InvalidPayload);
+    }
+    if receipt.high_water == old_high_water {
+        Ok(AcceptOutcome::ReceiptIdempotent)
+    } else {
+        active.peer_contiguous_high_water = receipt.high_water;
+        active.receipt = Some(receipt);
+        Ok(AcceptOutcome::ReceiptApplied)
+    }
+}
+
+/// Step 4 of `accept_envelope`: ratchet, payload, sequence, records.
+fn accept_envelope_operation(
+    candidate: &mut Candidate,
+    queue_id: QueueId,
+    message_id: MessageId,
+    packet: &EncryptedPacket,
+    packet_digest: [u8; 32],
+    expires_at: u64,
+    now: u64,
+) -> Result<AcceptArtifact> {
+    // (d) Decode the Olm message and establish or advance the ratchet.
+    let olm_message: OlmMessage =
+        serde_json::from_slice(packet.as_bytes()).map_err(|_| LabError::Encoding)?;
+    let plaintext = match ratchet_step(candidate, &olm_message)? {
+        RatchetStep::Plaintext(plaintext) => plaintext,
+        RatchetStep::GapFailure => return Ok(AcceptArtifact::GapFailure),
+    };
+
+    // (e) Strict payload decode with conversation/epoch/message binding.
+    let epoch_id = candidate
+        .state
+        .active_session
+        .as_ref()
+        .ok_or(LabError::MissingSession)?
+        .epoch_id;
+    let parsed = payload::decode_for(
+        &plaintext,
+        candidate.state.conversation_id,
+        epoch_id,
+        message_id,
+    )?;
+
+    // (f) Sender-sequence tracking against the contiguous high water and
+    // the bounded out-of-order set.
+    let send_seq = parsed.send_seq;
+    if send_seq == 0 {
+        return Err(LabError::InvalidPayload);
+    }
+    track_sender_sequence(
+        candidate
+            .state
+            .active_session
+            .as_mut()
+            .ok_or(LabError::MissingSession)?,
+        send_seq,
+    )?;
+
+    // (h) Record writes per payload kind.
+    let context = EnvelopeContext {
+        message_id,
+        epoch_id,
+        send_seq,
+        queue_id,
+        packet_digest,
+        expires_at,
+    };
+    let outcome = match parsed.kind {
+        payload::KIND_APPLICATION => {
+            let body = parsed.body.ok_or(LabError::InvalidPayload)?;
+            candidate.state.inbound.push(InboundRecord {
+                message_id,
+                epoch_id,
+                sender_sequence: send_seq,
+                queue_id,
+                packet_digest,
+                expires_at,
+                accepted_at: now,
+                body,
+            });
+            candidate
+                .state
+                .inbound
+                .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+            push_dedup(candidate, &context);
+            AcceptOutcome::Application(message_id)
+        }
+        payload::KIND_RECEIPT => apply_receipt(
+            candidate,
+            &parsed.receipt.ok_or(LabError::InvalidPayload)?,
+            &context,
+        )?,
+        _ => return Err(LabError::InvalidPayload),
+    };
+
+    // (i) Mode recompute before the commit (RekeyRequired dominates).
+    let active = candidate
+        .state
+        .active_session
+        .as_mut()
+        .ok_or(LabError::MissingSession)?;
+    recompute_mode(active);
+    Ok(AcceptArtifact::Outcome(outcome))
+}
+
+/// Step (f) of accept: advance the contiguous high water, draining the
+/// out-of-order set, or record a gap element; duplicates reject.
+fn track_sender_sequence(active: &mut ActiveSession, send_seq: u64) -> Result<()> {
+    if send_seq <= active.highest_contiguous_received_seq
+        || active.received_above_high_water.contains(&send_seq)
+    {
+        return Err(LabError::DuplicateMessage);
+    }
+    if send_seq == active.highest_contiguous_received_seq + 1 {
+        active.highest_contiguous_received_seq = send_seq;
+        while let Some(position) = active
+            .received_above_high_water
+            .iter()
+            .position(|seq| *seq == active.highest_contiguous_received_seq + 1)
+        {
+            active.received_above_high_water.remove(position);
+            active.highest_contiguous_received_seq += 1;
+        }
+    } else {
+        if active.received_above_high_water.len() >= MAX_RECEIVED_SET {
+            return Err(LabError::Storage);
+        }
+        active.received_above_high_water.push(send_seq);
+        active.received_above_high_water.sort_unstable();
+    }
+    Ok(())
+}
+
+/// Insert a dedup record (`Accepted`), keeping the array sorted.
+fn push_dedup(candidate: &mut Candidate, context: &EnvelopeContext) {
+    candidate.state.dedup.push(DedupRecord {
+        message_id: context.message_id,
+        epoch_id: context.epoch_id,
+        sequence: context.send_seq,
+        queue_id: context.queue_id,
+        packet_digest: context.packet_digest,
+        expires_at: context.expires_at,
+        state: DedupState::Accepted,
+    });
+    candidate
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+}
+
+/// Step 4 of `consume_inbound`: remove the inbound record, create the
+/// ACK intent, and stage the coalesced receipt when the mode allows.
+fn consume_inbound_operation(
+    candidate: &mut Candidate,
+    message_id: MessageId,
+    valid_until: u64,
+    now: u64,
+) -> Result<()> {
+    sweep_expired_sends(candidate, now)?;
+    prune_terminal_sends(candidate, now);
+    let index = candidate
+        .state
+        .inbound
+        .iter()
+        .position(|record| record.message_id == message_id)
+        .ok_or(LabError::MessageNotFound)?;
+    let record = candidate.state.inbound.remove(index);
+    candidate.state.acks.push(AckIntent {
+        message_id,
+        epoch_id: record.epoch_id,
+        sequence: record.sender_sequence,
+        queue_id: record.queue_id,
+        packet_digest: record.packet_digest,
+        valid_until,
+        state: AckState::Pending,
+    });
+    candidate
+        .state
+        .acks
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+
+    // Coalesced receipt staging (see the method's docs for the decision).
+    let (high_water, mode) = {
+        let active = candidate
+            .state
+            .active_session
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        (active.highest_contiguous_received_seq, active.mode)
+    };
+    if high_water > 0 && matches!(mode, SessionMode::Ready | SessionMode::ControlOnly) {
+        stage_receipt(candidate, high_water, valid_until, now)?;
+    }
+    let active = candidate
+        .state
+        .active_session
+        .as_mut()
+        .ok_or(LabError::MissingSession)?;
+    recompute_mode(active);
+    Ok(())
+}
+
+/// Stage one receipt send (a control advance on the shared send
+/// counter): a `HighWaterReceipt` signed with our account Ed25519
+/// identity, encrypted as a `Receipt` payload, signed for the peer's
+/// mailbox like any other send.
+fn stage_receipt(
+    candidate: &mut Candidate,
+    high_water: u64,
+    valid_until: u64,
+    now: u64,
+) -> Result<()> {
+    let (epoch_id, send_seq, peer_curve, conversation_id) = {
+        let active = candidate
+            .state
+            .active_session
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        let peer_curve = match active.role {
+            // The acknowledged sender is the peer: the session initiator's
+            // identity for an inbound session, the transcript's identity
+            // for an outbound one.
+            Role::Inbound => active.identity_key,
+            Role::Outbound => active.transcript.curve_identity,
+        };
+        (
+            active.epoch_id,
+            active
+                .last_assigned_send_seq
+                .checked_add(1)
+                .ok_or(LabError::Storage)?,
+            peer_curve,
+            candidate.state.conversation_id,
+        )
+    };
+    let mut receipt = HighWaterReceipt {
+        conversation_id,
+        epoch_id,
+        acknowledged_sender_curve: peer_curve,
+        issuer_curve: candidate.account.curve25519_key(),
+        high_water,
+        signature: candidate.account.sign(b""),
+    };
+    receipt.signature = candidate.account.sign(receipt_signing_bytes(&receipt));
+    let outgoing = payload::ClientPayloadV2 {
+        version: payload::PAYLOAD_VERSION,
+        conversation_id,
+        message_id: MessageId::random(),
+        epoch_id,
+        send_seq,
+        sent_at: now,
+        kind: payload::KIND_RECEIPT,
+        body: None,
+        receipt: Some(payload::ReceiptV2::from(&receipt)),
+    };
+    let message_id = outgoing.message_id;
+    let encoded = payload::encode(&outgoing)?;
+    let session = candidate.session.as_mut().ok_or(LabError::MissingSession)?;
+    let message = session
+        .encrypt(&encoded[..])
+        .map_err(|_| LabError::Crypto)?;
+    let packet = EncryptedPacket::from_untrusted(
+        serde_json::to_vec(&message).map_err(|_| LabError::Encoding)?,
+    );
+    if packet.as_bytes().len() > MAX_PACKET {
+        return Err(LabError::Encoding);
+    }
+    let binding = candidate
+        .state
+        .peer_binding
+        .as_ref()
+        .ok_or(LabError::MissingSession)?;
+    let keypair = parse_capability_keypair(&binding.send_keypair_json)?;
+    let queue_id = binding.queue_id;
+    let signature = keypair.sign(&send_signing_bytes(
+        queue_id,
+        message_id,
+        &packet.digest(),
+        valid_until,
+    ));
+    candidate.state.sends.push(SendRecord {
+        message_id,
+        state: SendState::Pending,
+        epoch_id,
+        sequence: send_seq,
+        queue_id: Some(queue_id),
+        packet: Some(packet),
+        expires_at: valid_until,
+        send_signature: Some(signature),
+        packet_digest: None,
+    });
+    candidate
+        .state
+        .sends
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let active = candidate
+        .state
+        .active_session
+        .as_mut()
+        .ok_or(LabError::MissingSession)?;
+    active.last_assigned_send_seq = send_seq;
+    Ok(())
+}
+
+/// D2a carry-over: prune terminal send records (`Stored`/`Duplicate`/
+/// `Expired`) whose tombstone window (`expires_at` + the relay's
+/// tombstone TTL, mirrored) has passed. `Pending`/`DeliveryUnknown` are
+/// never pruned this way. Pruning frees bounded slots only; it never
+/// touches the high-water or budget invariants.
+fn prune_terminal_sends(candidate: &mut Candidate, now: u64) {
+    candidate.state.sends.retain(|record| {
+        !(matches!(
+            record.state,
+            SendState::Stored | SendState::Duplicate | SendState::Expired
+        ) && record.expires_at.saturating_add(TOMBSTONE_TTL_SECONDS) <= now)
+    });
 }
