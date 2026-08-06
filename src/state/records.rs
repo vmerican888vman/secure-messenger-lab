@@ -380,6 +380,16 @@ impl HighWaterReceipt {
 /// original fields 1-17 to keep their numbering stable; the object now
 /// declares 18 fields. Validation requires it to equal top-level field 8
 /// for both roles, and a present receipt must still also match it.
+///
+/// **Wire-layout amendment (review D2b v3):** field 19,
+/// `last_staged_receipt_high_water: u64`, was added so a skipped
+/// best-effort receipt is never lost silently: a receipt is owed while
+/// `highest_contiguous_received_seq > last_staged_receipt_high_water`,
+/// and the façade stages it as soon as capacity and mode allow. 0 means
+/// no receipt has been staged. Validation requires
+/// `last_staged_receipt_high_water <= highest_contiguous_received_seq` —
+/// no receipt can have been staged for a high water never reached. The
+/// object now declares 19 fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -399,6 +409,10 @@ pub(crate) struct ActiveSession {
     pub(crate) received_above_high_water: Vec<u64>,
     /// Conversation binding; must equal top-level field 8 (field 18).
     pub(crate) conversation_id: ConversationId,
+    /// Highest received contiguous high water a staged receipt has
+    /// reported; 0 = none staged (field 19). Never exceeds
+    /// `highest_contiguous_received_seq`.
+    pub(crate) last_staged_receipt_high_water: u64,
 }
 
 impl ActiveSession {
@@ -429,6 +443,7 @@ impl ActiveSession {
         let receipt = HighWaterReceipt::parse(object.field(16)?)?;
         let received = parse_u64_set(object.field(17)?, MAX_RECEIVED_SET)?;
         let conversation_id = conversation_id(object.field(18)?)?;
+        let last_staged_receipt_high_water = u64_value(object.field(19)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -445,6 +460,7 @@ impl ActiveSession {
             receipt,
             received_above_high_water: received,
             conversation_id,
+            last_staged_receipt_high_water,
         })
     }
 
@@ -464,6 +480,7 @@ impl ActiveSession {
             .as_ref()
             .map_or(Vec::new(), HighWaterReceipt::encode);
         let received_bytes = encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?;
+        let last_staged_receipt_high_water = self.last_staged_receipt_high_water.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -485,6 +502,7 @@ impl ActiveSession {
                 (16, &receipt_bytes),
                 (17, &received_bytes),
                 (18, self.conversation_id.as_bytes()),
+                (19, &last_staged_receipt_high_water),
             ],
         )?;
         Ok(Zeroizing::new(object))

@@ -623,6 +623,11 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
             return Err(LabError::Storage);
         }
     }
+    // Review D2b v3 (field 19): no receipt can have been staged for a
+    // high water never reached.
+    if active.last_staged_receipt_high_water > active.highest_contiguous_received_seq {
+        return Err(LabError::Storage);
+    }
     Ok(())
 }
 

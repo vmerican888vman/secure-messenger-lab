@@ -25,6 +25,13 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
+**Late amendment (façade D2b v4):** ActiveSession gained field 19
+`last_staged_receipt_high_water: u64` (ascending order preserved, field
+count 19; validation: never exceeds `highest_contiguous_received_seq`, 0 =
+none staged). This is the durable owed-receipt marker from the D2b v3
+remediation; see `reviews/PROMPT-independent-phase2-facade-d2b.md` for the
+motivation. Codec-side rules and tests are in this leg's scope.
+
 Version 6 (head `eb2020e8beb178b2e933ef4d62fb9f0b5d1637e1`) was RETURNED
 (verdict in `reviews/REVIEW-codec-v6.md`) with two blockers, both fixed in
 the head under review:

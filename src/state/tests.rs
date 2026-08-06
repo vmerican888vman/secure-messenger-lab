@@ -304,6 +304,7 @@ fn make_active_session(
         receipt: Some(receipt),
         received_above_high_water: vec![3],
         conversation_id,
+        last_staged_receipt_high_water: 1,
     })
 }
 
@@ -1049,6 +1050,8 @@ fn array_count_bounds_enforced() -> Result<(), Box<dyn Error>> {
             (15, vec![1_u8]),
             (16, Vec::new()),
             (17, received),
+            (18, vec![0; 16]),
+            (19, 0_u64.to_be_bytes().to_vec()),
         ],
     )?;
     let bytes = splice_top(&encoded, 14, field_block(15, &session)?)?;
@@ -1190,8 +1193,11 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
     // The last byte of each of these fields sits inside a signature, a
     // public key, an enum or the received set; flipping it must fail. The
     // ACK array ends in the ACK state byte (Pending = 1, flipping bit 0
-    // makes the invalid 0).
-    for index in [11_usize, 12, 13, 14, 17] {
+    // makes the invalid 0). For the session (index 14) the flip targets
+    // the high byte of field 19 (`last_staged_receipt_high_water`), eight
+    // bytes in from the end — the value becomes enormous and exceeds the
+    // received high water.
+    for index in [11_usize, 12, 13, 17] {
         let (_, end) = field_value_span(&encoded, index)?;
         let mut mutated = encoded.to_vec();
         *mutated.get_mut(end - 1).ok_or("value end")? ^= 0x01;
@@ -1200,6 +1206,13 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
             "last-byte flip in field {index} accepted"
         );
     }
+    let (_, end) = field_value_span(&encoded, 14)?;
+    let mut mutated = encoded.to_vec();
+    *mutated.get_mut(end - 8).ok_or("field 19 high byte")? ^= 0x01;
+    assert!(
+        ClientStateV1::decode(&mutated).is_err(),
+        "field-19 high-byte flip accepted"
+    );
     Ok(())
 }
 
@@ -2012,6 +2025,7 @@ fn receipt_only_session_validates() -> Result<(), Box<dyn Error>> {
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
     active.received_above_high_water.clear();
+    active.last_staged_receipt_high_water = 0;
     // peer_contiguous_high_water stays 1 with its genuine receipt.
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
@@ -2123,6 +2137,7 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     set_water(&mut fixture, 32, 0, SessionMode::ReceiptLocked)?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
+    active.last_staged_receipt_high_water = 0;
     active.received_above_high_water.clear();
 
     // Keep the two genuine Pending records (sequences 1-2), drop the
@@ -2834,5 +2849,53 @@ fn dedup_expiry_must_match_inbound_record() -> Result<(), Box<dyn Error>> {
         ClientStateV1::decode(&bytes).is_err(),
         "decode accepted expiry mismatch"
     );
+    Ok(())
+}
+
+// --- review D2b v3: field 19 ------------------------------------------------
+
+/// Field 19 (`last_staged_receipt_high_water`) may never exceed the
+/// contiguous received high water; equal and lower values are fine.
+#[test]
+fn last_staged_receipt_high_water_never_exceeds_received() -> Result<(), Box<dyn Error>> {
+    // The populated fixture stages with hcr = 1 and last_staged = 1.
+    for (last_staged, valid) in [(2_u64, false), (1, true), (0, true)] {
+        let mut fixture = populated_fixture()?;
+        fixture
+            .state
+            .active_session
+            .as_mut()
+            .ok_or("no session")?
+            .last_staged_receipt_high_water = last_staged;
+        assert_eq!(
+            fixture.state.encode().is_ok(),
+            valid,
+            "last_staged {last_staged}"
+        );
+    }
+
+    // Decode path: splice a session object whose field 19 exceeds the
+    // received high water into the genuine encoding.
+    let mut fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.last_staged_receipt_high_water = 99;
+    let session_bytes = active.encode()?;
+    let bytes = splice_top(&encoded, 14, field_block(15, &session_bytes)?)?;
+    assert!(ClientStateV1::decode(&bytes).is_err());
+    Ok(())
+}
+
+/// A populated state carrying the new field round-trips byte-identically
+/// (the fixture carries `last_staged` = hcr = 1).
+#[test]
+fn field_19_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
+    let fixture = populated_fixture()?;
+    let active = fixture.state.active_session.as_ref().ok_or("no session")?;
+    assert_eq!(active.last_staged_receipt_high_water, 1);
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    let reencoded = decoded.encode()?;
+    assert_eq!(&encoded[..], &reencoded[..]);
     Ok(())
 }

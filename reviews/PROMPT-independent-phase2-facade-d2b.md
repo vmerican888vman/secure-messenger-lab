@@ -1,5 +1,29 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v4)
+
+Version 3 (head `af78462718ddcd5bff5ccd8212fa08ed2fb499c6`): Fable PASS, Sol
+RETURN (verdict in `reviews/REVIEW-sol-facade-d2b-v3.md`) — best-effort
+receipt staging had no durable "receipt owed" marker, so a peer could wedge
+in ControlOnly indefinitely. The head under review fixes it:
+
+- Codec wire amendment: ActiveSession field 19
+  `last_staged_receipt_high_water: u64` (ascending order preserved; codec
+  validation requires it never exceeds `highest_contiguous_received_seq`).
+- A receipt is owed iff `highest_contiguous_received_seq >
+  last_staged_receipt_high_water`; every clock-taking mutator stages the
+  owed receipt once capacity and mode allow (coalesced; one per current
+  HCR). The marker updates on staging. Skipped receipts can no longer be
+  lost.
+- Sol's closure regression exists: consume every inbound while full →
+  prune → owed receipt stages → drives through the real relay → the peer's
+  high water advances and it stages again.
+- Behavior note for review: the owed rule also stages receipts eagerly at
+  accept time when capacity exists (accept_envelope is a staging point),
+  subsuming the old per-consume staging — strictly better coalescing.
+
+The v2/v3 histories follow unchanged.
+
 ## Remediation history (v3)
 
 Version 2 (head `eb2020e8beb178b2e933ef4d62fb9f0b5d1637e1`) was RETURNED by

@@ -749,6 +749,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     mode: SessionMode::Ready,
                     receipt: None,
                     received_above_high_water: Vec::new(),
+                    last_staged_receipt_high_water: 0,
                     conversation_id: candidate.state.conversation_id,
                 });
                 candidate.session = Some(session);
@@ -1016,17 +1017,16 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     }
 
     /// The displayed transition: remove the inbound record (freeing the
-    /// 32-slot bound) and create a `Pending` ACK intent. Also stages the
-    /// coalesced receipt (D2b decision): when the contiguous received high
-    /// water is nonzero and the mode allows control traffic
-    /// (`Ready`/`ControlOnly`; in `ReceiptLocked`/`RekeyRequired` all
-    /// encryption is blocked and the receipt is silently skipped, per
-    /// §4), one receipt send is staged per consume, reporting the current
-    /// HCR. Receipts are idempotent at the peer, so per-consume staging
-    /// is safe; finer coalescing would need a durable last-staged-HCR
-    /// field the frozen codec lacks (noted for D2c). The receipt rides
-    /// the unchanged D2a send machinery as a `Pending` send record whose
-    /// payload is a `Receipt` kind.
+    /// 32-slot bound) and create a `Pending` ACK intent. Receipt staging
+    /// follows the owed rule (review D2b v3, codec field 19): a receipt
+    /// reporting the current contiguous received high water is staged
+    /// when one is owed, the mode allows control traffic
+    /// (`Ready`/`ControlOnly`; `ReceiptLocked`/`RekeyRequired` block all
+    /// encryption per §4), and the send array has capacity; otherwise it
+    /// stays owed and the next clock-taking mutator retries — a skipped
+    /// receipt is never lost. The receipt rides the unchanged D2a send
+    /// machinery as a `Pending` send record whose payload is a `Receipt`
+    /// kind.
     ///
     /// # Errors
     ///
@@ -1403,6 +1403,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     return Err(LabError::MessageGone);
                 }
                 candidate.state.sends.remove(index);
+                // Freeing a slot can make an owed receipt stageable.
+                maybe_stage_owed_receipt(candidate, now)?;
                 if let Some(active) = candidate.state.active_session.as_mut() {
                     recompute_mode(active);
                 }
@@ -1744,12 +1746,21 @@ fn stage_send_operation(
         .state
         .sends
         .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    {
+        let active = candidate
+            .state
+            .active_session
+            .as_mut()
+            .ok_or(LabError::MissingSession)?;
+        active.last_assigned_send_seq = send_seq;
+    }
+    // Pruning/sweeping above may have freed capacity for an owed receipt.
+    maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
         .active_session
         .as_mut()
         .ok_or(LabError::MissingSession)?;
-    active.last_assigned_send_seq = send_seq;
     recompute_mode(active);
     Ok(DurableAction {
         token: *message_id.as_bytes(),
@@ -1851,6 +1862,7 @@ fn ratchet_step(
             mode: SessionMode::Ready,
             receipt: None,
             received_above_high_water: Vec::new(),
+            last_staged_receipt_high_water: 0,
             conversation_id: candidate.state.conversation_id,
         });
         candidate.session = Some(session);
@@ -2020,7 +2032,9 @@ fn accept_envelope_operation(
         _ => return Err(LabError::InvalidPayload),
     };
 
-    // (i) Mode recompute before the commit (RekeyRequired dominates).
+    // (i) Owed-receipt staging and mode recompute before the commit
+    // (RekeyRequired dominates).
+    maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
         .active_session
@@ -2113,26 +2127,13 @@ fn consume_inbound_operation(
         .acks
         .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
 
-    // Coalesced receipt staging is BEST-EFFORT (review blocker 2): it is
-    // skipped silently when the mode blocks control traffic or the send
-    // array is at its bound, so an unstageable receipt can never roll
-    // back the consume itself. Safe because receipts are coalesced
-    // control: only the latest HCR matters, and the next successful HCR
-    // advance stages a newer receipt.
-    let (high_water, mode) = {
-        let active = candidate
-            .state
-            .active_session
-            .as_ref()
-            .ok_or(LabError::MissingSession)?;
-        (active.highest_contiguous_received_seq, active.mode)
-    };
-    if high_water > 0
-        && matches!(mode, SessionMode::Ready | SessionMode::ControlOnly)
-        && candidate.state.sends.len() < MAX_SENDS
-    {
-        stage_receipt(candidate, high_water, valid_until, now)?;
-    }
+    // Owed-receipt staging (review D2b v3, codec field 19): a receipt is
+    // owed while the contiguous received high water exceeds
+    // `last_staged_receipt_high_water`; it stages here when the mode
+    // allows control traffic and the send array has capacity, and stays
+    // owed otherwise (a skipped receipt is never lost). See
+    // `maybe_stage_owed_receipt`.
+    maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
         .active_session
@@ -2241,6 +2242,33 @@ fn stage_receipt(
         .as_mut()
         .ok_or(LabError::MissingSession)?;
     active.last_assigned_send_seq = send_seq;
+    active.last_staged_receipt_high_water = high_water;
+    Ok(())
+}
+
+/// Stage the owed receipt, if any (review D2b v3, codec field 19): a
+/// receipt is owed while `highest_contiguous_received_seq` exceeds
+/// `last_staged_receipt_high_water`. It stages only when the mode allows
+/// control traffic and the send array has capacity; otherwise it stays
+/// owed and the next clock-taking mutator retries, so a skipped
+/// best-effort receipt is never lost. Called from every clock-taking
+/// mutator after the sweeps. `ReceiptLocked`/`RekeyRequired` still block
+/// staging per §4.
+fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<()> {
+    let Some(active) = candidate.state.active_session.as_ref() else {
+        return Ok(());
+    };
+    let high_water = active.highest_contiguous_received_seq;
+    let owed = high_water > active.last_staged_receipt_high_water;
+    let mode_allows = matches!(active.mode, SessionMode::Ready | SessionMode::ControlOnly);
+    if owed && mode_allows && candidate.state.sends.len() < MAX_SENDS {
+        stage_receipt(
+            candidate,
+            high_water,
+            now.saturating_add(REQUEST_WINDOW_SECONDS),
+            now,
+        )?;
+    }
     Ok(())
 }
 
