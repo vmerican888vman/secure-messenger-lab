@@ -2451,3 +2451,115 @@ fn mixed_published_and_unpublished_otks_accepted() -> Result<(), Box<dyn Error>>
     assert_eq!(&encoded[..], &decoded.encode()?[..]);
     Ok(())
 }
+
+// --- review v4 remediation tests -------------------------------------------
+
+/// Splice `one_time_keys.next_key_id` in the canonical account pickle
+/// JSON from one exact value to another.
+fn splice_next_key_id(json: &str, from: u64, to: u64) -> Result<String, Box<dyn Error>> {
+    let needle = format!("\"next_key_id\":{from}");
+    if !json.contains(&needle) {
+        return Err(format!("{needle} not in account pickle").into());
+    }
+    Ok(json.replacen(&needle, &format!("\"next_key_id\":{to}"), 1))
+}
+
+/// Assert the spliced pickle is still canonical (typed re-serialization
+/// is byte-equal), so only the semantic counter check can reject it.
+fn assert_canonical_pickle(json: &str) -> Result<(), Box<dyn Error>> {
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(json.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        json.as_bytes(),
+        "splice broke canonical form"
+    );
+    Ok(())
+}
+
+/// Review v4: `next_key_id` at or below a retained key id must reject,
+/// even though the pickle stays canonical.
+#[test]
+fn next_key_id_collision_with_retained_key_rejected() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    // The fixture's account retains one published one-time key under id 0
+    // with the counter at 1; force the counter onto the retained id.
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let colliding = splice_next_key_id(&json, 1, 0)?;
+    assert_canonical_pickle(&colliding)?;
+    fixture.state.account_pickle = Zeroizing::new(colliding.clone().into_bytes());
+    assert!(
+        fixture.state.encode().is_err(),
+        "encode accepted the collision"
+    );
+
+    // Decode path: splice the hostile pickle into the valid encoding.
+    let valid = populated_fixture()?;
+    let encoded = valid.state.encode()?;
+    let bytes = splice_top(&encoded, 8, field_block(9, colliding.as_bytes())?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decode accepted the collision"
+    );
+    Ok(())
+}
+
+/// Review v4 boundary: counter == max retained id rejects; max + 1 (and
+/// larger, gaps are legitimate) accepts; an empty store accepts any
+/// counter.
+#[test]
+fn next_key_id_boundary_rules() -> Result<(), Box<dyn Error>> {
+    // max + 1: the unmodified populated fixture (retained id 0, counter 1).
+    let fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+
+    // A gap (counter 2 over retained id 0) also accepts.
+    let mut fixture = populated_fixture()?;
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let gapped = splice_next_key_id(&json, 1, 2)?;
+    assert_canonical_pickle(&gapped)?;
+    fixture.state.account_pickle = Zeroizing::new(gapped.into_bytes());
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+
+    // Empty store: counter 0 accepts (minimal fixture has no one-time
+    // keys), and a larger counter with an empty store accepts too.
+    let fixture = minimal_fixture()?;
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+    let mut fixture = minimal_fixture()?;
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let ahead = splice_next_key_id(&json, 0, 42)?;
+    assert_canonical_pickle(&ahead)?;
+    fixture.state.account_pickle = Zeroizing::new(ahead.into_bytes());
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+    Ok(())
+}
+
+/// Review v4: the accepted max-plus-one pickle cannot eat a retained key
+/// on the next generation — verified through a real `Account`.
+#[test]
+fn accepted_boundary_pickle_generates_without_key_loss() -> Result<(), Box<dyn Error>> {
+    let fixture = populated_fixture()?;
+    let retained = fixture
+        .state
+        .pending_prekey
+        .as_ref()
+        .ok_or("no pending prekey")?
+        .one_time_key;
+    let pickle: vodozemac::olm::AccountPickle =
+        serde_json::from_slice(&fixture.state.account_pickle)?;
+    let mut account = Account::from_pickle(pickle);
+    assert!(account.contains_one_time_key(retained));
+
+    let created = account.generate_one_time_keys(1).created;
+    let new_key = *created.first().ok_or("no key generated")?;
+    assert!(new_key != retained, "generation reused the retained key");
+    assert!(
+        account.contains_one_time_key(retained),
+        "retained key was replaced"
+    );
+    assert!(account.contains_one_time_key(new_key));
+    Ok(())
+}

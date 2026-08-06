@@ -25,6 +25,17 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
+Version 4 (head `eb9d26f1fe59a9b51fa347b18f0ca45f53985222`) was RETURNED by
+Sol with one blocker (verdict in `reviews/REVIEW-sol-client-state-codec-v4.md`):
+`check_one_time_key_consistency` ignored `next_key_id`, so a canonical pickle
+could point the counter at a retained key and the next generation would
+silently replace its secret. The amended head under review now requires
+`next_key_id` to be strictly greater than every retained key id (in
+`private_keys` ∪ `public_keys`); gaps are legitimate and never rejected.
+Regression tests cover a canonicality-preserving splice on both encode and
+decode paths, the max/max+1 boundary, and real subsequent key generation
+without key loss.
+
 Version 3 (head `235ccfb854ba0d8def87a612d68c9948adb2719f`) was PASSed by
 Fable and RETURNED by Sol with four further blockers (verdicts in
 `reviews/REVIEW-fable-client-state-codec-v3.md` and

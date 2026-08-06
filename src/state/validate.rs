@@ -223,7 +223,13 @@ fn check_account(state: &ClientStateV1) -> Result<Account> {
 /// - every `public_keys` (unpublished) entry's key id must exist in
 ///   `private_keys` and its stored public key must equal the derived
 ///   public for that id. The reverse need not hold: published keys are
-///   absent from the unpublished map by design.
+///   absent from the unpublished map by design;
+/// - `next_key_id` must be strictly greater than every retained key id in
+///   `private_keys` ∪ `public_keys` (review v4: a counter at or below a
+///   retained id makes the next generation select the occupied id and
+///   silently replace its secret). Gaps are legitimate (consumption and
+///   eviction leave them), so larger values are never rejected; an empty
+///   store accepts any `next_key_id`.
 fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(canonical_pickle).map_err(|_| LabError::Storage)?;
@@ -255,6 +261,25 @@ fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
         let secret = private_keys.get(key_id).ok_or(LabError::Storage)?;
         if &Curve25519PublicKey::from(secret) != stored_public {
             return Err(LabError::Storage);
+        }
+    }
+
+    // The counter must sit strictly above every retained key id. The map
+    // keys are decimal strings (`KeyId` serializes as its inner `u64`).
+    let next_key_id = one_time_keys
+        .get("next_key_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(LabError::Storage)?;
+    for map_name in ["private_keys", "public_keys"] {
+        let entries = one_time_keys
+            .get(map_name)
+            .and_then(serde_json::Value::as_object)
+            .ok_or(LabError::Storage)?;
+        for key in entries.keys() {
+            let id = key.parse::<u64>().map_err(|_| LabError::Storage)?;
+            if id >= next_key_id {
+                return Err(LabError::Storage);
+            }
         }
     }
     Ok(())
