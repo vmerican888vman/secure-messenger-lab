@@ -1057,7 +1057,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
         let rollback = database(&directory, "rollback.sqlite");
-        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(3, 4), b"old")?;
+        let mut store =
+            ClientStateStore::create_with_path(&path, TestProtector::new(3, 4), b"old")?;
         fs::copy(&path, &rollback)?;
         store.commit(b"new")?;
         drop(store);
@@ -1068,7 +1069,9 @@ mod tests {
             b"old"
         );
         assert!(ClientStateStore::open_with_path(&path, TestProtector::new(9, 10)).is_err());
-        assert!(ClientStateStore::open_with_path(&path, TestProtector::with_mask(3, 4, 99)).is_err());
+        assert!(
+            ClientStateStore::open_with_path(&path, TestProtector::with_mask(3, 4, 99)).is_err()
+        );
         let connection = Connection::open(&path)?;
         connection.execute("UPDATE client_state SET ciphertext = zeroblob(16)", [])?;
         drop(connection);
@@ -1085,8 +1088,13 @@ mod tests {
             next: 1,
             fail: false,
         };
-        let mut store =
-            ClientStateStore::create_with_rng(&path, TestProtector::new(5, 6), b"one", &mut rng, None)?;
+        let mut store = ClientStateStore::create_with_rng(
+            &path,
+            TestProtector::new(5, 6),
+            b"one",
+            &mut rng,
+            None,
+        )?;
         let first_nonce = store.connection.query_row(
             "SELECT nonce FROM client_state WHERE slot = 1",
             [],
@@ -1109,10 +1117,16 @@ mod tests {
         drop(store);
         let maximum = vec![7_u8; MAX_CIPHERTEXT_BYTES - 16];
         let max_path = database(&directory, "max.sqlite");
-        assert!(ClientStateStore::create_with_path(&max_path, TestProtector::new(7, 8), &maximum).is_ok());
+        assert!(
+            ClientStateStore::create_with_path(&max_path, TestProtector::new(7, 8), &maximum)
+                .is_ok()
+        );
         let over_path = database(&directory, "over.sqlite");
         let over = vec![7_u8; MAX_CIPHERTEXT_BYTES - 15];
-        assert!(ClientStateStore::create_with_path(&over_path, TestProtector::new(9, 10), &over).is_err());
+        assert!(
+            ClientStateStore::create_with_path(&over_path, TestProtector::new(9, 10), &over)
+                .is_err()
+        );
         let over_database = Connection::open(&over_path)?;
         assert_eq!(
             over_database.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
@@ -1190,9 +1204,14 @@ mod tests {
                 let store = ClientStateStore::open_with_path(&path, TestProtector::new(31, 32))?;
                 assert_eq!(store.state()?, b"created");
             } else {
-                assert!(ClientStateStore::open_with_path(&path, TestProtector::new(31, 32)).is_err());
-                let store =
-                    ClientStateStore::create_with_path(&path, TestProtector::new(31, 32), b"retried")?;
+                assert!(
+                    ClientStateStore::open_with_path(&path, TestProtector::new(31, 32)).is_err()
+                );
+                let store = ClientStateStore::create_with_path(
+                    &path,
+                    TestProtector::new(31, 32),
+                    b"retried",
+                )?;
                 assert_eq!(store.state()?, b"retried");
             }
         }
@@ -1227,7 +1246,8 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "wrapper-race.sqlite");
-        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(23, 24), b"old")?;
+        let mut store =
+            ClientStateStore::create_with_path(&path, TestProtector::new(23, 24), b"old")?;
         let attacker = Connection::open(&path)?;
         let wrapper_length = attacker.query_row(
             "SELECT length(wrapped_dek) FROM client_state WHERE slot = 1",
@@ -1255,7 +1275,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         for (name, tamper_nonce) in [("nonce.sqlite", true), ("ciphertext.sqlite", false)] {
             let path = database(&directory, name);
-            let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(27, 28), b"old")?;
+            let mut store =
+                ClientStateStore::create_with_path(&path, TestProtector::new(27, 28), b"old")?;
             let attacker = Connection::open(&path)?;
             let column = if tamper_nonce { "nonce" } else { "ciphertext" };
             let query = format!("SELECT {column} FROM client_state WHERE slot = 1");
@@ -1329,7 +1350,8 @@ mod tests {
     fn committed_nonce_corpus_is_unique() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "nonce-corpus.sqlite");
-        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(33, 34), b"zero")?;
+        let mut store =
+            ClientStateStore::create_with_path(&path, TestProtector::new(33, 34), b"zero")?;
         let mut seen = HashSet::new();
         assert!(seen.insert(store.nonce.to_vec()));
         for generation in 2_u64..=128 {
@@ -1344,7 +1366,8 @@ mod tests {
     fn exact_schema_rejects_extra_objects() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
-        let store = ClientStateStore::create_with_path(&path, TestProtector::new(13, 14), b"state")?;
+        let store =
+            ClientStateStore::create_with_path(&path, TestProtector::new(13, 14), b"state")?;
         drop(store);
         let connection = Connection::open(&path)?;
         connection.execute_batch("CREATE TABLE extra_state(value INTEGER) STRICT;")?;
@@ -1440,7 +1463,8 @@ mod tests {
     -> std::result::Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "evil-delete-trigger.sqlite");
-        let mut store = ClientStateStore::create_with_path(&path, TestProtector::new(41, 42), b"guarded")?;
+        let mut store =
+            ClientStateStore::create_with_path(&path, TestProtector::new(41, 42), b"guarded")?;
         let inspector = Connection::open(&path)?;
         let before = full_row(&inspector)?;
         drop(inspector);
@@ -1570,7 +1594,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         for (name, oversized_wrapper) in [("wrapper.sqlite", true), ("ciphertext.sqlite", false)] {
             let path = database(&directory, name);
-            let store = ClientStateStore::create_with_path(&path, TestProtector::new(29, 30), b"state")?;
+            let store =
+                ClientStateStore::create_with_path(&path, TestProtector::new(29, 30), b"state")?;
             let binding = store.binding()?;
             drop(store);
             let connection = Connection::open(&path)?;
@@ -1599,7 +1624,8 @@ mod tests {
     {
         let directory = tempfile::tempdir()?;
         let path = database(&directory, "state.sqlite");
-        let mut first = ClientStateStore::create_with_path(&path, TestProtector::new(11, 12), b"one")?;
+        let mut first =
+            ClientStateStore::create_with_path(&path, TestProtector::new(11, 12), b"one")?;
         let second = ClientStateStore::open_with_path(&path, TestProtector::new(11, 12))?;
         first.commit(b"two")?;
         let mut stale = second;
@@ -1642,7 +1668,11 @@ mod tests {
         // Create over an existing database refuses.
         let store_path = directory.path().join("occupied");
         let dir = PrivateStoreDir::create(&store_path, crate::StoreKind::ClientState)?;
-        drop(ClientStateStore::create(dir, TestProtector::new(73, 74), b"one")?);
+        drop(ClientStateStore::create(
+            dir,
+            TestProtector::new(73, 74),
+            b"one",
+        )?);
         let dir = crate::private_store_dir::open_with_release_grace(
             &store_path,
             crate::StoreKind::ClientState,

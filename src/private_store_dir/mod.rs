@@ -208,16 +208,12 @@ impl PrivateStoreDir {
     /// Returns a coarse storage error if the file exists or cannot be created
     /// with owner-only permissions.
     pub fn create_main_database_file(&self) -> Result<()> {
-        let name = std::ffi::CString::new(self.kind.main_basename())
-            .map_err(|_| LabError::Storage)?;
+        let name =
+            std::ffi::CString::new(self.kind.main_basename()).map_err(|_| LabError::Storage)?;
         let fd = fs::openat(
             &self.dir,
             name.as_c_str(),
-            OFlags::RDWR
-                | OFlags::CREATE
-                | OFlags::EXCL
-                | OFlags::NOFOLLOW
-                | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::RUSR | Mode::WUSR,
         )
         .map_err(|_| LabError::Storage)?;
@@ -377,10 +373,7 @@ fn probe(dir: &File, name: &[u8]) -> Result<File> {
 /// plain single-attempt [`PrivateStoreDir::open`]. Integration tests carry
 /// their own copy (they cannot reach crate-private items).
 #[cfg(test)]
-pub(crate) fn open_with_release_grace(
-    path: &Path,
-    kind: StoreKind,
-) -> Result<PrivateStoreDir> {
+pub(crate) fn open_with_release_grace(path: &Path, kind: StoreKind) -> Result<PrivateStoreDir> {
     for _ in 0..50 {
         match PrivateStoreDir::open(path, kind) {
             Ok(dir) => return Ok(dir),

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, params};
 use secure_messenger_lab::{
-    MailboxRegistration, PersistentClient, PrivateStoreDir, ProfileBinding, ProtectionLevel,
-    PROTOCOL_DOMAIN, QueueId, RedactedContactOffer, RegistrationOutcome, StateKeyProtector,
+    MailboxRegistration, PROTOCOL_DOMAIN, PersistentClient, PrivateStoreDir, ProfileBinding,
+    ProtectionLevel, QueueId, RedactedContactOffer, RegistrationOutcome, StateKeyProtector,
     StoreKind,
 };
 use tempfile::TempDir;
@@ -65,10 +65,11 @@ impl StateKeyProtector for TestProtector {
         {
             return Err(secure_messenger_lab::LabError::Storage);
         }
-        for (target, (value, mask)) in output
-            .iter_mut()
-            .zip(wrapped_dek[PREFIX.len() + 32..].iter().zip(self.mask.iter()))
-        {
+        for (target, (value, mask)) in output.iter_mut().zip(
+            wrapped_dek[PREFIX.len() + 32..]
+                .iter()
+                .zip(self.mask.iter()),
+        ) {
             *target = value ^ mask;
         }
         Ok(())
@@ -167,7 +168,10 @@ fn database_path(temp: &TempDir) -> PathBuf {
 }
 
 fn create_dir(temp: &TempDir) -> Result<PrivateStoreDir, Box<dyn Error>> {
-    Ok(PrivateStoreDir::create(&store_path(temp), StoreKind::ClientState)?)
+    Ok(PrivateStoreDir::create(
+        &store_path(temp),
+        StoreKind::ClientState,
+    )?)
 }
 
 fn open_dir(temp: &TempDir) -> Result<PrivateStoreDir, Box<dyn Error>> {
@@ -179,11 +183,18 @@ fn open_dir(temp: &TempDir) -> Result<PrivateStoreDir, Box<dyn Error>> {
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     }
-    Ok(PrivateStoreDir::open(&store_path(temp), StoreKind::ClientState)?)
+    Ok(PrivateStoreDir::open(
+        &store_path(temp),
+        StoreKind::ClientState,
+    )?)
 }
 
 fn create_client(temp: &TempDir) -> Result<PersistentClient<TestProtector>, Box<dyn Error>> {
-    Ok(PersistentClient::create(create_dir(temp)?, protector(), NOW)?)
+    Ok(PersistentClient::create(
+        create_dir(temp)?,
+        protector(),
+        NOW,
+    )?)
 }
 
 fn open_client(temp: &TempDir) -> Result<PersistentClient<TestProtector>, Box<dyn Error>> {
@@ -265,7 +276,10 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     action
         .request
         .manage_key
-        .verify(&registration_signing_bytes(&action.request), &action.request.signature)
+        .verify(
+            &registration_signing_bytes(&action.request),
+            &action.request.signature,
+        )
         .map_err(|_| "registration signature did not verify")?;
     client.record_registration_result(action.token, RegistrationOutcome::Confirmed)?;
 
@@ -273,7 +287,10 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     let mut client = open_client(&temp)?;
     assert_eq!(client.public_identity()?, identity);
     // Every committed record survived the reopen, proven behaviorally.
-    assert!(client.prekey_action(NOW + 300).is_err(), "pending prekey lost");
+    assert!(
+        client.prekey_action(NOW + 300).is_err(),
+        "pending prekey lost"
+    );
     let peer2 = peer_material(NOW + 300)?;
     assert!(
         client
@@ -361,11 +378,10 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     // next commit's exact-generation CAS fails (simulating an authentic
     // rollback / concurrent modification).
     let connection = Connection::open(database_path(&temp))?;
-    let nonce: Vec<u8> = connection.query_row(
-        "SELECT nonce FROM client_state WHERE slot = 1",
-        [],
-        |row| row.get(0),
-    )?;
+    let nonce: Vec<u8> =
+        connection.query_row("SELECT nonce FROM client_state WHERE slot = 1", [], |row| {
+            row.get(0)
+        })?;
     let mut tampered = nonce.clone();
     let first = tampered.first_mut().ok_or("empty nonce")?;
     *first ^= 0x01;

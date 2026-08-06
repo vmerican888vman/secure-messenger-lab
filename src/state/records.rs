@@ -16,9 +16,7 @@ use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 use zeroize::Zeroizing;
 
 use super::tlv::{self, ObjectReader, Reader};
-use super::{
-    MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SESSION_PICKLE,
-};
+use super::{MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SESSION_PICKLE};
 use crate::ids::{ConversationId, MessageId, Nonce, QueueId};
 use crate::{EncryptedPacket, LabError, Result};
 
@@ -110,19 +108,22 @@ impl RegistrationRecord {
         Ok(record)
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let valid_until = self.valid_until.to_be_bytes();
+        let signature = self.signature.to_bytes();
+        let object = tlv::write_object(
             REGISTRATION_TYPE,
             &[
-                (1, self.queue_id.as_bytes().to_vec()),
-                (2, self.send_key.as_bytes().to_vec()),
-                (3, self.receive_key.as_bytes().to_vec()),
-                (4, self.manage_key.as_bytes().to_vec()),
-                (5, self.nonce.as_bytes().to_vec()),
-                (6, self.valid_until.to_be_bytes().to_vec()),
-                (7, self.signature.to_bytes().to_vec()),
+                (1, self.queue_id.as_bytes() as &[u8]),
+                (2, self.send_key.as_bytes()),
+                (3, self.receive_key.as_bytes()),
+                (4, self.manage_key.as_bytes()),
+                (5, self.nonce.as_bytes()),
+                (6, &valid_until),
+                (7, &signature),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -151,13 +152,20 @@ impl PeerBundle {
         })
     }
 
-    fn fields(&self, first_id: u16) -> [(u16, Vec<u8>); 5] {
+    /// The five bundle field values borrowed for assembly; the caller owns
+    /// the integer temporaries.
+    fn fields<'a>(
+        &'a self,
+        first_id: u16,
+        valid_until: &'a [u8; 8],
+        signature: &'a [u8; 64],
+    ) -> [(u16, &'a [u8]); 5] {
         [
-            (first_id, self.signing_identity.as_bytes().to_vec()),
-            (first_id + 1, self.curve_identity.as_bytes().to_vec()),
-            (first_id + 2, self.one_time_key.as_bytes().to_vec()),
-            (first_id + 3, self.valid_until.to_be_bytes().to_vec()),
-            (first_id + 4, self.signature.to_bytes().to_vec()),
+            (first_id, self.signing_identity.as_bytes()),
+            (first_id + 1, self.curve_identity.as_bytes()),
+            (first_id + 2, self.one_time_key.as_bytes()),
+            (first_id + 3, valid_until),
+            (first_id + 4, signature),
         ]
     }
 }
@@ -199,18 +207,22 @@ impl PendingPreKey {
         Ok(record)
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let created_at = self.created_at.to_be_bytes();
+        let valid_until = self.valid_until.to_be_bytes();
+        let signature = self.signature.to_bytes();
+        let object = tlv::write_object(
             PENDING_PREKEY_TYPE,
             &[
-                (1, self.signing_identity.as_bytes().to_vec()),
-                (2, self.curve_identity.as_bytes().to_vec()),
-                (3, self.one_time_key.as_bytes().to_vec()),
-                (4, self.created_at.to_be_bytes().to_vec()),
-                (5, self.valid_until.to_be_bytes().to_vec()),
-                (6, self.signature.to_bytes().to_vec()),
+                (1, self.signing_identity.as_bytes() as &[u8]),
+                (2, self.curve_identity.as_bytes()),
+                (3, self.one_time_key.as_bytes()),
+                (4, &created_at),
+                (5, &valid_until),
+                (6, &signature),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -241,21 +253,24 @@ impl PeerBinding {
         })
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let bundle_fields = self.bundle.fields(1);
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let valid_until = self.bundle.valid_until.to_be_bytes();
+        let bundle_signature = self.bundle.signature.to_bytes();
+        let bundle_fields = self.bundle.fields(1, &valid_until, &bundle_signature);
+        let object = tlv::write_object(
             PEER_BINDING_TYPE,
             &[
-                bundle_fields[0].clone(),
-                bundle_fields[1].clone(),
-                bundle_fields[2].clone(),
-                bundle_fields[3].clone(),
-                bundle_fields[4].clone(),
-                (6, self.queue_id.as_bytes().to_vec()),
-                (7, self.send_keypair_json.to_vec()),
-                (8, self.send_public_key.as_bytes().to_vec()),
+                bundle_fields[0],
+                bundle_fields[1],
+                bundle_fields[2],
+                bundle_fields[3],
+                bundle_fields[4],
+                (6, self.queue_id.as_bytes() as &[u8]),
+                (7, &self.send_keypair_json[..]),
+                (8, self.send_public_key.as_bytes()),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -296,8 +311,7 @@ impl HighWaterReceipt {
     const ENCODED_LEN: usize = 1 + 16 + 32 + 32 + 32 + 8 + 64;
 
     fn parse(bytes: &[u8]) -> Result<Option<Self>> {
-        let Some(bytes) = optional(bytes, tlv::fixed::<{ Self::ENCODED_LEN }>)?
-        else {
+        let Some(bytes) = optional(bytes, tlv::fixed::<{ Self::ENCODED_LEN }>)? else {
             return Ok(None);
         };
         let mut reader = Reader::new(&bytes);
@@ -434,32 +448,46 @@ impl ActiveSession {
         })
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let transcript_fields = self.transcript.fields(6);
-        let receipt_bytes = self.receipt.as_ref().map_or(Vec::new(), HighWaterReceipt::encode);
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let role = [self.role as u8];
+        let transcript_valid_until = self.transcript.valid_until.to_be_bytes();
+        let transcript_signature = self.transcript.signature.to_bytes();
+        let transcript_fields =
+            self.transcript
+                .fields(6, &transcript_valid_until, &transcript_signature);
+        let last_assigned_send_seq = self.last_assigned_send_seq.to_be_bytes();
+        let peer_contiguous_high_water = self.peer_contiguous_high_water.to_be_bytes();
+        let highest_contiguous_received_seq = self.highest_contiguous_received_seq.to_be_bytes();
+        let mode = [self.mode as u8];
+        let receipt_bytes = self
+            .receipt
+            .as_ref()
+            .map_or(Vec::new(), HighWaterReceipt::encode);
+        let received_bytes = encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?;
+        let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
-                (1, vec![self.role as u8]),
-                (2, self.session_pickle.to_vec()),
-                (3, self.identity_key.as_bytes().to_vec()),
-                (4, self.base_key.as_bytes().to_vec()),
-                (5, self.one_time_key.as_bytes().to_vec()),
-                transcript_fields[0].clone(),
-                transcript_fields[1].clone(),
-                transcript_fields[2].clone(),
-                transcript_fields[3].clone(),
-                transcript_fields[4].clone(),
-                (11, self.epoch_id.to_vec()),
-                (12, self.last_assigned_send_seq.to_be_bytes().to_vec()),
-                (13, self.peer_contiguous_high_water.to_be_bytes().to_vec()),
-                (14, self.highest_contiguous_received_seq.to_be_bytes().to_vec()),
-                (15, vec![self.mode as u8]),
-                (16, receipt_bytes),
-                (17, encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?),
-                (18, self.conversation_id.as_bytes().to_vec()),
+                (1, &role as &[u8]),
+                (2, &self.session_pickle[..]),
+                (3, self.identity_key.as_bytes()),
+                (4, self.base_key.as_bytes()),
+                (5, self.one_time_key.as_bytes()),
+                transcript_fields[0],
+                transcript_fields[1],
+                transcript_fields[2],
+                transcript_fields[3],
+                transcript_fields[4],
+                (11, &self.epoch_id),
+                (12, &last_assigned_send_seq),
+                (13, &peer_contiguous_high_water),
+                (14, &highest_contiguous_received_seq),
+                (15, &mode),
+                (16, &receipt_bytes),
+                (17, &received_bytes),
+                (18, self.conversation_id.as_bytes()),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -502,20 +530,24 @@ impl InboundRecord {
         })
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let sender_sequence = self.sender_sequence.to_be_bytes();
+        let expires_at = self.expires_at.to_be_bytes();
+        let accepted_at = self.accepted_at.to_be_bytes();
+        let object = tlv::write_object(
             INBOUND_TYPE,
             &[
-                (1, self.message_id.as_bytes().to_vec()),
-                (2, self.epoch_id.to_vec()),
-                (3, self.sender_sequence.to_be_bytes().to_vec()),
-                (4, self.queue_id.as_bytes().to_vec()),
-                (5, self.packet_digest.to_vec()),
-                (6, self.expires_at.to_be_bytes().to_vec()),
-                (7, self.accepted_at.to_be_bytes().to_vec()),
-                (8, self.body.as_bytes().to_vec()),
+                (1, self.message_id.as_bytes() as &[u8]),
+                (2, &self.epoch_id),
+                (3, &sender_sequence),
+                (4, self.queue_id.as_bytes()),
+                (5, &self.packet_digest),
+                (6, &expires_at),
+                (7, &accepted_at),
+                (8, self.body.as_bytes()),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -608,8 +640,13 @@ impl SendRecord {
         }
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        let queue = self.queue_id.map_or_else(Vec::new, |id| id.as_bytes().to_vec());
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let state = [self.state as u8];
+        let sequence = self.sequence.to_be_bytes();
+        let expires_at = self.expires_at.to_be_bytes();
+        let queue = self
+            .queue_id
+            .map_or_else(Vec::new, |id| id.as_bytes().to_vec());
         let packet = self
             .packet
             .as_ref()
@@ -617,21 +654,24 @@ impl SendRecord {
         let signature_bytes = self
             .send_signature
             .map_or_else(Vec::new, |sig| sig.to_bytes().to_vec());
-        let digest = self.packet_digest.map_or_else(Vec::new, |digest| digest.to_vec());
-        tlv::write_object(
+        let digest = self
+            .packet_digest
+            .map_or_else(Vec::new, |digest| digest.to_vec());
+        let object = tlv::write_object(
             SEND_TYPE,
             &[
-                (1, self.message_id.as_bytes().to_vec()),
-                (2, vec![self.state as u8]),
-                (3, self.epoch_id.to_vec()),
-                (4, self.sequence.to_be_bytes().to_vec()),
-                (5, queue),
-                (6, packet),
-                (7, self.expires_at.to_be_bytes().to_vec()),
-                (8, signature_bytes),
-                (9, digest),
+                (1, self.message_id.as_bytes() as &[u8]),
+                (2, &state),
+                (3, &self.epoch_id),
+                (4, &sequence),
+                (5, &queue),
+                (6, &packet),
+                (7, &expires_at),
+                (8, &signature_bytes),
+                (9, &digest),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -676,19 +716,23 @@ impl AckIntent {
         Ok(record)
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let sequence = self.sequence.to_be_bytes();
+        let valid_until = self.valid_until.to_be_bytes();
+        let state = [self.state as u8];
+        let object = tlv::write_object(
             ACK_TYPE,
             &[
-                (1, self.message_id.as_bytes().to_vec()),
-                (2, self.epoch_id.to_vec()),
-                (3, self.sequence.to_be_bytes().to_vec()),
-                (4, self.queue_id.as_bytes().to_vec()),
-                (5, self.packet_digest.to_vec()),
-                (6, self.valid_until.to_be_bytes().to_vec()),
-                (7, vec![self.state as u8]),
+                (1, self.message_id.as_bytes() as &[u8]),
+                (2, &self.epoch_id),
+                (3, &sequence),
+                (4, self.queue_id.as_bytes()),
+                (5, &self.packet_digest),
+                (6, &valid_until),
+                (7, &state),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -733,19 +777,23 @@ impl DedupRecord {
         Ok(record)
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-        tlv::write_object(
+    pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let sequence = self.sequence.to_be_bytes();
+        let expires_at = self.expires_at.to_be_bytes();
+        let state = [self.state as u8];
+        let object = tlv::write_object(
             DEDUP_TYPE,
             &[
-                (1, self.message_id.as_bytes().to_vec()),
-                (2, self.epoch_id.to_vec()),
-                (3, self.sequence.to_be_bytes().to_vec()),
-                (4, self.queue_id.as_bytes().to_vec()),
-                (5, self.packet_digest.to_vec()),
-                (6, self.expires_at.to_be_bytes().to_vec()),
-                (7, vec![self.state as u8]),
+                (1, self.message_id.as_bytes() as &[u8]),
+                (2, &self.epoch_id),
+                (3, &sequence),
+                (4, self.queue_id.as_bytes()),
+                (5, &self.packet_digest),
+                (6, &expires_at),
+                (7, &state),
             ],
-        )
+        )?;
+        Ok(Zeroizing::new(object))
     }
 }
 
@@ -783,11 +831,12 @@ pub(crate) fn parse_record_array<T>(
 
 /// Encode a record array as `count:u32be` + length-delimited objects.
 /// Sortedness is (re)checked by semantic validation on the encode path.
+/// The result may carry plaintext record bodies and is zeroized on drop.
 pub(crate) fn encode_record_array<T>(
     records: &[T],
     bound: usize,
-    encode: impl Fn(&T) -> Result<Vec<u8>>,
-) -> Result<Vec<u8>> {
+    encode: impl Fn(&T) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
     if records.len() > bound {
         return Err(LabError::Storage);
     }
@@ -800,7 +849,7 @@ pub(crate) fn encode_record_array<T>(
         tlv::write_u32(&mut out, length);
         out.extend_from_slice(&bytes);
     }
-    Ok(out)
+    Ok(Zeroizing::new(out))
 }
 
 /// Parse the `received_above_high_water` set: `count:u32be` then

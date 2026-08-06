@@ -137,10 +137,7 @@ fn parse_linux_acl_xattr(bytes: &[u8]) -> Result<()> {
     if entries.len() != 3 * ENTRY {
         return Err(LabError::Storage);
     }
-    for (index, expected_tag) in [ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER]
-        .iter()
-        .enumerate()
-    {
+    for (index, expected_tag) in [ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER].iter().enumerate() {
         let entry = &entries[index * ENTRY..(index + 1) * ENTRY];
         let tag = u16::from_le_bytes(entry[0..2].try_into().map_err(|_| LabError::Storage)?);
         let id = u32::from_le_bytes(entry[4..8].try_into().map_err(|_| LabError::Storage)?);

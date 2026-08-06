@@ -25,17 +25,37 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
-Version 1 of this leg (head `a630f9a7b8b7c379330332d48e87239651944fb6`) was
-independently RETURNED by both reviewers with the identical blocking finding:
-the active-session transcript model assumed the session's identity and OTK
-always belong to the peer bundle, which is false for genuine inbound sessions
-(verdicts in `reviews/REVIEW-fable-client-state-codec.md` and
-`reviews/REVIEW-sol-client-state-codec.md`).
+Version 3 (head `235ccfb854ba0d8def87a612d68c9948adb2719f`) was PASSed by
+Fable and RETURNED by Sol with four further blockers (verdicts in
+`reviews/REVIEW-fable-client-state-codec-v3.md` and
+`reviews/REVIEW-sol-client-state-codec-v3.md`). The amended head under review
+now fixes all four:
+
+1. Current-epoch dedup records now require `has_received_message()` and a
+   sequence ≤ `highest_contiguous_received_seq` or present in
+   `received_above_high_water`; retired-epoch dedup stays exempt (§4
+   retention). The `receipt_only_session_validates` fixture uses
+   retired-epoch dedup records.
+2. `RekeyRequired` dominates the budget mode: accepted at any outstanding
+   count 0..=32 (the Ready/ControlOnly/ReceiptLocked matrix still governs
+   the three budget modes; >32 rejects regardless). This supersedes Fable's
+   v3 non-blocking carry-over note.
+3. Account validation now requires all derived OTK public keys unique and
+   every unpublished-map entry consistent with the private-key store (key id
+   exists, stored public equals derived public), closing the
+   duplicate-secret acceptance the vendored patch documents validators must
+   reject.
+4. Secret intermediates under this crate's control are `Zeroizing` (or never
+   materialize — record encodes write borrowed fields). Dependency-owned
+   buffers (serde_json internals, vodozemac pickle types, façade `Candidate`
+   clones) are documented as out of reach, not hacked around.
+
+Also: the head now passes `cargo fmt --check` (v3's CI formatting failure);
+the fmt pass reflowed some non-state files with zero semantic change.
 
 Version 2 (head `eaebebe4e6aef7c1a024e8f2a3ef6bebd7061bd4`) made the
-transcript role-aware and was RETURNED by Sol with four further blockers
-(verdict in `reviews/REVIEW-sol-client-state-codec-v2.md`). The amended head
-under review now fixes all four:
+transcript role-aware and was RETURNED by Sol with four blockers
+(verdict in `reviews/REVIEW-sol-client-state-codec-v2.md`), all fixed in v3:
 
 1. Receive-side state (`highest_contiguous_received_seq > 0`, non-empty
    received set, inbound records, or ACK intents) now requires
@@ -52,7 +72,7 @@ under review now fixes all four:
    (`contains_one_time_key`) AND absent from `account.one_time_keys()` (the
    unpublished set).
 
-Confirm you are reviewing the amended head, not either returned one.
+Confirm you are reviewing the amended head, not any returned one.
 
 The role-aware transcript model from v2 (unchanged by v3):
 

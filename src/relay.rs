@@ -103,9 +103,7 @@ impl Relay {
     /// Returns [`LabError::Storage`] if the directory already holds a
     /// database or `SQLite` cannot initialize the schema.
     pub fn create_at(dir: PrivateStoreDir, now: u64) -> Result<Self> {
-        if dir.kind() != StoreKind::Relay
-            || dir.main_database_at_open() != MainDatabase::Absent
-        {
+        if dir.kind() != StoreKind::Relay || dir.main_database_at_open() != MainDatabase::Absent {
             return Err(LabError::Storage);
         }
         dir.create_main_database_file()?;
@@ -139,9 +137,7 @@ impl Relay {
     /// closed even though `SQLite` could have opened it. See
     /// [`reject_anomalous_wal`].
     pub fn open_at(dir: PrivateStoreDir, now: u64) -> Result<Self> {
-        if dir.kind() != StoreKind::Relay
-            || dir.main_database_at_open() != MainDatabase::Present
-        {
+        if dir.kind() != StoreKind::Relay || dir.main_database_at_open() != MainDatabase::Present {
             return Err(LabError::Storage);
         }
         Self::open_at_path(&dir.database_path(), now, Some(dir))
@@ -181,7 +177,11 @@ impl Relay {
         Self::initialize(connection, unix_now()?, None)
     }
 
-    fn initialize(mut connection: Connection, now: u64, dir: Option<PrivateStoreDir>) -> Result<Self> {
+    fn initialize(
+        mut connection: Connection,
+        now: u64,
+        dir: Option<PrivateStoreDir>,
+    ) -> Result<Self> {
         connection.busy_timeout(Duration::from_secs(2))?;
         // Do not change journal mode or begin a migration until the opened
         // database has passed the exact schema/version preflight.

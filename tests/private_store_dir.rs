@@ -13,7 +13,12 @@ use secure_messenger_lab::{MainDatabase, PrivateStoreDir, StoreKind};
 use tempfile::TempDir;
 
 /// Create `parent/name` with exact permissions and content.
-fn seed_file(parent: &Path, name: &str, mode: u32, content: &[u8]) -> Result<PathBuf, Box<dyn Error>> {
+fn seed_file(
+    parent: &Path,
+    name: &str,
+    mode: u32,
+    content: &[u8],
+) -> Result<PathBuf, Box<dyn Error>> {
     let path = parent.join(name);
     let mut file = File::create(&path)?;
     file.write_all(content)?;
@@ -89,7 +94,12 @@ fn open_reports_present_absent_and_empty_main() -> Result<(), Box<dyn Error>> {
     let dir = PrivateStoreDir::create(&path, StoreKind::Relay)?;
     drop(dir);
 
-    seed_file(&path, "relay.sqlite3", 0o600, b"not-a-real-db-but-non-empty")?;
+    seed_file(
+        &path,
+        "relay.sqlite3",
+        0o600,
+        b"not-a-real-db-but-non-empty",
+    )?;
     let dir = open_grace(&path, StoreKind::Relay)?;
     assert_eq!(dir.main_database_at_open(), MainDatabase::Present);
     drop(dir);
@@ -207,7 +217,10 @@ fn symlinked_companion_is_rejected() -> Result<(), Box<dyn Error>> {
 
     seed_file(&path, "relay.sqlite3", 0o600, b"db")?;
     // Dangling: the guard must reject the link without following it.
-    symlink(path.join("no-such-target"), path.join("relay.sqlite3-journal"))?;
+    symlink(
+        path.join("no-such-target"),
+        path.join("relay.sqlite3-journal"),
+    )?;
     assert!(PrivateStoreDir::open(&path, StoreKind::Relay).is_err());
     Ok(())
 }
@@ -397,12 +410,14 @@ fn stores_refuse_companion_only_directories() -> Result<(), Box<dyn Error>> {
     assert!(relay_create.is_err());
 
     let state_path = temp.path().join("state-store");
-    drop(PrivateStoreDir::create(&state_path, StoreKind::ClientState)?);
+    drop(PrivateStoreDir::create(
+        &state_path,
+        StoreKind::ClientState,
+    )?);
     seed_file(&state_path, "client-state.sqlite3-journal", 0o600, b"torn")?;
-    let state_create = PrivateStoreDir::open(&state_path, StoreKind::ClientState)
-        .and_then(|dir| {
-            secure_messenger_lab::ClientStateStore::create(dir, protector(), b"state").map(|_| ())
-        });
+    let state_create = PrivateStoreDir::open(&state_path, StoreKind::ClientState).and_then(|dir| {
+        secure_messenger_lab::ClientStateStore::create(dir, protector(), b"state").map(|_| ())
+    });
     assert!(state_create.is_err());
     Ok(())
 }
@@ -424,7 +439,9 @@ fn protector() -> TestProtector {
 }
 
 impl secure_messenger_lab::StateKeyProtector for TestProtector {
-    fn expected_binding(&self) -> secure_messenger_lab::Result<secure_messenger_lab::ProfileBinding> {
+    fn expected_binding(
+        &self,
+    ) -> secure_messenger_lab::Result<secure_messenger_lab::ProfileBinding> {
         Ok(self.binding)
     }
 
@@ -457,10 +474,11 @@ impl secure_messenger_lab::StateKeyProtector for TestProtector {
         {
             return Err(secure_messenger_lab::LabError::Storage);
         }
-        for (target, (value, mask)) in output
-            .iter_mut()
-            .zip(wrapped_dek[PREFIX.len() + 32..].iter().zip(self.mask.iter()))
-        {
+        for (target, (value, mask)) in output.iter_mut().zip(
+            wrapped_dek[PREFIX.len() + 32..]
+                .iter()
+                .zip(self.mask.iter()),
+        ) {
             *target = value ^ mask;
         }
         Ok(())

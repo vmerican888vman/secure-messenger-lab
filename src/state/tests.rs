@@ -28,7 +28,9 @@ use super::{
     SendState, SessionMode,
 };
 use crate::capability::digest;
-use crate::{ConversationId, EncryptedPacket, MailboxOwner, MailboxRegistration, MessageId, QueueId};
+use crate::{
+    ConversationId, EncryptedPacket, MailboxOwner, MailboxRegistration, MessageId, QueueId,
+};
 
 const NOW: u64 = 1_800_000_000;
 
@@ -359,13 +361,22 @@ fn outbound_fixture(genuine_receive: bool) -> Result<Fixture, Box<dyn Error>> {
 
     let peer_send_keypair = Ed25519Keypair::new();
     let epoch_id = epoch_of(session.session_keys());
-    let sends =
-        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let sends = make_send_records(
+        &mut session,
+        &peer_send_keypair,
+        peer_mailbox.queue_id(),
+        epoch_id,
+    )?;
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session =
-        make_active_session(Role::Outbound, &session, &peer_bundle, receipt, conversation_id)?;
+    let active_session = make_active_session(
+        Role::Outbound,
+        &session,
+        &peer_bundle,
+        receipt,
+        conversation_id,
+    )?;
 
     let state = assemble_state(
         &our_account,
@@ -438,14 +449,24 @@ fn inbound_fixture() -> Result<Fixture, Box<dyn Error>> {
     let (peer_bundle, _) = make_peer_bundle(&mut peer_account)?;
     let peer_send_keypair = Ed25519Keypair::new();
     let epoch_id = epoch_of(keys);
-    let sends =
-        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let sends = make_send_records(
+        &mut session,
+        &peer_send_keypair,
+        peer_mailbox.queue_id(),
+        epoch_id,
+    )?;
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
     // A second, unconsumed one-time key backs the pending-prekey field.
     let pending_prekey = make_pending_prekey(&mut our_account)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt, conversation_id)?;
+    let active_session = make_active_session(
+        Role::Inbound,
+        &session,
+        &transcript,
+        receipt,
+        conversation_id,
+    )?;
 
     let state = assemble_state(
         &our_account,
@@ -522,6 +543,13 @@ fn field_block(id: u16, value: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
     Ok(out)
 }
 
+/// Owned-field wrapper over the borrowed-field `tlv::write_object`, for
+/// hand-crafted test objects.
+fn owned_object(object_type: u16, fields: &[(u16, Vec<u8>)]) -> Result<Vec<u8>, Box<dyn Error>> {
+    let borrowed: Vec<(u16, &[u8])> = fields.iter().map(|(id, value)| (*id, &value[..])).collect();
+    Ok(tlv::write_object(object_type, &borrowed)?)
+}
+
 /// Split a framed state into its top-level field blocks (ID + length +
 /// value each).
 fn split_top(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
@@ -532,7 +560,11 @@ fn split_top(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
             rest.get(2..6).ok_or("field header truncated")?.try_into()?,
         ))?;
         let block_len = 6 + length;
-        blocks.push(rest.get(..block_len).ok_or("field value truncated")?.to_vec());
+        blocks.push(
+            rest.get(..block_len)
+                .ok_or("field value truncated")?
+                .to_vec(),
+        );
         rest = rest.get(block_len..).ok_or("field value truncated")?;
     }
     Ok(blocks)
@@ -575,7 +607,9 @@ fn split_array(value: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
     let mut elements = Vec::new();
     for _ in 0..count {
         let length = usize::try_from(u32::from_be_bytes(
-            rest.get(..4).ok_or("element length truncated")?.try_into()?,
+            rest.get(..4)
+                .ok_or("element length truncated")?
+                .try_into()?,
         ))?;
         let total = 4 + length;
         elements.push(rest.get(..total).ok_or("element truncated")?.to_vec());
@@ -643,7 +677,11 @@ fn minimal_state_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
     let blocks = split_top(&encoded)?;
     for index in [12_usize, 13, 14] {
         let block = blocks.get(index).ok_or("optional field missing")?;
-        assert_eq!(block.len(), 6, "absent optional field must have zero length");
+        assert_eq!(
+            block.len(),
+            6,
+            "absent optional field must have zero length"
+        );
     }
     let decoded = ClientStateV1::decode(&encoded)?;
     let reencoded = decoded.encode()?;
@@ -690,7 +728,10 @@ fn wrong_field_count_rejected() -> Result<(), Box<dyn Error>> {
     for count in [18_u16, 20] {
         let mut bytes = encoded.to_vec();
         bytes[10..12].copy_from_slice(&count.to_be_bytes());
-        assert!(ClientStateV1::decode(&bytes).is_err(), "count {count} accepted");
+        assert!(
+            ClientStateV1::decode(&bytes).is_err(),
+            "count {count} accepted"
+        );
     }
     Ok(())
 }
@@ -755,7 +796,10 @@ fn truncated_input_rejected() -> Result<(), Box<dyn Error>> {
     let encoded = fixture.state.encode()?;
     for cut in [1_usize, 10, 100] {
         let truncated = &encoded[..encoded.len() - cut];
-        assert!(ClientStateV1::decode(truncated).is_err(), "cut {cut} accepted");
+        assert!(
+            ClientStateV1::decode(truncated).is_err(),
+            "cut {cut} accepted"
+        );
     }
     Ok(())
 }
@@ -819,7 +863,10 @@ fn invalid_enums_rejected() -> Result<(), Box<dyn Error>> {
         *record.get_mut(4 + 32).ok_or("state byte")? = invalid;
         let value = join_array(&elements)?;
         let bytes = splice_top(&encoded, 16, field_block(17, &value)?)?;
-        assert!(ClientStateV1::decode(&bytes).is_err(), "send state {invalid}");
+        assert!(
+            ClientStateV1::decode(&bytes).is_err(),
+            "send state {invalid}"
+        );
     }
 
     // ActiveSession.role is field 1 of the session object: byte offset 10.
@@ -839,14 +886,20 @@ fn invalid_enums_rejected() -> Result<(), Box<dyn Error>> {
         let last = record.len() - 1;
         *record.get_mut(last).ok_or("ack state")? = invalid;
         let bytes = splice_top(&encoded, 17, field_block(18, &join_array(&elements)?)?)?;
-        assert!(ClientStateV1::decode(&bytes).is_err(), "ack state {invalid}");
+        assert!(
+            ClientStateV1::decode(&bytes).is_err(),
+            "ack state {invalid}"
+        );
 
         let mut elements = split_array(blocks.get(18).ok_or("dedup")?.get(6..).ok_or("dedup")?)?;
         let record = elements.get_mut(0).ok_or("no dedup")?;
         let last = record.len() - 1;
         *record.get_mut(last).ok_or("dedup state")? = invalid;
         let bytes = splice_top(&encoded, 18, field_block(19, &join_array(&elements)?)?)?;
-        assert!(ClientStateV1::decode(&bytes).is_err(), "dedup state {invalid}");
+        assert!(
+            ClientStateV1::decode(&bytes).is_err(),
+            "dedup state {invalid}"
+        );
     }
     Ok(())
 }
@@ -886,7 +939,7 @@ fn keypair_bound_enforced() -> Result<(), Box<dyn Error>> {
 fn session_pickle_bound_enforced() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
-    let session = tlv::write_object(
+    let session = owned_object(
         records::ACTIVE_SESSION_TYPE,
         &[
             (1, vec![1_u8]),
@@ -905,7 +958,7 @@ fn session_pickle_bound_enforced() -> Result<(), Box<dyn Error>> {
 fn body_bound_enforced() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
-    let record = tlv::write_object(
+    let record = owned_object(
         records::INBOUND_TYPE,
         &[
             (1, fixture.state.inbound[0].message_id.as_bytes().to_vec()),
@@ -928,7 +981,7 @@ fn body_bound_enforced() -> Result<(), Box<dyn Error>> {
 fn packet_bound_enforced() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
-    let record = tlv::write_object(
+    let record = owned_object(
         records::SEND_TYPE,
         &[
             (1, fixture.state.sends[0].message_id.as_bytes().to_vec()),
@@ -967,14 +1020,17 @@ fn array_count_bounds_enforced() -> Result<(), Box<dyn Error>> {
     ] {
         let value = u32::try_from(count)?.to_be_bytes().to_vec();
         let bytes = splice_top(&encoded, index, field_block(field_id, &value)?)?;
-        assert!(ClientStateV1::decode(&bytes).is_err(), "field {field_id} count {count}");
+        assert!(
+            ClientStateV1::decode(&bytes).is_err(),
+            "field {field_id} count {count}"
+        );
     }
     // The received-set bound lives inside the session object (field 17).
     let mut received = u32::try_from(MAX_RECEIVED_SET + 1)?.to_be_bytes().to_vec();
     for value in 0..=MAX_RECEIVED_SET {
         received.extend_from_slice(&u64::try_from(value)?.to_be_bytes());
     }
-    let session = tlv::write_object(
+    let session = owned_object(
         records::ACTIVE_SESSION_TYPE,
         &[
             (1, vec![1_u8]),
@@ -1008,16 +1064,27 @@ fn unsorted_and_equal_array_ids_rejected() -> Result<(), Box<dyn Error>> {
     let blocks = split_top(&encoded)?;
     let dedup_value = blocks.get(18).ok_or("dedup")?.get(6..).ok_or("dedup")?;
     let mut elements = split_array(dedup_value)?;
-    assert_eq!(elements.len(), 2, "fixture dedup array must have two elements");
+    assert_eq!(
+        elements.len(),
+        2,
+        "fixture dedup array must have two elements"
+    );
 
     // Swapping the two elements breaks the strictly-increasing order.
     elements.swap(0, 1);
     let bytes = splice_top(&encoded, 18, field_block(19, &join_array(&elements)?)?)?;
-    assert!(ClientStateV1::decode(&bytes).is_err(), "decreasing IDs accepted");
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decreasing IDs accepted"
+    );
 
     // Duplicating an element creates equal IDs.
     let first = elements.first().ok_or("no element")?.clone();
-    let bytes = splice_top(&encoded, 18, field_block(19, &join_array(&[first.clone(), first])?)?)?;
+    let bytes = splice_top(
+        &encoded,
+        18,
+        field_block(19, &join_array(&[first.clone(), first])?)?,
+    )?;
     assert!(ClientStateV1::decode(&bytes).is_err(), "equal IDs accepted");
     Ok(())
 }
@@ -1026,7 +1093,10 @@ fn unsorted_and_equal_array_ids_rejected() -> Result<(), Box<dyn Error>> {
 fn unsorted_arrays_rejected_on_encode() -> Result<(), Box<dyn Error>> {
     let mut fixture = populated_fixture()?;
     fixture.state.dedup.swap(0, 1);
-    assert!(fixture.state.encode().is_err(), "decreasing dedup IDs accepted");
+    assert!(
+        fixture.state.encode().is_err(),
+        "decreasing dedup IDs accepted"
+    );
     fixture.state.dedup.swap(0, 1);
     let duplicate = DedupRecord {
         message_id: fixture.state.dedup[0].message_id,
@@ -1046,7 +1116,7 @@ fn unsorted_arrays_rejected_on_encode() -> Result<(), Box<dyn Error>> {
 fn invalid_utf8_body_rejected() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
-    let record = tlv::write_object(
+    let record = owned_object(
         records::INBOUND_TYPE,
         &[
             (1, fixture.state.inbound[0].message_id.as_bytes().to_vec()),
@@ -1077,7 +1147,10 @@ fn send_record_arm_mismatch_rejected() -> Result<(), Box<dyn Error>> {
     let terminal = elements.get_mut(2).ok_or("no terminal send")?;
     *terminal.get_mut(4 + 32).ok_or("state byte")? = 1;
     let bytes = splice_top(&encoded, 16, field_block(17, &join_array(&elements)?)?)?;
-    assert!(ClientStateV1::decode(&bytes).is_err(), "terminal arm as Pending");
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "terminal arm as Pending"
+    );
 
     // A pending record (index 0) relabeled as Stored keeps the full arm.
     let mut elements = split_array(blocks.get(16).ok_or("sends")?.get(6..).ok_or("sends")?)?;
@@ -1096,7 +1169,9 @@ fn byte_flip_in_each_cross_checked_field_fails() -> Result<(), Box<dyn Error>> {
     // nothing inside the plaintext cross-checks them, so their mutation is
     // detectable only by the outer AEAD (documented gap). Every other
     // top-level field must fail decode or validation when flipped.
-    for index in [0_usize, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18] {
+    for index in [
+        0_usize, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    ] {
         let (start, end) = field_value_span(&encoded, index)?;
         assert!(end > start, "field {index} unexpectedly empty");
         let mut mutated = encoded.to_vec();
@@ -1179,7 +1254,9 @@ fn canonical_json_properties_hold_empirically() -> Result<(), Box<dyn Error>> {
 #[test]
 fn keypair_json_duplicate_key_rejected_empirically() -> Result<(), Box<dyn Error>> {
     let json = serde_json::to_string(&Ed25519Keypair::new())?;
-    let pair = json.get(1..json.len() - 1).ok_or("unexpected keypair JSON shape")?;
+    let pair = json
+        .get(1..json.len() - 1)
+        .ok_or("unexpected keypair JSON shape")?;
     let duplicated = format!("{{{pair},{pair}}}");
     assert!(serde_json::from_str::<Ed25519Keypair>(&duplicated).is_err());
     assert!(
@@ -1204,7 +1281,9 @@ fn session_pickle_defaulted_member_rejected() -> Result<(), Box<dyn Error>> {
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     let json = String::from_utf8(active.session_pickle.to_vec())?;
     let needle = ",\"config\":{\"version\":\"V1\"}";
-    let position = json.find(needle).ok_or("config member not found in session pickle")?;
+    let position = json
+        .find(needle)
+        .ok_or("config member not found in session pickle")?;
     let mut shortened = json;
     shortened.replace_range(position..position + needle.len(), "");
     // The member deserializes via serde's default, so only canonical byte
@@ -1302,7 +1381,9 @@ fn pending_prekey_cross_checks() -> Result<(), Box<dyn Error>> {
     let mut fixture = populated_fixture()?;
     let prekey = fixture.state.pending_prekey.as_mut().ok_or("no prekey")?;
     prekey.signing_identity = fixture.peer_account.ed25519_key();
-    prekey.signature = fixture.peer_account.sign(prekey_signing_bytes(&prekey.bundle()));
+    prekey.signature = fixture
+        .peer_account
+        .sign(prekey_signing_bytes(&prekey.bundle()));
     assert!(fixture.state.encode().is_err());
 
     // `created_at < valid_until` is required.
@@ -1310,10 +1391,15 @@ fn pending_prekey_cross_checks() -> Result<(), Box<dyn Error>> {
     let valid_until = {
         let prekey = fixture.state.pending_prekey.as_mut().ok_or("no prekey")?;
         prekey.created_at = prekey.valid_until;
-        prekey.signature = fixture.our_account.sign(prekey_signing_bytes(&prekey.bundle()));
+        prekey.signature = fixture
+            .our_account
+            .sign(prekey_signing_bytes(&prekey.bundle()));
         prekey.valid_until
     };
-    assert!(fixture.state.encode().is_err(), "created_at == valid_until ({valid_until})");
+    assert!(
+        fixture.state.encode().is_err(),
+        "created_at == valid_until ({valid_until})"
+    );
 
     // The exact one-time key must still exist in the account: swap in a
     // key that is not ours and re-sign.
@@ -1326,7 +1412,9 @@ fn pending_prekey_cross_checks() -> Result<(), Box<dyn Error>> {
         .ok_or("no foreign one-time key")?;
     let prekey = fixture.state.pending_prekey.as_mut().ok_or("no prekey")?;
     prekey.one_time_key = foreign;
-    prekey.signature = fixture.our_account.sign(prekey_signing_bytes(&prekey.bundle()));
+    prekey.signature = fixture
+        .our_account
+        .sign(prekey_signing_bytes(&prekey.bundle()));
     assert!(fixture.state.encode().is_err());
     Ok(())
 }
@@ -1401,7 +1489,9 @@ fn peer_binding_cross_checks() -> Result<(), Box<dyn Error>> {
     let mut fixture = populated_fixture()?;
     let binding = fixture.state.peer_binding.as_mut().ok_or("no binding")?;
     binding.bundle.valid_until += 300;
-    binding.bundle.signature = fixture.peer_account.sign(prekey_signing_bytes(&binding.bundle));
+    binding.bundle.signature = fixture
+        .peer_account
+        .sign(prekey_signing_bytes(&binding.bundle));
     assert!(fixture.state.encode().is_err());
     Ok(())
 }
@@ -1442,7 +1532,9 @@ fn active_session_cross_checks() -> Result<(), Box<dyn Error>> {
 fn send_cross_checks_enforced() -> Result<(), Box<dyn Error>> {
     // Send signature must verify under the bound send capability.
     let mut fixture = populated_fixture()?;
-    let signature = fixture.state.sends[0].send_signature.ok_or("no signature")?;
+    let signature = fixture.state.sends[0]
+        .send_signature
+        .ok_or("no signature")?;
     fixture.state.sends[0].send_signature = Some(flip_signature(signature)?);
     assert!(fixture.state.encode().is_err());
 
@@ -1525,7 +1617,10 @@ fn session_absence_requires_session_records_absent() -> Result<(), Box<dyn Error
                 fixture.state.sends.clear();
             }
         }
-        assert!(fixture.state.encode().is_err(), "{case} record without a session");
+        assert!(
+            fixture.state.encode().is_err(),
+            "{case} record without a session"
+        );
     }
     Ok(())
 }
@@ -1570,28 +1665,38 @@ fn outstanding_budget_and_mode_consistency() -> Result<(), Box<dyn Error>> {
     set_water(&mut fixture, 33, 0, SessionMode::ReceiptLocked)?;
     assert!(fixture.state.encode().is_err());
 
-    // Exactly 32: ReceiptLocked only.
+    // Exactly 32: ReceiptLocked only among the BUDGET modes;
+    // RekeyRequired dominates and is accepted (covered explicitly by
+    // `rekey_required_dominates_budget_at_any_outstanding`).
     for (mode, valid) in [
         (SessionMode::Ready, false),
         (SessionMode::ControlOnly, false),
         (SessionMode::ReceiptLocked, true),
-        (SessionMode::RekeyRequired, false),
+        (SessionMode::RekeyRequired, true),
     ] {
         let mut fixture = populated_fixture()?;
         set_water(&mut fixture, 32, 0, mode)?;
-        assert_eq!(fixture.state.encode().is_ok(), valid, "outstanding 32, {mode:?}");
+        assert_eq!(
+            fixture.state.encode().is_ok(),
+            valid,
+            "outstanding 32, {mode:?}"
+        );
     }
 
-    // 24..=31: ControlOnly or ReceiptLocked.
+    // 24..=31: ControlOnly or ReceiptLocked; RekeyRequired dominates.
     for (mode, valid) in [
         (SessionMode::Ready, false),
         (SessionMode::ControlOnly, true),
         (SessionMode::ReceiptLocked, true),
-        (SessionMode::RekeyRequired, false),
+        (SessionMode::RekeyRequired, true),
     ] {
         let mut fixture = populated_fixture()?;
         set_water(&mut fixture, 24, 0, mode)?;
-        assert_eq!(fixture.state.encode().is_ok(), valid, "outstanding 24, {mode:?}");
+        assert_eq!(
+            fixture.state.encode().is_ok(),
+            valid,
+            "outstanding 24, {mode:?}"
+        );
     }
 
     // 0..=23 outstanding: any mode, and each round-trips.
@@ -1702,8 +1807,9 @@ fn inbound_transcript_otk_must_match_session_keys() -> Result<(), Box<dyn Error>
         .ok_or("no foreign key")?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.transcript.one_time_key = foreign;
-    active.transcript.signature =
-        fixture.our_account.sign(prekey_signing_bytes(&active.transcript));
+    active.transcript.signature = fixture
+        .our_account
+        .sign(prekey_signing_bytes(&active.transcript));
     assert!(fixture.state.encode().is_err());
     Ok(())
 }
@@ -1738,21 +1844,30 @@ fn inbound_consumed_otk_must_not_remain_in_account() -> Result<(), Box<dyn Error
     let mut session = creation.session;
 
     // Sanity: the stale snapshot still holds the consumed key.
-    let stale_account =
-        Account::from_pickle(serde_json::from_slice::<vodozemac::olm::AccountPickle>(
-            &stale_pickle,
-        )?);
+    let stale_account = Account::from_pickle(serde_json::from_slice::<
+        vodozemac::olm::AccountPickle,
+    >(&stale_pickle)?);
     assert!(stale_account.contains_one_time_key(consumed_otk));
 
     let (peer_bundle, _) = make_peer_bundle(&mut peer_account)?;
     let peer_send_keypair = Ed25519Keypair::new();
     let epoch_id = epoch_of(session.session_keys());
-    let sends =
-        make_send_records(&mut session, &peer_send_keypair, peer_mailbox.queue_id(), epoch_id)?;
+    let sends = make_send_records(
+        &mut session,
+        &peer_send_keypair,
+        peer_mailbox.queue_id(),
+        epoch_id,
+    )?;
     let inbound_id = sends.first().ok_or("no sends")?.message_id;
     let (inbound, ack, dedup) = make_inbound_side(our_mailbox.queue_id(), epoch_id, inbound_id)?;
     let receipt = signed_receipt(conversation_id, epoch_id, &our_account, &peer_account, 1);
-    let active_session = make_active_session(Role::Inbound, &session, &transcript, receipt, conversation_id)?;
+    let active_session = make_active_session(
+        Role::Inbound,
+        &session,
+        &transcript,
+        receipt,
+        conversation_id,
+    )?;
 
     let mut state = assemble_state(
         &our_account,
@@ -1793,8 +1908,9 @@ fn inbound_transcript_signature_must_verify_with_own_identity() -> Result<(), Bo
     let mut fixture = inbound_fixture()?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.transcript.signing_identity = fixture.peer_account.ed25519_key();
-    active.transcript.signature =
-        fixture.peer_account.sign(prekey_signing_bytes(&active.transcript));
+    active.transcript.signature = fixture
+        .peer_account
+        .sign(prekey_signing_bytes(&active.transcript));
     assert!(fixture.state.encode().is_err());
     Ok(())
 }
@@ -1826,8 +1942,9 @@ fn session_identity_must_match_peer_binding_curve_for_either_role() -> Result<()
         let impostor = Account::new();
         let binding = fixture.state.peer_binding.as_mut().ok_or("no binding")?;
         binding.bundle.curve_identity = impostor.curve25519_key();
-        binding.bundle.signature =
-            fixture.peer_account.sign(prekey_signing_bytes(&binding.bundle));
+        binding.bundle.signature = fixture
+            .peer_account
+            .sign(prekey_signing_bytes(&binding.bundle));
         assert!(
             fixture.state.encode().is_err(),
             "impostor binding curve accepted (inbound={use_inbound})"
@@ -1853,7 +1970,10 @@ fn receive_side_state_requires_a_receiving_ratchet() -> Result<(), Box<dyn Error
     let mut fixture = send_only_fixture()?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.received_above_high_water = vec![1];
-    assert!(fixture.state.encode().is_err(), "(b) fabricated received set");
+    assert!(
+        fixture.state.encode().is_err(),
+        "(b) fabricated received set"
+    );
 
     // (c) One inbound record on a send-only ratchet (dedup record present
     // and consistent; only the ratchet provenance can fail).
@@ -1862,7 +1982,10 @@ fn receive_side_state_requires_a_receiving_ratchet() -> Result<(), Box<dyn Error
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
     active.received_above_high_water.clear();
-    assert!(fixture.state.encode().is_err(), "(c) fabricated inbound record");
+    assert!(
+        fixture.state.encode().is_err(),
+        "(c) fabricated inbound record"
+    );
 
     // (d) One ACK intent on a send-only ratchet (matching dedup present).
     let mut fixture = send_only_fixture()?;
@@ -1876,12 +1999,17 @@ fn receive_side_state_requires_a_receiving_ratchet() -> Result<(), Box<dyn Error
 
 /// Finding 1, converse: a receipt is send-side. A receipt-only session
 /// (never received, receipt present, all receive-side state empty) must
-/// still validate.
+/// still validate. Review v3: its dedup records are retired-epoch (any
+/// epoch ≠ the session's), since current-epoch dedup is
+/// receive-authoritative and would require a receiving ratchet.
 #[test]
 fn receipt_only_session_validates() -> Result<(), Box<dyn Error>> {
     let mut fixture = send_only_fixture()?;
     fixture.state.inbound.clear();
     fixture.state.acks.clear();
+    for record in &mut fixture.state.dedup {
+        record.epoch_id = digest(b"retired-epoch");
+    }
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
     active.received_above_high_water.clear();
@@ -1911,14 +2039,20 @@ fn conversation_binding_does_not_depend_on_receipt() -> Result<(), Box<dyn Error
     let (start, _) = field_value_span(&encoded, 7)?;
     let mut mutated = encoded.to_vec();
     *mutated.get_mut(start).ok_or("conversation field")? ^= 0x01;
-    assert!(ClientStateV1::decode(&mutated).is_err(), "field-8 flip accepted");
+    assert!(
+        ClientStateV1::decode(&mutated).is_err(),
+        "field-8 flip accepted"
+    );
 
     // Build-time mismatch: the session record claims another conversation.
     let mut fixture = populated_fixture()?;
     set_water(&mut fixture, 3, 0, SessionMode::Ready)?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.conversation_id = ConversationId::random();
-    assert!(fixture.state.encode().is_err(), "mismatched session conversation");
+    assert!(
+        fixture.state.encode().is_err(),
+        "mismatched session conversation"
+    );
     Ok(())
 }
 
@@ -1945,10 +2079,7 @@ fn delivery_unknown_transition_uses_digest_arm_and_round_trips() -> Result<(), B
     let decoded = ClientStateV1::decode(&encoded)?;
     let reencoded = decoded.encode()?;
     assert_eq!(&encoded[..], &reencoded[..]);
-    assert!(matches!(
-        decoded.sends[0].state,
-        SendState::DeliveryUnknown
-    ));
+    assert!(matches!(decoded.sends[0].state, SendState::DeliveryUnknown));
     Ok(())
 }
 
@@ -1982,8 +2113,14 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     let mut fixture = send_only_fixture()?;
     // Clear the receive side so only the outbox is under test, and make
     // room for 32 outstanding sequences (mode ReceiptLocked at exactly 32).
+    // The dedup records are retired-epoch: current-epoch dedup is
+    // receive-authoritative (review v3 finding 1) and this ratchet only
+    // ever sent.
     fixture.state.inbound.clear();
     fixture.state.acks.clear();
+    for record in &mut fixture.state.dedup {
+        record.epoch_id = digest(b"retired-epoch");
+    }
     set_water(&mut fixture, 32, 0, SessionMode::ReceiptLocked)?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
@@ -2072,7 +2209,12 @@ fn pending_prekey_must_be_marked_published() -> Result<(), Box<dyn Error>> {
     };
     prekey.signature = account.sign(prekey_signing_bytes(&prekey.bundle()));
     assert!(account.contains_one_time_key(one_time_key));
-    assert!(account.one_time_keys().values().any(|key| *key == one_time_key));
+    assert!(
+        account
+            .one_time_keys()
+            .values()
+            .any(|key| *key == one_time_key)
+    );
 
     fixture.state.own_ed25519_identity = account.ed25519_key();
     fixture.state.own_curve_identity = account.curve25519_key();
@@ -2085,5 +2227,227 @@ fn pending_prekey_must_be_marked_published() -> Result<(), Box<dyn Error>> {
     fixture.state.account_pickle = Zeroizing::new(serde_json::to_vec(&account.pickle())?);
     let encoded = fixture.state.encode()?;
     ClientStateV1::decode(&encoded)?;
+    Ok(())
+}
+
+// --- review v3 remediation tests -------------------------------------------
+
+/// Finding 1: a dedup record for the CURRENT epoch is
+/// receive-authoritative; retired-epoch records stay exempt.
+#[test]
+fn current_epoch_dedup_requires_receive_provenance() -> Result<(), Box<dyn Error>> {
+    // Current-epoch dedup on a never-received ratchet (the receipt-only
+    // shape with a current-epoch dedup record) ⇒ reject.
+    let mut fixture = send_only_fixture()?;
+    fixture.state.inbound.clear();
+    fixture.state.acks.clear();
+    {
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active.highest_contiguous_received_seq = 0;
+        active.received_above_high_water.clear();
+    }
+    assert!(
+        fixture.state.encode().is_err(),
+        "current-epoch dedup accepted on a never-received ratchet"
+    );
+
+    // Current-epoch dedup with sequence above the contiguous high water
+    // and absent from the received set ⇒ reject, even on a genuinely
+    // receiving ratchet.
+    let mut fixture = populated_fixture()?;
+    let epoch_id = fixture
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0xEE; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence: 4,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"phantom"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Accepted,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    assert!(
+        fixture.state.encode().is_err(),
+        "uncovered current-epoch dedup accepted"
+    );
+
+    // Current-epoch dedup at or below the contiguous high water (the
+    // genuine fixture already carries one inside the received set) ⇒
+    // accept and round-trip.
+    let mut fixture = populated_fixture()?;
+    let epoch_id = fixture
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0x01; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence: 1,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"contiguous"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Acked,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+    Ok(())
+}
+
+/// Finding 2: `RekeyRequired` dominates the budget mode — accepted at any
+/// non-malformed outstanding count; more than 32 outstanding rejects in
+/// every mode.
+#[test]
+fn rekey_required_dominates_budget_at_any_outstanding() -> Result<(), Box<dyn Error>> {
+    // (last_assigned, high_water): outstanding 0, 24, 31, 32.
+    for (last_assigned, high_water) in [(3, 3), (24, 0), (31, 0), (32, 0)] {
+        let mut fixture = populated_fixture()?;
+        set_water(
+            &mut fixture,
+            last_assigned,
+            high_water,
+            SessionMode::RekeyRequired,
+        )?;
+        let encoded = fixture.state.encode()?;
+        ClientStateV1::decode(&encoded)?;
+    }
+    let mut fixture = populated_fixture()?;
+    set_water(&mut fixture, 33, 0, SessionMode::RekeyRequired)?;
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+/// Finding 3: a duplicated one-time-key secret collapses the
+/// `key_ids_by_key` index and must be rejected on both paths.
+#[test]
+fn duplicate_one_time_key_secret_rejected() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    // The fixture's account holds exactly one published one-time key:
+    // `private_keys` is `{"0":[...32 bytes...]}`. Duplicate the exact
+    // secret entry under the next key id, keeping the canonical order.
+    let marker = "\"private_keys\":{";
+    let entry_start = json.find(marker).ok_or("private_keys missing")? + marker.len();
+    let entry_end = json[entry_start..]
+        .find('}')
+        .ok_or("unterminated private_keys")?;
+    let entry_text = &json[entry_start..entry_start + entry_end];
+    let duplicate = entry_text.replacen("\"0\"", "\"1\"", 1);
+    let spliced = format!(
+        "{}{},{}{}",
+        &json[..entry_start],
+        entry_text,
+        duplicate,
+        &json[entry_start + entry_end..]
+    );
+    fixture.state.account_pickle = Zeroizing::new(spliced.clone().into_bytes());
+    // The splice stays canonical (typed re-serialization is byte-equal),
+    // so only the duplicate-secret check can be rejecting.
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(spliced.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        spliced.as_bytes(),
+        "splice broke canonical form"
+    );
+    assert!(
+        fixture.state.encode().is_err(),
+        "encode accepted duplicate secret"
+    );
+
+    // Decode path: splice the mutated pickle into the encoding of the
+    // valid state.
+    let valid = populated_fixture()?;
+    let encoded = valid.state.encode()?;
+    let bytes = splice_top(&encoded, 8, field_block(9, spliced.as_bytes())?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decode accepted duplicate secret"
+    );
+    Ok(())
+}
+
+/// Finding 3: an unpublished-map entry whose key id does not exist in
+/// `private_keys` is an orphan and must be rejected.
+#[test]
+fn unpublished_otk_with_unknown_key_id_rejected() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    // The fixture marked its keys published, so `public_keys` is `{}`.
+    let other = Account::new();
+    let public_text = serde_json::to_string(&other.curve25519_key())?;
+    let spliced = json.replacen(
+        "\"public_keys\":{}",
+        &format!("\"public_keys\":{{\"7\":{public_text}}}"),
+        1,
+    );
+    assert_ne!(spliced, json, "public_keys was not empty as expected");
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(spliced.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        spliced.as_bytes(),
+        "splice broke canonical form"
+    );
+    fixture.state.account_pickle = Zeroizing::new(spliced.into_bytes());
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+/// Finding 3: an unpublished entry whose stored public key does not match
+/// the private key's derived public is rejected.
+#[test]
+fn unpublished_otk_public_mismatch_rejected() -> Result<(), Box<dyn Error>> {
+    let mut fixture = minimal_fixture()?;
+    // An account with one UNPUBLISHED one-time key.
+    let mut account = Account::new();
+    let _created = account.generate_one_time_keys(1);
+    fixture.state.own_ed25519_identity = account.ed25519_key();
+    fixture.state.own_curve_identity = account.curve25519_key();
+    let json = String::from_utf8(serde_json::to_vec(&account.pickle())?)?;
+
+    // Swap the unpublished map's stored public for another key's.
+    let marker = "\"public_keys\":{\"0\":";
+    let start = json.find(marker).ok_or("unpublished entry missing")? + marker.len();
+    let end = json[start..].find(']').ok_or("unterminated entry")? + start;
+    let impostor_text = serde_json::to_string(&Account::new().curve25519_key())?;
+    let spliced = format!("{}{}{}", &json[..start], impostor_text, &json[end + 1..]);
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(spliced.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        spliced.as_bytes(),
+        "splice broke canonical form"
+    );
+    fixture.state.account_pickle = Zeroizing::new(spliced.into_bytes());
+    assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+/// Finding 3, positive: a genuine account with a mixed published and
+/// unpublished one-time-key set validates and round-trips.
+#[test]
+fn mixed_published_and_unpublished_otks_accepted() -> Result<(), Box<dyn Error>> {
+    let mut fixture = minimal_fixture()?;
+    let mut account = Account::new();
+    let _published = account.generate_one_time_keys(1);
+    account.mark_keys_as_published();
+    let _unpublished = account.generate_one_time_keys(1);
+    fixture.state.own_ed25519_identity = account.ed25519_key();
+    fixture.state.own_curve_identity = account.curve25519_key();
+    fixture.state.account_pickle = Zeroizing::new(serde_json::to_vec(&account.pickle())?);
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
     Ok(())
 }

@@ -154,17 +154,16 @@ impl ClientStateV1 {
 
         // 9: Account pickle, bounded canonical JSON.
         let account_pickle = object.field_bounded(9, MAX_ACCOUNT_PICKLE)?;
-        tlv::canonical_json::<vodozemac::olm::AccountPickle>(
-            account_pickle,
-            MAX_ACCOUNT_PICKLE,
-        )?;
+        tlv::canonical_json::<vodozemac::olm::AccountPickle>(account_pickle, MAX_ACCOUNT_PICKLE)?;
 
         // 10: own public identity, Ed25519 signing || Curve25519.
         let identity = tlv::fixed::<64>(object.field(10)?)?;
-        let own_ed25519_identity = Ed25519PublicKey::from_slice(&tlv::fixed::<32>(&identity[..32])?)
-            .map_err(|_| LabError::Storage)?;
-        let own_curve_identity = Curve25519PublicKey::from_slice(&tlv::fixed::<32>(&identity[32..])?)
-            .map_err(|_| LabError::Storage)?;
+        let own_ed25519_identity =
+            Ed25519PublicKey::from_slice(&tlv::fixed::<32>(&identity[..32])?)
+                .map_err(|_| LabError::Storage)?;
+        let own_curve_identity =
+            Curve25519PublicKey::from_slice(&tlv::fixed::<32>(&identity[32..])?)
+                .map_err(|_| LabError::Storage)?;
 
         // 11: own mailbox and three private keypairs (send, receive,
         // manage), each bounded canonical JSON.
@@ -192,12 +191,10 @@ impl ClientStateV1 {
             SendRecord::parse,
             |record| record.message_id,
         )?;
-        let acks = records::parse_record_array(
-            object.field(18)?,
-            MAX_ACKS,
-            AckIntent::parse,
-            |record| record.message_id,
-        )?;
+        let acks =
+            records::parse_record_array(object.field(18)?, MAX_ACKS, AckIntent::parse, |record| {
+                record.message_id
+            })?;
         let dedup = records::parse_record_array(
             object.field(19)?,
             MAX_DEDUP,
@@ -247,41 +244,47 @@ impl ClientStateV1 {
     pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
         validate::validate(self)?;
 
-        let mut fields: Vec<(u16, Vec<u8>)> = Vec::with_capacity(FIELD_COUNT);
-        fields.push((1, SCHEMA_VERSION.to_be_bytes().to_vec()));
-        fields.push((2, self.profile_id.to_vec()));
-        fields.push((3, self.key_ref.to_vec()));
-        fields.push((4, self.generation.to_be_bytes().to_vec()));
-        fields.push((5, PROTOCOL_DOMAIN.to_vec()));
-        fields.push((6, VODOZEMAC_VERSION.to_vec()));
-        fields.push((7, vec![SESSION_CONFIG_VERSION]));
-        fields.push((8, self.conversation_id.as_bytes().to_vec()));
-        fields.push((9, self.account_pickle.to_vec()));
-
+        let schema_version = SCHEMA_VERSION.to_be_bytes();
+        let generation = self.generation.to_be_bytes();
+        let session_config = [SESSION_CONFIG_VERSION];
         let mut identity = Vec::with_capacity(64);
         identity.extend_from_slice(self.own_ed25519_identity.as_bytes());
         identity.extend_from_slice(self.own_curve_identity.as_bytes());
-        fields.push((10, identity));
-        fields.push((11, self.encode_mailbox()?));
-        fields.push((12, self.registration.encode()?));
-        fields.push((13, encode_optional(self.pending_prekey.as_ref())?));
-        fields.push((14, encode_optional(self.peer_binding.as_ref())?));
-        fields.push((15, encode_optional(self.active_session.as_ref())?));
-        fields.push((
-            16,
-            records::encode_record_array(&self.inbound, MAX_INBOUND, InboundRecord::encode)?,
-        ));
-        fields.push((
-            17,
-            records::encode_record_array(&self.sends, MAX_SENDS, SendRecord::encode)?,
-        ));
-        fields.push((18, records::encode_record_array(&self.acks, MAX_ACKS, AckIntent::encode)?));
-        fields.push((
-            19,
-            records::encode_record_array(&self.dedup, MAX_DEDUP, DedupRecord::encode)?,
-        ));
+        let mailbox = self.encode_mailbox()?;
+        let registration = self.registration.encode()?;
+        let pending_prekey = encode_optional(self.pending_prekey.as_ref())?;
+        let peer_binding = encode_optional(self.peer_binding.as_ref())?;
+        let active_session = encode_optional(self.active_session.as_ref())?;
+        let inbound =
+            records::encode_record_array(&self.inbound, MAX_INBOUND, InboundRecord::encode)?;
+        let sends = records::encode_record_array(&self.sends, MAX_SENDS, SendRecord::encode)?;
+        let acks = records::encode_record_array(&self.acks, MAX_ACKS, AckIntent::encode)?;
+        let dedup = records::encode_record_array(&self.dedup, MAX_DEDUP, DedupRecord::encode)?;
 
-        let object = tlv::write_object(CLIENT_STATE_TYPE, &fields)?;
+        let object = tlv::write_object(
+            CLIENT_STATE_TYPE,
+            &[
+                (1, &schema_version as &[u8]),
+                (2, &self.profile_id),
+                (3, &self.key_ref),
+                (4, &generation),
+                (5, PROTOCOL_DOMAIN),
+                (6, VODOZEMAC_VERSION),
+                (7, &session_config),
+                (8, self.conversation_id.as_bytes()),
+                (9, &self.account_pickle[..]),
+                (10, &identity),
+                (11, &mailbox[..]),
+                (12, &registration[..]),
+                (13, &pending_prekey[..]),
+                (14, &peer_binding[..]),
+                (15, &active_session[..]),
+                (16, &inbound[..]),
+                (17, &sends[..]),
+                (18, &acks[..]),
+                (19, &dedup[..]),
+            ],
+        )?;
         let total = MAGIC.len() + object.len();
         if total > MAX_TOTAL_PLAINTEXT {
             return Err(LabError::Storage);
@@ -293,8 +296,9 @@ impl ClientStateV1 {
     }
 
     /// Field 11: queue ID followed by three length-delimited keypair JSON
-    /// documents (send, receive, manage), each bounded at 512 bytes.
-    fn encode_mailbox(&self) -> Result<Vec<u8>> {
+    /// documents (send, receive, manage), each bounded at 512 bytes. The
+    /// result is secret-bearing and zeroized on drop.
+    fn encode_mailbox(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut out = Vec::new();
         out.extend_from_slice(self.mailbox_queue_id.as_bytes());
         for json in [
@@ -306,11 +310,16 @@ impl ClientStateV1 {
             tlv::write_u32(&mut out, length);
             out.extend_from_slice(json);
         }
-        Ok(out)
+        Ok(Zeroizing::new(out))
     }
 }
 
-type MailboxMaterial = (QueueId, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+type MailboxMaterial = (
+    QueueId,
+    Zeroizing<Vec<u8>>,
+    Zeroizing<Vec<u8>>,
+    Zeroizing<Vec<u8>>,
+);
 
 fn parse_mailbox(bytes: &[u8]) -> Result<MailboxMaterial> {
     let mut reader = Reader::new(bytes);
@@ -338,12 +347,12 @@ fn parse_optional<T>(bytes: &[u8], parse: impl Fn(&[u8]) -> Result<T>) -> Result
     }
 }
 
-fn encode_optional<T>(record: Option<&T>) -> Result<Vec<u8>>
+fn encode_optional<T>(record: Option<&T>) -> Result<Zeroizing<Vec<u8>>>
 where
     T: Encodable,
 {
     match record {
-        None => Ok(Vec::new()),
+        None => Ok(Zeroizing::new(Vec::new())),
         Some(record) => record.encode_record(),
     }
 }
@@ -351,23 +360,23 @@ where
 /// Local trait so `encode_optional` can stay generic over the record
 /// types without exposing their `encode` methods under one name.
 trait Encodable {
-    fn encode_record(&self) -> Result<Vec<u8>>;
+    fn encode_record(&self) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 impl Encodable for PendingPreKey {
-    fn encode_record(&self) -> Result<Vec<u8>> {
+    fn encode_record(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.encode()
     }
 }
 
 impl Encodable for PeerBinding {
-    fn encode_record(&self) -> Result<Vec<u8>> {
+    fn encode_record(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.encode()
     }
 }
 
 impl Encodable for ActiveSession {
-    fn encode_record(&self) -> Result<Vec<u8>> {
+    fn encode_record(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.encode()
     }
 }

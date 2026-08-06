@@ -68,8 +68,11 @@ fn consumed_one_time_key_is_no_longer_found() -> Result<(), Box<dyn Error>> {
         OlmMessage::Normal(_) => return Err("first message must be a pre-key message".into()),
     };
 
-    let result =
-        bob.create_inbound_session(SessionConfig::version_1(), alice.curve25519_key(), &pre_key_message)?;
+    let result = bob.create_inbound_session(
+        SessionConfig::version_1(),
+        alice.curve25519_key(),
+        &pre_key_message,
+    )?;
     assert_eq!(result.plaintext, plaintext);
 
     // The consumed one-time key must be gone; an unused one must remain.
@@ -86,8 +89,8 @@ fn consumed_one_time_key_is_no_longer_found() -> Result<(), Box<dyn Error>> {
 /// membership check reports `false` while a private copy is still stored.
 /// Membership must instead agree with the authoritative private-key store.
 #[test]
-fn duplicate_secret_pickle_membership_stays_consistent_with_held_keys(
-) -> Result<(), Box<dyn Error>> {
+fn duplicate_secret_pickle_membership_stays_consistent_with_held_keys() -> Result<(), Box<dyn Error>>
+{
     use vodozemac::olm::AccountPickle;
 
     let mut account = Account::new();
@@ -97,13 +100,16 @@ fn duplicate_secret_pickle_membership_stays_consistent_with_held_keys(
     account.mark_keys_as_published();
 
     // Duplicate the first private key over the second key ID in the pickle.
-    let mut json: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&account.pickle())?)?;
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&serde_json::to_vec(&account.pickle())?)?;
     let private_keys = json
         .pointer_mut("/one_time_keys/private_keys")
         .and_then(serde_json::Value::as_object_mut)
         .ok_or_else(|| String::from("account pickle JSON shape changed"))?;
-    let entries: Vec<(String, serde_json::Value)> =
-        private_keys.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let entries: Vec<(String, serde_json::Value)> = private_keys
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let [(_, first_secret), (second_id, _)] = entries.as_slice() else {
         return Err("expected exactly two one-time keys".into());
     };

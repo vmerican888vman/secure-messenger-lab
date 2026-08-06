@@ -32,8 +32,13 @@
 //! present; receipts are always verified against the peer binding's pinned
 //! identity, never the transcript's.
 
+use std::collections::BTreeMap;
+
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
-use vodozemac::{Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
+use vodozemac::{
+    Curve25519PublicKey, Curve25519SecretKey, Ed25519Keypair, Ed25519PublicKey, Ed25519Signature,
+    KeyId,
+};
 use zeroize::Zeroizing;
 
 use super::records::{
@@ -102,12 +107,9 @@ pub(super) fn receipt_signing_bytes(receipt: &HighWaterReceipt) -> Vec<u8> {
     )
 }
 
-fn verify(
-    key: Ed25519PublicKey,
-    message: &[u8],
-    signature: &Ed25519Signature,
-) -> Result<()> {
-    key.verify(message, signature).map_err(|_| LabError::Storage)
+fn verify(key: Ed25519PublicKey, message: &[u8], signature: &Ed25519Signature) -> Result<()> {
+    key.verify(message, signature)
+        .map_err(|_| LabError::Storage)
 }
 
 pub(super) fn validate(state: &ClientStateV1) -> Result<()> {
@@ -179,11 +181,7 @@ fn check_structure(state: &ClientStateV1) -> Result<()> {
     Ok(())
 }
 
-fn check_sorted<T>(
-    items: &[T],
-    bound: usize,
-    id_of: impl Fn(&T) -> MessageId,
-) -> Result<()> {
+fn check_sorted<T>(items: &[T], bound: usize, id_of: impl Fn(&T) -> MessageId) -> Result<()> {
     if items.len() > bound {
         return Err(LabError::Storage);
     }
@@ -195,13 +193,15 @@ fn check_sorted<T>(
     Ok(())
 }
 
-/// Canonical `Account` pickle, re-pickle byte equality, and the stored
-/// own public identity against the reconstructed account.
+/// Canonical `Account` pickle, re-pickle byte equality, the stored own
+/// public identity against the reconstructed account, and the one-time-key
+/// store consistency (review v3 finding 3).
 fn check_account(state: &ClientStateV1) -> Result<Account> {
     let pickle: AccountPickle = canonical_json(&state.account_pickle, MAX_ACCOUNT_PICKLE)?;
     let account = Account::from_pickle(pickle);
-    let reencoded = serde_json::to_vec(&account.pickle()).map_err(|_| LabError::Storage)?;
-    if reencoded != state.account_pickle[..] {
+    let reencoded =
+        Zeroizing::new(serde_json::to_vec(&account.pickle()).map_err(|_| LabError::Storage)?);
+    if reencoded[..] != state.account_pickle[..] {
         return Err(LabError::Storage);
     }
     if account.ed25519_key() != state.own_ed25519_identity
@@ -209,7 +209,55 @@ fn check_account(state: &ClientStateV1) -> Result<Account> {
     {
         return Err(LabError::Storage);
     }
+    check_one_time_key_consistency(&state.account_pickle)?;
     Ok(account)
+}
+
+/// One-time-key store consistency, checked against the already-canonical
+/// account pickle bytes (review v3 finding 3; vodozemac's pickle field
+/// types are private, so the JSON is navigated directly):
+///
+/// - the public keys derived from all `private_keys` entries must be
+///   unique — a duplicated secret would silently collapse the
+///   `key_ids_by_key` index;
+/// - every `public_keys` (unpublished) entry's key id must exist in
+///   `private_keys` and its stored public key must equal the derived
+///   public for that id. The reverse need not hold: published keys are
+///   absent from the unpublished map by design.
+fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_slice(canonical_pickle).map_err(|_| LabError::Storage)?;
+    let one_time_keys = value.get("one_time_keys").ok_or(LabError::Storage)?;
+    let private_keys: BTreeMap<KeyId, Curve25519SecretKey> = serde_json::from_value(
+        one_time_keys
+            .get("private_keys")
+            .ok_or(LabError::Storage)?
+            .clone(),
+    )
+    .map_err(|_| LabError::Storage)?;
+    let unpublished: BTreeMap<KeyId, Curve25519PublicKey> = serde_json::from_value(
+        one_time_keys
+            .get("public_keys")
+            .ok_or(LabError::Storage)?
+            .clone(),
+    )
+    .map_err(|_| LabError::Storage)?;
+
+    let mut derived_publics: Vec<Curve25519PublicKey> = Vec::with_capacity(private_keys.len());
+    for secret in private_keys.values() {
+        let public = Curve25519PublicKey::from(secret);
+        if derived_publics.contains(&public) {
+            return Err(LabError::Storage);
+        }
+        derived_publics.push(public);
+    }
+    for (key_id, stored_public) in &unpublished {
+        let secret = private_keys.get(key_id).ok_or(LabError::Storage)?;
+        if &Curve25519PublicKey::from(secret) != stored_public {
+            return Err(LabError::Storage);
+        }
+    }
+    Ok(())
 }
 
 /// The three reconstructed capability public keys must match the
@@ -318,33 +366,43 @@ fn check_records(state: &ClientStateV1, account: &Account) -> Result<()> {
         // Session absence requires all session-dependent records absent.
         // Dedup records are not session-dependent: section 4 retains them
         // through their safety window across rekey, including while no
-        // session is installed.
+        // session is installed. With no active session there is no current
+        // epoch, so every dedup record is retired-exempt (review v3
+        // finding 1).
         if !state.inbound.is_empty() || !state.sends.is_empty() || !state.acks.is_empty() {
             return Err(LabError::Storage);
         }
-        check_dedup(state)?;
+        check_dedup(state, None)?;
         return Ok(());
     };
-    check_active_session(state, account, active)?;
+    let session = restore_session(active)?;
+    check_active_session(state, account, active, &session)?;
     check_inbound(state, active)?;
     check_sends(state, active)?;
     check_acks(state, active)?;
-    check_dedup(state)?;
+    check_dedup(state, Some((active, &session)))?;
     Ok(())
+}
+
+/// Restore the session from its canonical pickle and require the
+/// re-pickle to be byte-identical.
+fn restore_session(active: &ActiveSession) -> Result<Session> {
+    let pickle: SessionPickle = canonical_json(&active.session_pickle, MAX_SESSION_PICKLE)?;
+    let session = Session::from_pickle(pickle);
+    let reencoded =
+        Zeroizing::new(serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?);
+    if reencoded[..] != active.session_pickle[..] {
+        return Err(LabError::Storage);
+    }
+    Ok(session)
 }
 
 fn check_active_session(
     state: &ClientStateV1,
     account: &Account,
     active: &ActiveSession,
+    session: &Session,
 ) -> Result<()> {
-    // Canonical session pickle; re-pickle byte equality; config version 1.
-    let pickle: SessionPickle = canonical_json(&active.session_pickle, MAX_SESSION_PICKLE)?;
-    let session = Session::from_pickle(pickle);
-    let reencoded = serde_json::to_vec(&session.pickle()).map_err(|_| LabError::Storage)?;
-    if reencoded != active.session_pickle[..] {
-        return Err(LabError::Storage);
-    }
     if session.session_config().version() != super::SESSION_CONFIG_VERSION {
         return Err(LabError::Storage);
     }
@@ -459,6 +517,15 @@ fn check_active_session(
 }
 
 /// Section 4 high-water invariants and mode consistency.
+///
+/// Review v3 finding 2 (recorded amendment): the §4 budget matrix
+/// constrains the three BUDGET modes only — `Ready` below 24 outstanding,
+/// `ControlOnly` at 24-31, `ReceiptLocked` at 32, more than 32 malformed.
+/// `RekeyRequired` is orthogonal and DOMINATES the budget mode: an
+/// authenticated current-epoch gap failure moves the session to
+/// `RekeyRequired` at ANY outstanding count in 0..=32 (it exits only via
+/// the §4 user-confirmed rebootstrap), so validation accepts
+/// `RekeyRequired` for every non-malformed outstanding count.
 fn check_high_water(active: &ActiveSession) -> Result<()> {
     if active.peer_contiguous_high_water > active.last_assigned_send_seq {
         return Err(LabError::Storage);
@@ -467,13 +534,18 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     if outstanding > MAX_OUTSTANDING {
         return Err(LabError::Storage);
     }
-    if outstanding == MAX_OUTSTANDING && active.mode != SessionMode::ReceiptLocked {
-        return Err(LabError::Storage);
-    }
-    if (CONTROL_ONLY_THRESHOLD..MAX_OUTSTANDING).contains(&outstanding)
-        && !matches!(active.mode, SessionMode::ControlOnly | SessionMode::ReceiptLocked)
-    {
-        return Err(LabError::Storage);
+    if active.mode != SessionMode::RekeyRequired {
+        if outstanding == MAX_OUTSTANDING && active.mode != SessionMode::ReceiptLocked {
+            return Err(LabError::Storage);
+        }
+        if (CONTROL_ONLY_THRESHOLD..MAX_OUTSTANDING).contains(&outstanding)
+            && !matches!(
+                active.mode,
+                SessionMode::ControlOnly | SessionMode::ReceiptLocked
+            )
+        {
+            return Err(LabError::Storage);
+        }
     }
     // Every out-of-order received sequence must sit strictly above the
     // implied contiguous high water; an element exactly at `hcr + 1` would
@@ -571,11 +643,9 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
             // states hold only digest and expiry; nothing remains to
             // verify.)
             let binding = state.peer_binding.as_ref().ok_or(LabError::Storage)?;
-            let (Some(queue_id), Some(packet), Some(signature)) = (
-                record.queue_id,
-                &record.packet,
-                &record.send_signature,
-            ) else {
+            let (Some(queue_id), Some(packet), Some(signature)) =
+                (record.queue_id, &record.packet, &record.send_signature)
+            else {
                 return Err(LabError::Storage);
             };
             if queue_id != binding.queue_id {
@@ -583,7 +653,12 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
             }
             verify(
                 binding.send_public_key,
-                &send_signing_bytes(queue_id, record.message_id, &packet.digest(), record.expires_at),
+                &send_signing_bytes(
+                    queue_id,
+                    record.message_id,
+                    &packet.digest(),
+                    record.expires_at,
+                ),
                 signature,
             )?;
         }
@@ -618,10 +693,26 @@ fn check_acks(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
     Ok(())
 }
 
-fn check_dedup(state: &ClientStateV1) -> Result<()> {
+fn check_dedup(state: &ClientStateV1, current: Option<(&ActiveSession, &Session)>) -> Result<()> {
     for record in &state.dedup {
         if record.queue_id != state.mailbox_queue_id || record.sequence == 0 {
             return Err(LabError::Storage);
+        }
+        // Review v3 finding 1: a dedup record for the CURRENT epoch is
+        // receive-authoritative — the restored ratchet must actually have
+        // received, and the record's sequence must be covered by the
+        // contiguous high water or sit in the out-of-order received set.
+        // Dedup records for retired epochs stay exempt (section 4
+        // retention across rekey); with no active session there is no
+        // current epoch and every record is retired-exempt.
+        if let Some((active, session)) = current {
+            if record.epoch_id == active.epoch_id {
+                let covered = record.sequence <= active.highest_contiguous_received_seq
+                    || active.received_above_high_water.contains(&record.sequence);
+                if !session.has_received_message() || !covered {
+                    return Err(LabError::Storage);
+                }
+            }
         }
     }
     Ok(())

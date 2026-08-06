@@ -23,6 +23,7 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 use crate::{LabError, Result};
 
@@ -177,7 +178,9 @@ pub(crate) fn write_field(out: &mut Vec<u8>, id: u16, value: &[u8]) -> Result<()
 
 /// Assemble a complete object from `(field_id, value)` pairs, which the
 /// caller must supply in strictly ascending ID order (the schema order).
-pub(crate) fn write_object(object_type: u16, fields: &[(u16, Vec<u8>)]) -> Result<Vec<u8>> {
+/// Values are borrowed: no intermediate copies of secret field material
+/// are made here.
+pub(crate) fn write_object(object_type: u16, fields: &[(u16, &[u8])]) -> Result<Vec<u8>> {
     let field_count = u16::try_from(fields.len()).map_err(|_| LabError::Storage)?;
     if field_count == 0 {
         return Err(LabError::Storage);
@@ -197,7 +200,9 @@ pub(crate) fn write_object(object_type: u16, fields: &[(u16, Vec<u8>)]) -> Resul
 /// against the compact reserialization rejects whitespace variants, unknown
 /// fields, missing or defaulted fields, duplicate keys (serde's derive
 /// rejects them first), serde aliases, non-canonical member order and
-/// trailing bytes.
+/// trailing bytes. The reserialized buffer is secret-bearing (pickles and
+/// keypairs contain private keys) and is zeroized on drop; `serde_json`'s
+/// internal buffers are dependency-owned and out of reach.
 pub(crate) fn canonical_json<T>(bytes: &[u8], bound: usize) -> Result<T>
 where
     T: DeserializeOwned + Serialize,
@@ -208,8 +213,8 @@ where
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = T::deserialize(&mut deserializer).map_err(|_| LabError::Storage)?;
     deserializer.end().map_err(|_| LabError::Storage)?;
-    let reserialized = serde_json::to_vec(&value).map_err(|_| LabError::Storage)?;
-    if reserialized != bytes {
+    let reserialized = Zeroizing::new(serde_json::to_vec(&value).map_err(|_| LabError::Storage)?);
+    if reserialized[..] != *bytes {
         return Err(LabError::Storage);
     }
     Ok(value)

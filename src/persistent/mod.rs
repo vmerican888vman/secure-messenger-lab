@@ -447,9 +447,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         pinned_signing_identity
             .verify(&prekey_signing_bytes(&bundle), &offer.signature)
             .map_err(|_| LabError::PeerVerificationFailed)?;
-        let send_keypair_json = Zeroizing::new(
-            serde_json::to_vec(&peer_send_keypair).map_err(|_| LabError::Storage)?,
-        );
+        let send_keypair_json =
+            Zeroizing::new(serde_json::to_vec(&peer_send_keypair).map_err(|_| LabError::Storage)?);
         let send_public_key = peer_send_keypair.public_key();
         self.mutate(|candidate, _keypairs| {
             if candidate.state.peer_binding.is_some() {
@@ -536,8 +535,12 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     ) -> Result<DurableAction<MailboxRegistration>> {
         self.mutate(|candidate, keypairs| {
             let nonce = Nonce::random();
-            let (record, request) =
-                mint_registration(keypairs, candidate.state.mailbox_queue_id, nonce, valid_until);
+            let (record, request) = mint_registration(
+                keypairs,
+                candidate.state.mailbox_queue_id,
+                nonce,
+                valid_until,
+            );
             candidate.state.registration = record;
             Ok(DurableAction {
                 token: *nonce.as_bytes(),
@@ -592,12 +595,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 RegistrationOutcome::Confirmed => record.valid_until,
                 RegistrationOutcome::Failed => 0,
             };
-            let (successor, _request) = mint_registration(
-                keypairs,
-                record.queue_id,
-                Nonce::random(),
-                valid_until,
-            );
+            let (successor, _request) =
+                mint_registration(keypairs, record.queue_id, Nonce::random(), valid_until);
             candidate.state.registration = successor;
             Ok(())
         })
@@ -653,7 +652,10 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         // serialization and aggregate bounds.
         let outcome = operation(&mut candidate, &self.keypairs).and_then(|artifact| {
             sync_pickles(&mut candidate)?;
-            candidate.state.encode().map(|snapshot| (artifact, snapshot))
+            candidate
+                .state
+                .encode()
+                .map(|snapshot| (artifact, snapshot))
         });
         let (artifact, snapshot) = match outcome {
             Ok(outcome) => outcome,
