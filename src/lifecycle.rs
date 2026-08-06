@@ -313,7 +313,14 @@ impl<P: StateKeyProtector + Clone> LifecycleManager<P> {
         // Reopen and fully authenticate, parse and validate using the
         // provisional handle. A transient boundary failure here leaves the
         // row Provisional; recover() completes the promotion.
-        let reopened_dir = PrivateStoreDir::open(&store_path, StoreKind::ClientState)?;
+        //
+        // The reopen immediately follows a drop, so on macOS the strictly
+        // non-blocking lifecycle lock can transiently report contention
+        // (vnode release lag, documented in the boundary's module docs —
+        // fail-closed and caller-retryable). This manager IS the caller,
+        // so it retries briefly; a persistent failure still fails closed
+        // and leaves the row Provisional.
+        let reopened_dir = open_dir_with_grace(&store_path)?;
         let store = ClientStateStore::open(reopened_dir, self.platform.clone())?;
         if store.generation()? != 1 {
             return Err(LabError::Storage);
@@ -832,6 +839,20 @@ fn store_path_of(dir: &PrivateStoreDir) -> Result<PathBuf> {
         .parent()
         .map(std::path::Path::to_path_buf)
         .ok_or(LabError::Storage)
+}
+
+/// Bounded caller-side retry of a `ClientState` directory open after an
+/// immediate drop-then-reopen; see `create_profile` for why this exists.
+/// Roughly one second in 10 ms steps; the final attempt's error is the
+/// returned one.
+fn open_dir_with_grace(path: &std::path::Path) -> Result<PrivateStoreDir> {
+    for _ in 0..100 {
+        match PrivateStoreDir::open(path, StoreKind::ClientState) {
+            Ok(dir) => return Ok(dir),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    PrivateStoreDir::open(path, StoreKind::ClientState)
 }
 
 fn activate(connection: &Connection) -> Result<()> {
