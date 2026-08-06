@@ -124,8 +124,10 @@ fn registration_signing_bytes(request: &MailboxRegistration) -> Vec<u8> {
     )
 }
 
-/// A genuine peer contact offer plus the peer's send capability material.
+/// A genuine peer contact offer plus the peer's send capability material
+/// and the account behind them (kept for decrypting staged packets).
 struct PeerMaterial {
+    account: Account,
     offer: RedactedContactOffer,
     queue_id: QueueId,
     send_keypair: Ed25519Keypair,
@@ -153,6 +155,7 @@ fn peer_material(valid_until: u64) -> Result<PeerMaterial, Box<dyn Error>> {
         valid_until,
     ));
     Ok(PeerMaterial {
+        account: peer_account,
         offer,
         queue_id: QueueId::random(),
         send_keypair: Ed25519Keypair::new(),
@@ -202,10 +205,10 @@ fn open_client(temp: &TempDir) -> Result<PersistentClient<TestProtector>, Box<dy
 }
 
 /// Commit a verified contact and establish the outbound session with a
-/// genuine peer bundle.
+/// genuine peer bundle; returns the peer material for packet inspection.
 fn commit_contact_and_establish(
     client: &mut PersistentClient<TestProtector>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<PeerMaterial, Box<dyn Error>> {
     let peer = peer_material(NOW + 300)?;
     client.commit_verified_contact(
         peer.offer.signing_identity,
@@ -215,7 +218,7 @@ fn commit_contact_and_establish(
         NOW,
     )?;
     client.establish_outbound_session(NOW)?;
-    Ok(())
+    Ok(peer)
 }
 
 #[test]
@@ -619,4 +622,313 @@ fn persistent_client_is_neither_sync_nor_clone() {
     impl<T: ?Sized + Sync> AmbiguousIfImpl<fn()> for T {}
     impl<T: Clone> AmbiguousIfImpl<fn(fn())> for T {}
     let _ = <PersistentClient<TestProtector> as AmbiguousIfImpl<_>>::check;
+}
+
+// --- D2a: outbound send path ------------------------------------------------
+
+use secure_messenger_lab::{DurableAction, SendOutcome};
+use vodozemac::olm::{OlmMessage, SessionConfig};
+
+fn send_signing_bytes(
+    queue_id: QueueId,
+    message_id: secure_messenger_lab::MessageId,
+    packet_digest: &[u8; 32],
+    expires_at: u64,
+) -> Vec<u8> {
+    canonical(
+        b"send",
+        &[
+            queue_id.as_bytes(),
+            message_id.as_bytes(),
+            packet_digest,
+            &expires_at.to_be_bytes(),
+        ],
+    )
+}
+
+/// A client with a committed contact and an established outbound session,
+/// plus the peer material for packet inspection.
+fn send_ready_client(
+    temp: &TempDir,
+) -> Result<(PersistentClient<TestProtector>, PeerMaterial), Box<dyn Error>> {
+    let mut client = create_client(temp)?;
+    let peer = commit_contact_and_establish(&mut client)?;
+    Ok((client, peer))
+}
+
+fn assert_same_request(
+    action: &DurableAction<secure_messenger_lab::capability::SendRequest>,
+    request: &secure_messenger_lab::capability::SendRequest,
+) {
+    assert_eq!(action.request.queue_id, request.queue_id);
+    assert_eq!(action.request.message_id, request.message_id);
+    assert_eq!(action.request.packet.as_bytes(), request.packet.as_bytes());
+    assert_eq!(action.request.expires_at, request.expires_at);
+    assert_eq!(
+        action.request.signature.to_bytes(),
+        request.signature.to_bytes()
+    );
+}
+
+#[test]
+fn send_round_trip_and_crash_recovery() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, mut peer) = send_ready_client(&temp)?;
+    let identity = client.public_identity()?;
+
+    let action = client.stage_send("hello d2a", NOW, NOW + 3_600, NOW)?;
+    assert_eq!(action.request.queue_id, peer.queue_id);
+    // The exact request verifies against the peer's send capability.
+    peer.send_keypair
+        .public_key()
+        .verify(
+            &send_signing_bytes(
+                action.request.queue_id,
+                action.request.message_id,
+                &action.request.packet.digest(),
+                action.request.expires_at,
+            ),
+            &action.request.signature,
+        )
+        .map_err(|_| "send signature did not verify")?;
+    // The peer really decrypts the first (pre-key) packet; the payload is
+    // a v2 Application with the durable epoch/sequence/message ID.
+    let olm_message: OlmMessage = serde_json::from_slice(action.request.packet.as_bytes())?;
+    let OlmMessage::PreKey(pre_key) = olm_message else {
+        return Err("first staged packet must be a pre-key message".into());
+    };
+    let creation = peer.account.create_inbound_session(
+        SessionConfig::version_1(),
+        identity.curve25519,
+        &pre_key,
+    )?;
+    let payload: serde_json::Value = serde_json::from_slice(&creation.plaintext)?;
+    assert_eq!(payload["version"], 2);
+    assert_eq!(payload["kind"], 1);
+    assert_eq!(payload["body"], "hello d2a");
+    assert_eq!(payload["send_seq"], 1);
+    assert_eq!(
+        payload["message_id"],
+        serde_json::to_value(action.request.message_id)?,
+    );
+
+    // Crash recovery: the identical durable request is reconstructible.
+    drop(client);
+    let mut client = open_client(&temp)?;
+    let pending = client.pending_send_actions()?;
+    assert_eq!(pending.len(), 1);
+    let recovered = pending.first().ok_or("no pending action")?;
+    assert_eq!(recovered.token, action.token);
+    assert_same_request(recovered, &action.request);
+
+    client.record_send_result(&action, SendOutcome::Stored)?;
+    assert!(client.pending_send_actions()?.is_empty());
+
+    drop(client);
+    let client = open_client(&temp)?;
+    assert!(client.pending_send_actions()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn send_token_discipline() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    let action_a = client.stage_send("first", NOW, NOW + 3_600, NOW)?;
+    let action_b = client.stage_send("second", NOW, NOW + 3_600, NOW)?;
+
+    // Token matches nothing.
+    let wrong_token = DurableAction {
+        token: [0xAB; 16],
+        request: action_a.request.clone(),
+    };
+    assert!(
+        client
+            .record_send_result(&wrong_token, SendOutcome::Stored)
+            .is_err()
+    );
+    // Token right, request wrong.
+    let cross = DurableAction {
+        token: action_a.token,
+        request: action_b.request.clone(),
+    };
+    assert!(
+        client
+            .record_send_result(&cross, SendOutcome::Stored)
+            .is_err()
+    );
+    // Request right, token wrong.
+    let cross = DurableAction {
+        token: action_b.token,
+        request: action_a.request.clone(),
+    };
+    assert!(
+        client
+            .record_send_result(&cross, SendOutcome::Stored)
+            .is_err()
+    );
+    // Both still consumable (no mutation happened).
+    client.record_send_result(&action_a, SendOutcome::Stored)?;
+    // Replay rejects (no longer Pending).
+    assert!(
+        client
+            .record_send_result(&action_a, SendOutcome::Stored)
+            .is_err()
+    );
+    // A Duplicate outcome lands in the digest arm too.
+    client.record_send_result(&action_b, SendOutcome::Duplicate)?;
+    Ok(())
+}
+
+#[test]
+fn send_budget_and_mode_boundaries() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    // 24 application sends are allowed; the 25th hits ControlOnly and
+    // application staging is blocked.
+    for index in 0..24 {
+        client
+            .stage_send(&format!("message-{index}"), NOW, NOW + 3_600, NOW)
+            .map_err(|error| format!("send {index} failed: {error}"))?;
+    }
+    assert!(client.stage_send("blocked", NOW, NOW + 3_600, NOW).is_err());
+    // The mode persists across reopen.
+    drop(client);
+    let mut client = open_client(&temp)?;
+    assert_eq!(client.pending_send_actions()?.len(), 24);
+    assert!(client.stage_send("blocked", NOW, NOW + 3_600, NOW).is_err());
+    Ok(())
+}
+
+#[test]
+fn send_expiry_sweep() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    client.stage_send("short-lived", NOW, NOW + 10, NOW)?;
+    // The next send-path mutator at a later clock sweeps the expired
+    // record to Expired.
+    let action = client.stage_send("current", NOW + 20, NOW + 3_600, NOW + 20)?;
+    let pending = client.pending_send_actions()?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.first().ok_or("no pending")?.token, action.token);
+    // The swept record stays swept across reopen.
+    drop(client);
+    let client = open_client(&temp)?;
+    let pending = client.pending_send_actions()?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.first().ok_or("no pending")?.token, action.token);
+    Ok(())
+}
+
+#[test]
+fn delivery_unknown_flow() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    let action = client.stage_send("uncertain", NOW, NOW + 3_600, NOW)?;
+    client.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
+
+    let unknowns = client.delivery_unknowns()?;
+    assert_eq!(unknowns.len(), 1);
+    let view = *unknowns.first().ok_or("no delivery unknown")?;
+    assert_eq!(view.message_id, action.request.message_id);
+    assert_eq!(view.packet_digest, action.request.packet.digest());
+    assert_eq!(view.expires_at, action.request.expires_at);
+
+    // Consuming a Pending-or-unknown ID rejects; the genuine one removes
+    // the record and frees the slot without touching the high water.
+    assert!(
+        client
+            .consume_delivery_unknown(secure_messenger_lab::MessageId::random(), NOW)
+            .is_err()
+    );
+    let pending = client.stage_send("still pending", NOW, NOW + 3_600, NOW)?;
+    assert!(
+        client
+            .consume_delivery_unknown(pending.request.message_id, NOW)
+            .is_err()
+    );
+    client.consume_delivery_unknown(action.request.message_id, NOW)?;
+    assert!(client.delivery_unknowns()?.is_empty());
+
+    drop(client);
+    let client = open_client(&temp)?;
+    assert!(client.delivery_unknowns()?.is_empty());
+    assert_eq!(client.pending_send_actions()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn send_crash_discipline_between_every_mutator() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let client = create_client(&temp)?;
+    drop(client);
+    let mut client = open_client(&temp)?;
+    let peer = commit_contact_and_establish(&mut client)?;
+    drop(client);
+
+    let mut client = open_client(&temp)?;
+    let action = client.stage_send("durable", NOW, NOW + 3_600, NOW)?;
+    drop(client);
+
+    let mut client = open_client(&temp)?;
+    assert_eq!(client.pending_send_actions()?.len(), 1);
+    client.record_send_result(&action, SendOutcome::Stored)?;
+    drop(client);
+
+    let mut client = open_client(&temp)?;
+    assert!(client.pending_send_actions()?.is_empty());
+    let _ = peer;
+
+    // A result for a send this profile never staged rejects after reopen
+    // (foreign action from a different client).
+    let temp2 = TempDir::new()?;
+    let (mut foreign, _foreign_peer) = send_ready_client(&temp2)?;
+    let foreign_action = foreign.stage_send("not yours", NOW, NOW + 3_600, NOW)?;
+    assert!(
+        client
+            .record_send_result(&foreign_action, SendOutcome::Stored)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn send_reconcile_required_on_commit_failure() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    let action = client.stage_send("committed", NOW, NOW + 3_600, NOW)?;
+
+    let connection = Connection::open(database_path(&temp))?;
+    let nonce: Vec<u8> =
+        connection.query_row("SELECT nonce FROM client_state WHERE slot = 1", [], |row| {
+            row.get(0)
+        })?;
+    let mut tampered = nonce.clone();
+    *tampered.first_mut().ok_or("empty nonce")? ^= 0x01;
+    connection.execute(
+        "UPDATE client_state SET nonce = ?1 WHERE slot = 1",
+        params![tampered],
+    )?;
+
+    assert!(client.stage_send("doomed", NOW, NOW + 3_600, NOW).is_err());
+    assert!(client.pending_send_actions().is_err());
+    assert!(client.public_identity().is_err());
+    assert!(
+        client
+            .record_send_result(&action, SendOutcome::Stored)
+            .is_err()
+    );
+    assert!(client.delivery_unknowns().is_err());
+
+    connection.execute(
+        "UPDATE client_state SET nonce = ?1 WHERE slot = 1",
+        params![nonce],
+    )?;
+    drop(connection);
+    drop(client);
+    let client = open_client(&temp)?;
+    let pending = client.pending_send_actions()?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending.first().ok_or("no pending")?.token, action.token);
+    Ok(())
 }

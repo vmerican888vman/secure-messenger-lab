@@ -116,15 +116,16 @@ use vodozemac::olm::{Account, Session, SessionConfig};
 use vodozemac::{Curve25519PublicKey, Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
 use zeroize::Zeroizing;
 
-use crate::capability::{canonical, digest};
-use crate::ids::{ConversationId, Nonce, QueueId};
+use crate::capability::{SendRequest, canonical, digest};
+use crate::ids::{ConversationId, MessageId, Nonce, QueueId};
+use crate::payload;
 use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
 use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
-    ActiveSession, ClientStateV1, MAX_KEYPAIR_JSON, PeerBinding, PeerBundle, PendingPreKey,
-    RegistrationRecord, Role, SessionMode,
+    ActiveSession, ClientStateV1, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, PeerBinding, PeerBundle,
+    PendingPreKey, RegistrationRecord, Role, SendRecord, SendState, SessionMode,
 };
-use crate::{LabError, MailboxRegistration, Result};
+use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
 /// Validity window for a contact offer, mirroring
 /// `CONTACT_BUNDLE_MAX_VALIDITY_SECONDS` in `src/client.rs` (private
@@ -132,6 +133,33 @@ use crate::{LabError, MailboxRegistration, Result};
 const CONTACT_OFFER_MAX_VALIDITY_SECONDS: u64 = 5 * 60;
 
 const PREKEY_ACTION: &[u8] = b"peer-prekey";
+const SEND_ACTION: &[u8] = b"send";
+
+/// The relay's per-message TTL bound (private in `relay.rs`; mirrored).
+const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Section 4 budget: 24 application advances, then `ControlOnly`.
+const CONTROL_ONLY_THRESHOLD: u64 = 24;
+/// Section 4 absolute maximum outstanding; `ReceiptLocked` at 32.
+const MAX_OUTSTANDING: u64 = 32;
+
+/// Canonical length-prefixed signing bytes for a send request; identical
+/// construction to `send_signing_bytes` in `src/capability.rs`.
+fn send_signing_bytes(
+    queue_id: QueueId,
+    message_id: MessageId,
+    packet_digest: &[u8; 32],
+    expires_at: u64,
+) -> Vec<u8> {
+    canonical(
+        SEND_ACTION,
+        &[
+            queue_id.as_bytes(),
+            message_id.as_bytes(),
+            packet_digest,
+            &expires_at.to_be_bytes(),
+        ],
+    )
+}
 
 /// Canonical length-prefixed signing bytes for a peer bundle; identical
 /// construction to `peer_prekey_signing_bytes` in `src/client.rs`.
@@ -181,6 +209,22 @@ pub struct RedactedContactOffer {
 pub enum RegistrationOutcome {
     Confirmed,
     Failed,
+}
+
+/// Outcome of a durable send action, as reported by the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    Stored,
+    Duplicate,
+    DeliveryUnknown,
+}
+
+/// Owned view of a `DeliveryUnknown` send record (digest+expiry arm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryUnknownView {
+    pub message_id: MessageId,
+    pub packet_digest: [u8; 32],
+    pub expires_at: u64,
 }
 
 /// Bookkeeping for the §2 mutator discipline. `Mutating` is never
@@ -719,6 +763,232 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         Ok(())
     }
 
+    /// Stage an application send (D2a): expiry sweep, payload v2, Olm
+    /// encryption with the candidate session, packet bound, signature with
+    /// the peer-binding send capability for the peer's queue, `Pending`
+    /// record, mode recompute, commit — then the action is returned.
+    ///
+    /// Application staging is allowed iff the current mode is `Ready`
+    /// (§4). The token is the fresh random `message_id`; the durable
+    /// request binding is the record's canonical digest (see the module
+    /// docs).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MissingSession`] without a session or binding,
+    /// [`LabError::Storage`] when the mode blocks staging,
+    /// [`LabError::InvalidExpiry`] for an expired or overlong TTL,
+    /// [`LabError::InvalidPayload`] for an oversized body, or a coarse
+    /// error for crypto/commit failures.
+    pub fn stage_send(
+        &mut self,
+        body: &str,
+        sent_at: u64,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<DurableAction<SendRequest>> {
+        self.mutate(
+            |current| {
+                let active = current
+                    .state
+                    .active_session
+                    .as_ref()
+                    .ok_or(LabError::MissingSession)?;
+                if current.state.peer_binding.is_none() {
+                    return Err(LabError::MissingSession);
+                }
+                // §4: application bodies stage only in Ready.
+                if active.mode != SessionMode::Ready {
+                    return Err(LabError::Storage);
+                }
+                if expires_at <= now || expires_at - now > MAX_MESSAGE_TTL_SECONDS {
+                    return Err(LabError::InvalidExpiry);
+                }
+                if body.len() > MAX_BODY {
+                    return Err(LabError::InvalidPayload);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| stage_send_operation(candidate, body, sent_at, expires_at, now),
+        )
+    }
+
+    /// Owned reconstruction of every `Pending` record's exact durable
+    /// request, for crash retry. Each action's token is its message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`.
+    pub fn pending_send_actions(&self) -> Result<Vec<DurableAction<SendRequest>>> {
+        self.ensure_ready()?;
+        let mut actions = Vec::new();
+        for record in &self.state.sends {
+            if record.state != SendState::Pending {
+                continue;
+            }
+            let (Some(queue_id), Some(packet), Some(signature)) =
+                (record.queue_id, &record.packet, &record.send_signature)
+            else {
+                return Err(LabError::Storage);
+            };
+            actions.push(DurableAction {
+                token: *record.message_id.as_bytes(),
+                request: SendRequest {
+                    queue_id,
+                    message_id: record.message_id,
+                    packet: packet.clone(),
+                    expires_at: record.expires_at,
+                    signature: *signature,
+                },
+            });
+        }
+        Ok(actions)
+    }
+
+    /// Record the relay's answer to a durable send action. The full action
+    /// is presented back: token (message ID) lookup plus the digest check
+    /// against the durable record's canonical bytes run before staging;
+    /// transitions are allowed only from `Pending`. Every outcome maps to
+    /// its codec digest+expiry arm (codec v3: `DeliveryUnknown` is
+    /// body-free). Per §4 none of these transitions advances the peer high
+    /// water or recovers send budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown token,
+    /// [`LabError::MessageGone`] when the record is no longer `Pending`,
+    /// [`LabError::Unauthorized`] on a request digest mismatch, or a
+    /// coarse storage error when the commit fails.
+    pub fn record_send_result(
+        &mut self,
+        action: &DurableAction<SendRequest>,
+        outcome: SendOutcome,
+    ) -> Result<()> {
+        self.mutate(
+            |current| {
+                let index = current
+                    .state
+                    .sends
+                    .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
+                    .map_err(|_| LabError::MessageNotFound)?;
+                let record = &current.state.sends[index];
+                if record.state != SendState::Pending {
+                    return Err(LabError::MessageGone);
+                }
+                let presented = SendRecord {
+                    message_id: record.message_id,
+                    state: SendState::Pending,
+                    epoch_id: record.epoch_id,
+                    sequence: record.sequence,
+                    queue_id: Some(action.request.queue_id),
+                    packet: Some(action.request.packet.clone()),
+                    expires_at: action.request.expires_at,
+                    send_signature: Some(action.request.signature),
+                    packet_digest: None,
+                };
+                if digest(&presented.encode()?) != digest(&record.encode()?) {
+                    return Err(LabError::Unauthorized);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| {
+                let index = candidate
+                    .state
+                    .sends
+                    .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
+                    .map_err(|_| LabError::MessageNotFound)?;
+                let record = &mut candidate.state.sends[index];
+                let packet_digest = record.packet.as_ref().ok_or(LabError::Storage)?.digest();
+                record.state = match outcome {
+                    SendOutcome::Stored => SendState::Stored,
+                    SendOutcome::Duplicate => SendState::Duplicate,
+                    SendOutcome::DeliveryUnknown => SendState::DeliveryUnknown,
+                };
+                record.queue_id = None;
+                record.packet = None;
+                record.send_signature = None;
+                record.packet_digest = Some(packet_digest);
+                if let Some(active) = candidate.state.active_session.as_mut() {
+                    recompute_mode(active);
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// Owned views of every `DeliveryUnknown` record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`.
+    pub fn delivery_unknowns(&self) -> Result<Vec<DeliveryUnknownView>> {
+        self.ensure_ready()?;
+        self.state
+            .sends
+            .iter()
+            .filter(|record| record.state == SendState::DeliveryUnknown)
+            .map(|record| {
+                Ok(DeliveryUnknownView {
+                    message_id: record.message_id,
+                    packet_digest: record.packet_digest.ok_or(LabError::Storage)?,
+                    expires_at: record.expires_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve a `DeliveryUnknown` record by REMOVING it from the send
+    /// array, freeing the bounded slot (D2a decision, documented in the
+    /// module docs: the alternative — keeping a consumed marker — would
+    /// exhaust the 32-record bound under churn; the digest is durably
+    /// present in the dedup picture only on the receive side, and §4 says
+    /// consuming a `DeliveryUnknown` never advances the peer high water
+    /// nor recovers send budget by itself). Unknown or wrong-state IDs
+    /// reject without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown ID,
+    /// [`LabError::MessageGone`] when the record is not
+    /// `DeliveryUnknown`, or a coarse storage error when the commit
+    /// fails.
+    pub fn consume_delivery_unknown(&mut self, message_id: MessageId, now: u64) -> Result<()> {
+        self.mutate(
+            |current| {
+                let index = current
+                    .state
+                    .sends
+                    .binary_search_by(|probe| {
+                        probe.message_id.as_bytes().cmp(message_id.as_bytes())
+                    })
+                    .map_err(|_| LabError::MessageNotFound)?;
+                if current.state.sends[index].state != SendState::DeliveryUnknown {
+                    return Err(LabError::MessageGone);
+                }
+                Ok(())
+            },
+            |candidate, _keypairs| {
+                sweep_expired_sends(candidate, now)?;
+                let index = candidate
+                    .state
+                    .sends
+                    .binary_search_by(|probe| {
+                        probe.message_id.as_bytes().cmp(message_id.as_bytes())
+                    })
+                    .map_err(|_| LabError::MessageNotFound)?;
+                // The sweep may have transitioned the target to Expired.
+                if candidate.state.sends[index].state != SendState::DeliveryUnknown {
+                    return Err(LabError::MessageGone);
+                }
+                candidate.state.sends.remove(index);
+                if let Some(active) = candidate.state.active_session.as_mut() {
+                    recompute_mode(active);
+                }
+                Ok(())
+            },
+        )
+    }
+
     /// Clone the complete candidate logical and crypto state (step 3).
     fn stage(&self) -> Result<Candidate> {
         let state = ClientStateV1::decode(&self.state.encode()?)?;
@@ -849,4 +1119,141 @@ fn parse_capability_keypair(bytes: &Zeroizing<Vec<u8>>) -> Result<Ed25519Keypair
         return Err(LabError::Storage);
     }
     Ok(keypair)
+}
+
+/// §4 expiry sweep at the top of every send-path mutator: `Pending` and
+/// `DeliveryUnknown` records at or past their expiry become `Expired`
+/// (digest+expiry arm). `Expired` never advances the peer high water and
+/// never recovers send budget.
+fn sweep_expired_sends(candidate: &mut Candidate, now: u64) -> Result<()> {
+    for record in &mut candidate.state.sends {
+        if matches!(
+            record.state,
+            SendState::Pending | SendState::DeliveryUnknown
+        ) && record.expires_at <= now
+        {
+            let packet_digest = match &record.packet_digest {
+                Some(digest) => *digest,
+                None => record.packet.as_ref().ok_or(LabError::Storage)?.digest(),
+            };
+            record.state = SendState::Expired;
+            record.queue_id = None;
+            record.packet = None;
+            record.send_signature = None;
+            record.packet_digest = Some(packet_digest);
+        }
+    }
+    Ok(())
+}
+
+/// §4 mode recomputation after each committed mutation: the budget modes
+/// derive from outstanding = `last_assigned_send_seq` −
+/// `peer_contiguous_high_water`; `RekeyRequired` dominates and is never
+/// recomputed away by this leg (it exits only via the §4 rebootstrap,
+/// which is out of scope for D2).
+fn recompute_mode(active: &mut ActiveSession) {
+    if active.mode == SessionMode::RekeyRequired {
+        return;
+    }
+    let outstanding = active.last_assigned_send_seq - active.peer_contiguous_high_water;
+    active.mode = if outstanding >= MAX_OUTSTANDING {
+        SessionMode::ReceiptLocked
+    } else if outstanding >= CONTROL_ONLY_THRESHOLD {
+        SessionMode::ControlOnly
+    } else {
+        SessionMode::Ready
+    };
+}
+
+/// The step-4 body of `stage_send` (extracted to keep the public method
+/// readable): sweep, payload, encrypt, sign, record, recompute mode.
+fn stage_send_operation(
+    candidate: &mut Candidate,
+    body: &str,
+    sent_at: u64,
+    expires_at: u64,
+    now: u64,
+) -> Result<DurableAction<SendRequest>> {
+    sweep_expired_sends(candidate, now)?;
+    let (epoch_id, send_seq, conversation_id) = {
+        let active = candidate
+            .state
+            .active_session
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        (
+            active.epoch_id,
+            active
+                .last_assigned_send_seq
+                .checked_add(1)
+                .ok_or(LabError::Storage)?,
+            candidate.state.conversation_id,
+        )
+    };
+    let message_id = MessageId::random();
+    let outgoing = payload::application(
+        conversation_id,
+        message_id,
+        epoch_id,
+        send_seq,
+        sent_at,
+        body.to_owned(),
+    )?;
+    let encoded = payload::encode(&outgoing)?;
+    let session = candidate.session.as_mut().ok_or(LabError::MissingSession)?;
+    let message = session
+        .encrypt(&encoded[..])
+        .map_err(|_| LabError::Crypto)?;
+    let packet = EncryptedPacket::from_untrusted(
+        serde_json::to_vec(&message).map_err(|_| LabError::Encoding)?,
+    );
+    if packet.as_bytes().len() > MAX_PACKET {
+        return Err(LabError::Encoding);
+    }
+    let binding = candidate
+        .state
+        .peer_binding
+        .as_ref()
+        .ok_or(LabError::MissingSession)?;
+    let keypair = parse_capability_keypair(&binding.send_keypair_json)?;
+    let queue_id = binding.queue_id;
+    let signature = keypair.sign(&send_signing_bytes(
+        queue_id,
+        message_id,
+        &packet.digest(),
+        expires_at,
+    ));
+    let request = SendRequest {
+        queue_id,
+        message_id,
+        packet: packet.clone(),
+        expires_at,
+        signature,
+    };
+    candidate.state.sends.push(SendRecord {
+        message_id,
+        state: SendState::Pending,
+        epoch_id,
+        sequence: send_seq,
+        queue_id: Some(queue_id),
+        packet: Some(packet),
+        expires_at,
+        send_signature: Some(signature),
+        packet_digest: None,
+    });
+    candidate
+        .state
+        .sends
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let active = candidate
+        .state
+        .active_session
+        .as_mut()
+        .ok_or(LabError::MissingSession)?;
+    active.last_assigned_send_seq = send_seq;
+    recompute_mode(active);
+    Ok(DurableAction {
+        token: *message_id.as_bytes(),
+        request,
+    })
 }

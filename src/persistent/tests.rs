@@ -246,3 +246,113 @@ fn payload_profile_or_key_ref_mismatch_rejected_on_reopen()
     assert!(open_client(&temp).is_err());
     Ok(())
 }
+
+// --- D2a: mode-block fixtures ------------------------------------------------
+
+use vodozemac::Ed25519Keypair;
+use vodozemac::olm::Account;
+
+use super::RedactedContactOffer;
+use crate::capability::canonical;
+use crate::ids::QueueId;
+use crate::state::SessionMode;
+
+fn in_crate_prekey_signing_bytes(
+    signing_identity: &vodozemac::Ed25519PublicKey,
+    curve_identity: &vodozemac::Curve25519PublicKey,
+    one_time_key: &vodozemac::Curve25519PublicKey,
+    valid_until: u64,
+) -> Vec<u8> {
+    canonical(
+        b"peer-prekey",
+        &[
+            signing_identity.as_bytes(),
+            curve_identity.as_bytes(),
+            one_time_key.as_bytes(),
+            &valid_until.to_be_bytes(),
+        ],
+    )
+}
+
+/// Commit a genuine peer contact and establish the outbound session.
+fn establish_session(
+    client: &mut PersistentClient<TestProtector>,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let mut peer_account = Account::new();
+    let one_time_key = *peer_account
+        .generate_one_time_keys(1)
+        .created
+        .first()
+        .ok_or("no peer one-time key")?;
+    peer_account.mark_keys_as_published();
+    let mut offer = RedactedContactOffer {
+        signing_identity: peer_account.ed25519_key(),
+        curve_identity: peer_account.curve25519_key(),
+        one_time_key,
+        valid_until: NOW + 300,
+        signature: peer_account.sign(b""),
+    };
+    offer.signature = peer_account.sign(in_crate_prekey_signing_bytes(
+        &offer.signing_identity,
+        &offer.curve_identity,
+        &offer.one_time_key,
+        NOW + 300,
+    ));
+    let keypair = Ed25519Keypair::new();
+    client.commit_verified_contact(
+        offer.signing_identity,
+        offer,
+        QueueId::random(),
+        Zeroizing::new(serde_json::to_vec(&keypair)?),
+        NOW,
+    )?;
+    client.establish_outbound_session(NOW)?;
+    Ok(())
+}
+
+#[test]
+fn receipt_locked_blocks_all_staging() -> std::result::Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let mut client = create_client(&temp)?;
+    establish_session(&mut client)?;
+    // Drive the in-memory record to the ReceiptLocked corner (outstanding
+    // 32). Staging is rejected before anything commits, so the store is
+    // untouched by this fixture.
+    let active = client
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no active session")?;
+    active.last_assigned_send_seq = 32;
+    active.mode = SessionMode::ReceiptLocked;
+    assert!(client.stage_send("blocked", NOW, NOW + 3_600, NOW).is_err());
+    Ok(())
+}
+
+#[test]
+fn rekey_required_blocks_all_staging() -> std::result::Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let mut client = create_client(&temp)?;
+    establish_session(&mut client)?;
+    client
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no active session")?
+        .mode = SessionMode::RekeyRequired;
+    assert!(client.stage_send("blocked", NOW, NOW + 3_600, NOW).is_err());
+    // RekeyRequired is never recomputed away: even at zero outstanding it
+    // stays and keeps blocking.
+    client
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no active session")?
+        .last_assigned_send_seq = 0;
+    assert!(
+        client
+            .stage_send("still blocked", NOW, NOW + 3_600, NOW)
+            .is_err()
+    );
+    Ok(())
+}
