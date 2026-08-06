@@ -2600,7 +2600,17 @@ fn state_with_raw_keypairs(
     receive: &vodozemac::Ed25519Keypair,
     manage: &vodozemac::Ed25519Keypair,
 ) -> Result<ClientStateV1, Box<dyn Error>> {
-    let account = Account::new();
+    state_with_key_material(&Account::new(), send, receive, manage)
+}
+
+/// Same, with an explicit account (identity-alias fixtures need the
+/// account's own signing keypair to coincide with the stored identity).
+fn state_with_key_material(
+    account: &Account,
+    send: &vodozemac::Ed25519Keypair,
+    receive: &vodozemac::Ed25519Keypair,
+    manage: &vodozemac::Ed25519Keypair,
+) -> Result<ClientStateV1, Box<dyn Error>> {
     let queue_id = QueueId::random();
     let mut registration = crate::MailboxRegistration {
         queue_id,
@@ -2675,5 +2685,155 @@ fn mailbox_capability_collapse_rejected() -> Result<(), Box<dyn Error>> {
     permuted.send_keypair_json = Zeroizing::new(serde_json::to_vec(&receive)?);
     permuted.receive_keypair_json = Zeroizing::new(serde_json::to_vec(&send)?);
     assert!(permuted.encode().is_err(), "permuted keypairs accepted");
+    Ok(())
+}
+
+// --- review v6 remediation tests -------------------------------------------
+
+/// Extract the canonical `signing_key` (an `Ed25519Keypair` JSON
+/// document) from an account's canonical pickle.
+fn account_signing_keypair(account: &Account) -> Result<vodozemac::Ed25519Keypair, Box<dyn Error>> {
+    let pickle = serde_json::to_vec(&account.pickle())?;
+    let value: serde_json::Value = serde_json::from_slice(&pickle)?;
+    let signing_key = value.get("signing_key").ok_or("signing_key missing")?;
+    Ok(serde_json::from_slice(&serde_json::to_vec(signing_key)?)?)
+}
+
+/// Review v6 blocker 1, the reviewer's reproduction: the account's own
+/// signing keypair reused as the mailbox send capability must reject on
+/// both paths.
+#[test]
+fn identity_key_must_not_alias_mailbox_send_capability() -> Result<(), Box<dyn Error>> {
+    let fixture = minimal_fixture()?;
+    let account = &fixture.our_account;
+    let identity_keypair = account_signing_keypair(account)?;
+    let aliased = state_with_key_material(
+        account,
+        &identity_keypair,
+        &vodozemac::Ed25519Keypair::new(),
+        &vodozemac::Ed25519Keypair::new(),
+    )?;
+    assert!(
+        aliased.encode().is_err(),
+        "encode accepted an identity-aliased send keypair"
+    );
+
+    // Decode path: splice the aliased mailbox (field 11) and registration
+    // (field 12) into the genuine state's encoding.
+    let encoded = fixture.state.encode()?;
+    let mailbox = mailbox_value(
+        aliased.mailbox_queue_id,
+        &aliased.send_keypair_json,
+        &aliased.receive_keypair_json,
+        &aliased.manage_keypair_json,
+    )?;
+    let bytes = splice_top(&encoded, 10, field_block(11, &mailbox)?)?;
+    let registration = aliased.registration.encode()?;
+    let bytes = splice_top(&bytes, 11, field_block(12, &registration)?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decode accepted an identity-aliased send keypair"
+    );
+    Ok(())
+}
+
+/// Review v6 blocker 1: receive and manage must not alias the identity
+/// either.
+#[test]
+fn identity_key_must_not_alias_receive_or_manage() -> Result<(), Box<dyn Error>> {
+    for slot in ["receive", "manage"] {
+        let fixture = minimal_fixture()?;
+        let account = &fixture.our_account;
+        let identity_keypair = account_signing_keypair(account)?;
+        let fresh_a = vodozemac::Ed25519Keypair::new();
+        let fresh_b = vodozemac::Ed25519Keypair::new();
+        let aliased = if slot == "receive" {
+            state_with_key_material(account, &fresh_a, &identity_keypair, &fresh_b)?
+        } else {
+            state_with_key_material(account, &fresh_a, &fresh_b, &identity_keypair)?
+        };
+        assert!(
+            aliased.encode().is_err(),
+            "identity-aliased {slot} keypair accepted"
+        );
+    }
+    Ok(())
+}
+
+/// Review v6 blocker 1: the peer's send capability must differ from the
+/// peer's pinned signing identity.
+#[test]
+fn peer_send_capability_must_not_alias_peer_identity() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    let identity_keypair = account_signing_keypair(&fixture.peer_account)?;
+    {
+        let binding = fixture.state.peer_binding.as_mut().ok_or("no binding")?;
+        binding.send_keypair_json = Zeroizing::new(serde_json::to_vec(&identity_keypair)?);
+        binding.send_public_key = fixture.peer_account.ed25519_key();
+    }
+    assert!(
+        fixture.state.encode().is_err(),
+        "aliased peer capability encoded"
+    );
+
+    // Decode path: splice the aliased peer binding (field 14) into the
+    // genuine encoding.
+    let valid = populated_fixture()?;
+    let encoded = valid.state.encode()?;
+    let binding_bytes = fixture
+        .state
+        .peer_binding
+        .as_ref()
+        .ok_or("no binding")?
+        .encode()?;
+    let bytes = splice_top(&encoded, 13, field_block(14, &binding_bytes)?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "aliased peer capability decoded"
+    );
+    Ok(())
+}
+
+/// Review v6 blocker 2: a matching dedup record must agree with the
+/// inbound record on expiry.
+#[test]
+fn dedup_expiry_must_match_inbound_record() -> Result<(), Box<dyn Error>> {
+    // Encode path.
+    let mut fixture = populated_fixture()?;
+    let inbound_id = fixture.state.inbound[0].message_id;
+    let dedup = fixture
+        .state
+        .dedup
+        .iter_mut()
+        .find(|record| record.message_id == inbound_id)
+        .ok_or("matching dedup missing")?;
+    dedup.expires_at = 0;
+    assert!(
+        fixture.state.encode().is_err(),
+        "encode accepted expiry mismatch"
+    );
+
+    // Decode path: encode a genuine state, then splice in the dedup array
+    // with only the matching record's expiry zeroed.
+    let mut fixture = populated_fixture()?;
+    let inbound_id = fixture.state.inbound[0].message_id;
+    let encoded = fixture.state.encode()?;
+    let dedup = fixture
+        .state
+        .dedup
+        .iter_mut()
+        .find(|record| record.message_id == inbound_id)
+        .ok_or("matching dedup missing")?;
+    dedup.expires_at = 0;
+    let array = records::encode_record_array(
+        &fixture.state.dedup,
+        MAX_DEDUP,
+        records::DedupRecord::encode,
+    )?;
+    let bytes = splice_top(&encoded, 18, field_block(19, &array)?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decode accepted expiry mismatch"
+    );
     Ok(())
 }

@@ -304,7 +304,10 @@ fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
 /// the three capability public keys must be DISTINCT from each other
 /// (review v5 finding 3: a collapsed mailbox where one keypair serves
 /// send, receive and manage destroys the capability separation the
-/// mailbox design exists for).
+/// mailbox design exists for). Each mailbox key must also differ from the
+/// long-term `own_ed25519_identity` (review v6 blocker 1): the send key is
+/// transferable to the peer, and none of the mailbox capabilities may
+/// alias the pinned identity.
 fn check_mailbox(state: &ClientStateV1) -> Result<()> {
     let send = keypair(&state.send_keypair_json)?;
     let receive = keypair(&state.receive_keypair_json)?;
@@ -315,9 +318,19 @@ fn check_mailbox(state: &ClientStateV1) -> Result<()> {
     {
         return Err(LabError::Storage);
     }
-    if state.registration.send_key == state.registration.receive_key
-        || state.registration.send_key == state.registration.manage_key
-        || state.registration.receive_key == state.registration.manage_key
+    let mailbox_keys = [
+        state.registration.send_key,
+        state.registration.receive_key,
+        state.registration.manage_key,
+    ];
+    for key in &mailbox_keys {
+        if *key == state.own_ed25519_identity {
+            return Err(LabError::Storage);
+        }
+    }
+    if mailbox_keys[0] == mailbox_keys[1]
+        || mailbox_keys[0] == mailbox_keys[2]
+        || mailbox_keys[1] == mailbox_keys[2]
     {
         return Err(LabError::Storage);
     }
@@ -399,6 +412,12 @@ fn check_peer_binding(state: &ClientStateV1) -> Result<()> {
     };
     let keypair = keypair(&binding.send_keypair_json)?;
     if keypair.public_key() != binding.send_public_key {
+        return Err(LabError::Storage);
+    }
+    // The send capability must not alias the peer's pinned signing
+    // identity (review v6 blocker 1): the capability is transferable, the
+    // identity is not.
+    if binding.send_public_key == binding.bundle.signing_identity {
         return Err(LabError::Storage);
     }
     verify(
@@ -668,6 +687,7 @@ fn check_inbound(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
             || dedup.sequence != record.sender_sequence
             || dedup.queue_id != record.queue_id
             || dedup.packet_digest != record.packet_digest
+            || dedup.expires_at != record.expires_at
         {
             return Err(LabError::Storage);
         }

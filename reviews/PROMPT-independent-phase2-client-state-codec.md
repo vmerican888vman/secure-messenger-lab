@@ -25,6 +25,21 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
+Version 6 (head `eb2020e8beb178b2e933ef4d62fb9f0b5d1637e1`) was RETURNED
+(verdict in `reviews/REVIEW-codec-v6.md`) with two blockers, both fixed in
+the head under review:
+
+1. Identity keys can no longer alias transferable capabilities: every
+   mailbox public key (send/receive/manage) must differ from
+   `own_ed25519_identity`, and the peer's send capability public key must
+   differ from the peer's pinned signing identity. The reviewer's exact
+   reproduction (account `signing_key` reused as `send_keypair_json`) is a
+   regression test on both encode and decode paths.
+2. Matching inbound and dedup records must now agree on `expires_at`
+   (§3's expiry/dedup cross-check). The ACK-intent side was examined and
+   intentionally not changed: an ACK intent's `valid_until` is its own
+   value, not a duplicate of the message expiry.
+
 Version 5 (head `d8795fabb0bb5f9fb685c7a0f12e33ac2039b174`) was dual-RETURNED
 (verdicts transcribed in `reviews/REVIEW-combined-codec-v5-d2a-d2b.md`):
 Fable found the `u64::MAX` counter wrap (`wrapping_add` onto retained key id
