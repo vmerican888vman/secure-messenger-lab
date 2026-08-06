@@ -42,7 +42,7 @@ use vodozemac::{
 use zeroize::Zeroizing;
 
 use super::records::{
-    ActiveSession, HighWaterReceipt, PeerBundle, RECEIPT_VERSION, Role, SessionMode,
+    ActiveSession, HighWaterReceipt, PeerBundle, RECEIPT_VERSION, Role, SendKind, SessionMode,
 };
 use super::tlv::canonical_json;
 use super::{
@@ -636,9 +636,9 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
             return Err(LabError::Storage);
         }
     }
-    // Review D2b v3 (field 19): no receipt can have been staged for a
+    // Review D2b v4 (field 19): no receipt can have been DELIVERED for a
     // high water never reached.
-    if active.last_staged_receipt_high_water > active.highest_contiguous_received_seq {
+    if active.last_delivered_receipt_high_water > active.highest_contiguous_received_seq {
         return Err(LabError::Storage);
     }
     Ok(())
@@ -745,6 +745,14 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
                 return Err(LabError::Storage);
             };
             if queue_id != binding.queue_id {
+                return Err(LabError::Storage);
+            }
+            // A full-arm receipt may not report a high water the session
+            // has never received (review D2b v4 codec amendment).
+            if record.kind == SendKind::Receipt
+                && record.receipt_high_water.ok_or(LabError::Storage)?
+                    > active.highest_contiguous_received_seq
+            {
                 return Err(LabError::Storage);
             }
             verify(

@@ -48,7 +48,7 @@ use crate::{LabError, PROTOCOL_DOMAIN, Result};
 // exercised only by the codec's own tests until D2 lands.
 #[allow(unused_imports)]
 pub(crate) use records::{
-    AckState, DedupState, HighWaterReceipt, PeerBundle, Role, SendState, SessionMode,
+    AckState, DedupState, HighWaterReceipt, PeerBundle, Role, SendKind, SendState, SessionMode,
 };
 
 /// Top-level framing magic.

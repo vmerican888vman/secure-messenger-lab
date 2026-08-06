@@ -1,5 +1,35 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v5)
+
+Version 4 (head `844f6b1229a1a9ed275138725cf94bc08b008d4c`) was RETURNED by
+BOTH reviewers (verdicts in `reviews/REVIEW-fable-facade-d2b-v4.md` and
+`reviews/REVIEW-sol-facade-d2b-v4.md`) with four P1 blockers, all fixed in
+the head under review:
+
+1. **Lost receipts re-arm.** The marker (ActiveSession field 19, renamed
+   `last_delivered_receipt_high_water`) now advances ONLY on
+   `Stored`/`Duplicate` in `record_send_result` — never at staging, expiry,
+   or DeliveryUnknown. Expiry or unknown-delivery of a pending receipt
+   automatically re-owes it; the next eligible mutator re-stages with a
+   fresh envelope at the 7-day send TTL (the 300 s window was wrong for
+   receipts). SendRecord gained `kind` and `receipt_high_water` fields
+   (codec amendment) so receipts are identifiable through their lifecycle.
+2. **Quiescence.** Receipt-kind accepts never create receipt debt (the
+   marker covers the receipt's own sequence); only debt that PREDATES the
+   receipt may stage in an accept pass. Ping-pong is impossible by
+   construction; an in-order exchange test proves both peers drain to idle.
+3. **Control priority.** In `stage_send`, owed-receipt staging runs BEFORE
+   the application insert; the body is inserted only if capacity remains
+   (it errors immediately and is retryable — receipts were the silent-loss
+   case).
+4. **Fresh mode before staging.** Accept recomputes the budget mode from
+   the fresh high water before owed staging (RekeyRequired dominance
+   preserved), so `ReceiptLocked → ControlOnly` recovery stages in the same
+   pass.
+
+The v2–v4 histories follow unchanged.
+
 ## Remediation history (v4)
 
 Version 3 (head `af78462718ddcd5bff5ccd8212fa08ed2fb499c6`): Fable PASS, Sol

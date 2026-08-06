@@ -114,15 +114,29 @@
 //!   intent's exact request. Both are read-only operations that require
 //!   `Ready` and never commit. Their tokens (the fetch nonce / the
 //!   message ID) are purely correlational.
-//! - **Receipt staging is per-consume and best-effort-coalesced.**
-//!   `consume_inbound` stages one receipt send (a control advance on the
-//!   shared send counter, payload kind `Receipt`, riding the unchanged
-//!   D2a send machinery) when the contiguous received high water is
-//!   nonzero and the mode allows control traffic. In `ReceiptLocked` and
-//!   `RekeyRequired` all encryption is blocked per §4, so staging is
-//!   silently skipped. Receipts are idempotent at the peer; finer
-//!   coalescing needs a durable last-staged-HCR field the frozen codec
-//!   lacks (noted for D2c).
+//! - **Receipt staging follows the durable owed rule (review D2b v4).**
+//!   A receipt reporting the contiguous received high water is owed while
+//!   that water exceeds `last_delivered_receipt_high_water` (codec field
+//!   19, renamed from the v3 staged-marker at the same wire position) AND
+//!   no `Pending` receipt-kind send for the same water is in flight. The
+//!   marker advances only in `record_send_result` when a receipt-kind
+//!   record reaches `Stored`/`Duplicate` — never at staging, never on
+//!   `DeliveryUnknown`/expiry — so a lost receipt re-owes automatically
+//!   and the next eligible mutator re-stages it with a fresh envelope and
+//!   a fresh 7-day expiry (the same TTL rule as `stage_send`, not the
+//!   300 s request window). Staging points are the application-accept
+//!   path, `consume_inbound`, and the sweep/prune mutators when capacity
+//!   returns, at most one receipt per pass, and only in
+//!   `Ready`/`ControlOnly`. In `stage_send` an owed receipt takes
+//!   priority over the new application body for a freed slot (the body
+//!   errors and is retryable; a skipped receipt was the silent-loss
+//!   case). Receipt-kind accepts are quiescent: a receipt-driven HCR
+//!   advance creates no obligation (the delivered marker moves past the
+//!   receipt's own sequence when the books were balanced), so receipts
+//!   never trigger counter-receipts and two peers drain to idle; a debt
+//!   that predates the receipt is not a counter-receipt and stages in
+//!   the same accept pass, with the budget mode recomputed from the fresh
+//!   high water BEFORE staging (`RekeyRequired` dominance preserved).
 //! - **Gap failure commits.** A previously unseen, peer-authenticated
 //!   packet on the current session whose decrypt fails with
 //!   `TooBigMessageGap`/`MissingMessageKey` commits `RekeyRequired` and
@@ -159,8 +173,8 @@ use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
     AckIntent, AckState, ActiveSession, ClientStateV1, DedupRecord, DedupState, HighWaterReceipt,
     InboundRecord, MAX_ACKS, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS,
-    PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendRecord, SendState,
-    SessionMode,
+    PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendKind, SendRecord,
+    SendState, SessionMode,
 };
 use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
@@ -749,7 +763,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     mode: SessionMode::Ready,
                     receipt: None,
                     received_above_high_water: Vec::new(),
-                    last_staged_receipt_high_water: 0,
+                    last_delivered_receipt_high_water: 0,
                     conversation_id: candidate.state.conversation_id,
                 });
                 candidate.session = Some(session);
@@ -908,7 +922,12 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// step 4; (g) the gap-failure durable `RekeyRequired` commit is the
     /// one path where the commit succeeds and the error is reported
     /// afterwards (the mode change IS the durable outcome, per §4); (i)
-    /// mode recompute runs before every commit.
+    /// mode recompute from the fresh high water runs BEFORE any owed
+    /// receipt staging (review D2b v4 blocker 4), and receipt-kind
+    /// accepts are quiescent (a receipt-driven HCR advance moves the
+    /// delivered marker past the receipt's own sequence instead of
+    /// creating an obligation; only a debt predating the receipt stages,
+    /// blocker 2).
     ///
     /// # Errors
     ///
@@ -1018,9 +1037,11 @@ impl<P: StateKeyProtector> PersistentClient<P> {
 
     /// The displayed transition: remove the inbound record (freeing the
     /// 32-slot bound) and create a `Pending` ACK intent. Receipt staging
-    /// follows the owed rule (review D2b v3, codec field 19): a receipt
-    /// reporting the current contiguous received high water is staged
-    /// when one is owed, the mode allows control traffic
+    /// follows the owed rule (review D2b v4): a receipt reporting the
+    /// current contiguous received high water is staged when that water
+    /// exceeds the DELIVERED marker (`last_delivered_receipt_high_water`,
+    /// codec field 19) and no `Pending` receipt for the same water is in
+    /// flight, the mode allows control traffic
     /// (`Ready`/`ControlOnly`; `ReceiptLocked`/`RekeyRequired` block all
     /// encryption per §4), and the send array has capacity; otherwise it
     /// stays owed and the next clock-taking mutator retries — a skipped
@@ -1177,20 +1198,25 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         Ok(())
     }
 
-    /// Stage an application send (D2a): expiry sweep, payload v2, Olm
+    /// Stage an application send (D2a): expiry sweep, the owed receipt
+    /// (control priority, review D2b v4 blocker 3), payload v2, Olm
     /// encryption with the candidate session, packet bound, signature with
     /// the peer-binding send capability for the peer's queue, `Pending`
     /// record, mode recompute, commit — then the action is returned.
     ///
     /// Application staging is allowed iff the current mode is `Ready`
-    /// (§4). The token is the fresh random `message_id`; the durable
-    /// request binding is the record's canonical digest (see the module
-    /// docs).
+    /// (§4) and the send array has capacity after the sweeps and the owed
+    /// receipt: an owed receipt outranks the new body for a freed slot,
+    /// so a full array is an immediate, retryable error rather than a
+    /// skipped receipt. The token is the fresh random `message_id`; the
+    /// durable request binding is the record's canonical digest (see the
+    /// module docs).
     ///
     /// # Errors
     ///
     /// Returns [`LabError::MissingSession`] without a session or binding,
-    /// [`LabError::Storage`] when the mode blocks staging,
+    /// [`LabError::Storage`] when the mode blocks staging or the send
+    /// array is full,
     /// [`LabError::InvalidExpiry`] for an expired or overlong TTL,
     /// [`LabError::InvalidPayload`] for an oversized body, or a coarse
     /// error for crypto/commit failures.
@@ -1307,6 +1333,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     expires_at: action.request.expires_at,
                     send_signature: Some(action.request.signature),
                     packet_digest: None,
+                    kind: record.kind,
+                    receipt_high_water: record.receipt_high_water,
                 };
                 if digest(&presented.encode()?) != digest(&record.encode()?) {
                     return Err(LabError::Unauthorized);
@@ -1321,6 +1349,17 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     .map_err(|_| LabError::MessageNotFound)?;
                 let record = &mut candidate.state.sends[index];
                 let packet_digest = record.packet.as_ref().ok_or(LabError::Storage)?.digest();
+                // The receipt marker advances only here: a receipt-kind
+                // record reaching a delivered-to-relay terminal state
+                // (Stored or Duplicate). Never at staging, never on
+                // DeliveryUnknown/Expired/consume (review D2b v4).
+                let delivered_receipt_hw = if record.kind == SendKind::Receipt
+                    && matches!(outcome, SendOutcome::Stored | SendOutcome::Duplicate)
+                {
+                    record.receipt_high_water
+                } else {
+                    None
+                };
                 record.state = match outcome {
                     SendOutcome::Stored => SendState::Stored,
                     SendOutcome::Duplicate => SendState::Duplicate,
@@ -1330,7 +1369,17 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 record.packet = None;
                 record.send_signature = None;
                 record.packet_digest = Some(packet_digest);
+                // Terminal arms carry no high water (codec: field 11 is
+                // present only on a full-arm receipt); the marker above
+                // has already captured the delivered value.
+                record.receipt_high_water = None;
                 if let Some(active) = candidate.state.active_session.as_mut() {
+                    if let Some(high_water) = delivered_receipt_hw {
+                        // Monotone: an older receipt finishing after a
+                        // newer one never moves the marker backward.
+                        active.last_delivered_receipt_high_water =
+                            active.last_delivered_receipt_high_water.max(high_water);
+                    }
                     recompute_mode(active);
                 }
                 Ok(())
@@ -1565,6 +1614,11 @@ fn sweep_expired_sends(candidate: &mut Candidate, now: u64) -> Result<()> {
             record.packet = None;
             record.send_signature = None;
             record.packet_digest = Some(packet_digest);
+            // Terminal arms carry no high water (codec: field 11 is
+            // present only on a full-arm receipt); an expired receipt
+            // never delivered, so the marker does not move and the owed
+            // rule re-arms automatically.
+            record.receipt_high_water = None;
         }
     }
     Ok(())
@@ -1665,7 +1719,8 @@ fn recompute_mode(active: &mut ActiveSession) {
 }
 
 /// The step-4 body of `stage_send` (extracted to keep the public method
-/// readable): sweep, payload, encrypt, sign, record, recompute mode.
+/// readable): sweep, stage the owed receipt (control priority, blocker 3),
+/// payload, encrypt, sign, record, recompute mode.
 fn stage_send_operation(
     candidate: &mut Candidate,
     body: &str,
@@ -1676,6 +1731,19 @@ fn stage_send_operation(
     sweep_expired_sends(candidate, now)?;
     prune_terminal_sends(candidate, now);
     sweep_expired_acks(candidate, now)?;
+    // Control priority (review D2b v4 blocker 3): an owed receipt
+    // outranks the new application body for any slot the sweeps freed,
+    // so it stages BEFORE the application insert. The application is
+    // inserted only if capacity remains; otherwise the whole candidate
+    // (including the staged receipt) is discarded, this returns the
+    // bound error, and the caller retries — the receipt stays owed and
+    // re-stages on the retry. Application sends can never starve (they
+    // error immediately and are retryable); receipts were the
+    // silent-loss case.
+    maybe_stage_owed_receipt(candidate, now)?;
+    if candidate.state.sends.len() >= MAX_SENDS {
+        return Err(LabError::Storage);
+    }
     let (epoch_id, send_seq, conversation_id) = {
         let active = candidate
             .state
@@ -1741,6 +1809,8 @@ fn stage_send_operation(
         expires_at,
         send_signature: Some(signature),
         packet_digest: None,
+        kind: SendKind::Application,
+        receipt_high_water: None,
     });
     candidate
         .state
@@ -1753,15 +1823,8 @@ fn stage_send_operation(
             .as_mut()
             .ok_or(LabError::MissingSession)?;
         active.last_assigned_send_seq = send_seq;
+        recompute_mode(active);
     }
-    // Pruning/sweeping above may have freed capacity for an owed receipt.
-    maybe_stage_owed_receipt(candidate, now)?;
-    let active = candidate
-        .state
-        .active_session
-        .as_mut()
-        .ok_or(LabError::MissingSession)?;
-    recompute_mode(active);
     Ok(DurableAction {
         token: *message_id.as_bytes(),
         request,
@@ -1862,7 +1925,7 @@ fn ratchet_step(
             mode: SessionMode::Ready,
             receipt: None,
             received_above_high_water: Vec::new(),
-            last_staged_receipt_high_water: 0,
+            last_delivered_receipt_high_water: 0,
             conversation_id: candidate.state.conversation_id,
         });
         candidate.session = Some(session);
@@ -1981,11 +2044,24 @@ fn accept_envelope_operation(
     )?;
 
     // (f) Sender-sequence tracking against the contiguous high water and
-    // the bounded out-of-order set.
+    // the bounded out-of-order set. Capture the receipt books first: the
+    // quiescence rule below needs to know whether a debt predated this
+    // accept (review D2b v4 blockers 2 and 4).
     let send_seq = parsed.send_seq;
     if send_seq == 0 {
         return Err(LabError::InvalidPayload);
     }
+    let (hcr_before, owed_before) = {
+        let active = candidate
+            .state
+            .active_session
+            .as_ref()
+            .ok_or(LabError::MissingSession)?;
+        (
+            active.highest_contiguous_received_seq,
+            active.highest_contiguous_received_seq > active.last_delivered_receipt_high_water,
+        )
+    };
     track_sender_sequence(
         candidate
             .state
@@ -2032,16 +2108,64 @@ fn accept_envelope_operation(
         _ => return Err(LabError::InvalidPayload),
     };
 
-    // (i) Owed-receipt staging and mode recompute before the commit
-    // (RekeyRequired dominates).
-    maybe_stage_owed_receipt(candidate, now)?;
+    accept_staging_tail(candidate, parsed.kind, hcr_before, owed_before, now)?;
+    Ok(AcceptArtifact::Outcome(outcome))
+}
+
+/// Step (i) of accept: recompute the budget mode from the FRESH high
+/// water BEFORE any staging (review D2b v4 blocker 4): an applied receipt
+/// that drops outstanding below the lock threshold makes a previously
+/// owed receipt stageable in THIS pass; recomputing afterwards would
+/// skip it with the stale mode. `RekeyRequired` dominance is preserved by
+/// `recompute_mode`. The accept path is the only mutator that both moves
+/// a high water and stages; every other stager recomputes from values it
+/// just set itself.
+///
+/// Quiescence (review D2b v4 blocker 2): a receipt-driven HCR advance
+/// creates NO obligation, so receipts are never acknowledged recursively.
+/// When the books were balanced before the accept (the delivered marker
+/// equalled the high water), move the marker past the receipt's OWN
+/// sequence (`hcr_before + 1`) and stage nothing; application sequences
+/// drained from the out-of-order set beyond it stay owed and are covered
+/// by the next application-triggered receipt (receipts are coalesced
+/// control, only the latest HCR matters). A debt that PREDATES the
+/// receipt is not a counter-receipt: it stays owed and stages here with
+/// the freshly recomputed mode (blocker 4).
+fn accept_staging_tail(
+    candidate: &mut Candidate,
+    kind: u8,
+    hcr_before: u64,
+    owed_before: bool,
+    now: u64,
+) -> Result<()> {
+    {
+        let active = candidate
+            .state
+            .active_session
+            .as_mut()
+            .ok_or(LabError::MissingSession)?;
+        recompute_mode(active);
+    }
+    if kind == payload::KIND_RECEIPT && !owed_before {
+        let active = candidate
+            .state
+            .active_session
+            .as_mut()
+            .ok_or(LabError::MissingSession)?;
+        if active.highest_contiguous_received_seq > hcr_before {
+            active.last_delivered_receipt_high_water = hcr_before + 1;
+        }
+    }
+    if kind == payload::KIND_APPLICATION || owed_before {
+        maybe_stage_owed_receipt(candidate, now)?;
+    }
     let active = candidate
         .state
         .active_session
         .as_mut()
         .ok_or(LabError::MissingSession)?;
     recompute_mode(active);
-    Ok(AcceptArtifact::Outcome(outcome))
+    Ok(())
 }
 
 /// Step (f) of accept: advance the contiguous high water, draining the
@@ -2127,12 +2251,12 @@ fn consume_inbound_operation(
         .acks
         .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
 
-    // Owed-receipt staging (review D2b v3, codec field 19): a receipt is
-    // owed while the contiguous received high water exceeds
-    // `last_staged_receipt_high_water`; it stages here when the mode
-    // allows control traffic and the send array has capacity, and stays
-    // owed otherwise (a skipped receipt is never lost). See
-    // `maybe_stage_owed_receipt`.
+    // Owed-receipt staging (review D2b v4): a receipt is owed while the
+    // contiguous received high water exceeds
+    // `last_delivered_receipt_high_water` and no `Pending` receipt for the
+    // same water is in flight; it stages here when the mode allows control
+    // traffic and the send array has capacity, and stays owed otherwise
+    // (a skipped receipt is never lost). See `maybe_stage_owed_receipt`.
     maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
@@ -2147,12 +2271,11 @@ fn consume_inbound_operation(
 /// counter): a `HighWaterReceipt` signed with our account Ed25519
 /// identity, encrypted as a `Receipt` payload, signed for the peer's
 /// mailbox like any other send.
-fn stage_receipt(
-    candidate: &mut Candidate,
-    high_water: u64,
-    valid_until: u64,
-    now: u64,
-) -> Result<()> {
+fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result<()> {
+    // Receipt envelopes carry the 7-day message TTL, identical to
+    // `stage_send`'s expiry rule (review D2b v4: the 300 s request
+    // window wedged receipts that outlived it unstored).
+    let expires_at = now.saturating_add(MAX_MESSAGE_TTL_SECONDS);
     let (epoch_id, send_seq, peer_curve, conversation_id) = {
         let active = candidate
             .state
@@ -2219,7 +2342,7 @@ fn stage_receipt(
         queue_id,
         message_id,
         &packet.digest(),
-        valid_until,
+        expires_at,
     ));
     candidate.state.sends.push(SendRecord {
         message_id,
@@ -2228,9 +2351,11 @@ fn stage_receipt(
         sequence: send_seq,
         queue_id: Some(queue_id),
         packet: Some(packet),
-        expires_at: valid_until,
+        expires_at,
         send_signature: Some(signature),
         packet_digest: None,
+        kind: SendKind::Receipt,
+        receipt_high_water: Some(high_water),
     });
     candidate
         .state
@@ -2242,32 +2367,35 @@ fn stage_receipt(
         .as_mut()
         .ok_or(LabError::MissingSession)?;
     active.last_assigned_send_seq = send_seq;
-    active.last_staged_receipt_high_water = high_water;
+    // The delivered-marker deliberately does NOT move at staging (v4):
+    // it advances only when the receipt reaches a delivered terminal
+    // state in record_send_result.
     Ok(())
 }
 
-/// Stage the owed receipt, if any (review D2b v3, codec field 19): a
-/// receipt is owed while `highest_contiguous_received_seq` exceeds
-/// `last_staged_receipt_high_water`. It stages only when the mode allows
-/// control traffic and the send array has capacity; otherwise it stays
-/// owed and the next clock-taking mutator retries, so a skipped
-/// best-effort receipt is never lost. Called from every clock-taking
-/// mutator after the sweeps. `ReceiptLocked`/`RekeyRequired` still block
-/// staging per §4.
+/// Stage the owed receipt, if any (review D2b v4): a receipt is owed
+/// while `highest_contiguous_received_seq` exceeds
+/// `last_delivered_receipt_high_water` AND no `Pending` receipt-kind send
+/// with `receipt_high_water` equal to the current high water is in
+/// flight. It stages at most one receipt per mutator pass, only when the
+/// mode allows control traffic and the send array has capacity; otherwise
+/// it stays owed and the next clock-taking mutator retries, so a skipped
+/// or lost receipt is never silently satisfied. `ReceiptLocked`/
+/// `RekeyRequired` still block staging per §4.
 fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<()> {
     let Some(active) = candidate.state.active_session.as_ref() else {
         return Ok(());
     };
     let high_water = active.highest_contiguous_received_seq;
-    let owed = high_water > active.last_staged_receipt_high_water;
+    let owed = high_water > active.last_delivered_receipt_high_water;
     let mode_allows = matches!(active.mode, SessionMode::Ready | SessionMode::ControlOnly);
-    if owed && mode_allows && candidate.state.sends.len() < MAX_SENDS {
-        stage_receipt(
-            candidate,
-            high_water,
-            now.saturating_add(REQUEST_WINDOW_SECONDS),
-            now,
-        )?;
+    let in_flight = candidate.state.sends.iter().any(|record| {
+        record.state == SendState::Pending
+            && record.kind == SendKind::Receipt
+            && record.receipt_high_water == Some(high_water)
+    });
+    if owed && !in_flight && mode_allows && candidate.state.sends.len() < MAX_SENDS {
+        stage_receipt(candidate, high_water, now)?;
     }
     Ok(())
 }

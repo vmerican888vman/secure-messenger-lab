@@ -381,15 +381,16 @@ impl HighWaterReceipt {
 /// declares 18 fields. Validation requires it to equal top-level field 8
 /// for both roles, and a present receipt must still also match it.
 ///
-/// **Wire-layout amendment (review D2b v3):** field 19,
-/// `last_staged_receipt_high_water: u64`, was added so a skipped
-/// best-effort receipt is never lost silently: a receipt is owed while
-/// `highest_contiguous_received_seq > last_staged_receipt_high_water`,
-/// and the façade stages it as soon as capacity and mode allow. 0 means
-/// no receipt has been staged. Validation requires
-/// `last_staged_receipt_high_water <= highest_contiguous_received_seq` —
-/// no receipt can have been staged for a high water never reached. The
-/// object now declares 19 fields.
+/// **Wire-layout amendments (reviews D2b v3/v4):** field 19,
+/// `last_delivered_receipt_high_water: u64`, marks the highest received
+/// high water a DELIVERED receipt has reported (0 = none delivered). v3
+/// added it as `last_staged_...`; v4 renamed it in place (same wire
+/// position, codec still pre-PASS) because the marker now advances only
+/// when a receipt send reaches a delivered terminal state, never at
+/// staging. A receipt is owed while `highest_contiguous_received_seq`
+/// exceeds it. Validation requires the marker never to exceed
+/// `highest_contiguous_received_seq` — no receipt can have reported a
+/// high water never reached. The object declares 19 fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -409,10 +410,10 @@ pub(crate) struct ActiveSession {
     pub(crate) received_above_high_water: Vec<u64>,
     /// Conversation binding; must equal top-level field 8 (field 18).
     pub(crate) conversation_id: ConversationId,
-    /// Highest received contiguous high water a staged receipt has
-    /// reported; 0 = none staged (field 19). Never exceeds
+    /// Highest received contiguous high water a DELIVERED receipt has
+    /// reported; 0 = none delivered (field 19). Never exceeds
     /// `highest_contiguous_received_seq`.
-    pub(crate) last_staged_receipt_high_water: u64,
+    pub(crate) last_delivered_receipt_high_water: u64,
 }
 
 impl ActiveSession {
@@ -443,7 +444,7 @@ impl ActiveSession {
         let receipt = HighWaterReceipt::parse(object.field(16)?)?;
         let received = parse_u64_set(object.field(17)?, MAX_RECEIVED_SET)?;
         let conversation_id = conversation_id(object.field(18)?)?;
-        let last_staged_receipt_high_water = u64_value(object.field(19)?)?;
+        let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -460,7 +461,7 @@ impl ActiveSession {
             receipt,
             received_above_high_water: received,
             conversation_id,
-            last_staged_receipt_high_water,
+            last_delivered_receipt_high_water,
         })
     }
 
@@ -480,7 +481,8 @@ impl ActiveSession {
             .as_ref()
             .map_or(Vec::new(), HighWaterReceipt::encode);
         let received_bytes = encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?;
-        let last_staged_receipt_high_water = self.last_staged_receipt_high_water.to_be_bytes();
+        let last_delivered_receipt_high_water =
+            self.last_delivered_receipt_high_water.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -502,7 +504,7 @@ impl ActiveSession {
                 (16, &receipt_bytes),
                 (17, &received_bytes),
                 (18, self.conversation_id.as_bytes()),
-                (19, &last_staged_receipt_high_water),
+                (19, &last_delivered_receipt_high_water),
             ],
         )?;
         Ok(Zeroizing::new(object))
@@ -596,6 +598,24 @@ impl SendState {
     }
 }
 
+/// Send-record kind: `1` = application, `2` = receipt (control).
+///
+/// **Wire-layout amendment (review D2b v4):** fields 10 (`kind: u8`) and
+/// 11 (`receipt_high_water: u64`) were added so the expiry sweep and the
+/// owed-receipt rule can identify receipt sends without decrypting. Field
+/// 10 is present on every record (both arms). Field 11 carries content
+/// only on a full-arm receipt record (exactly 8 bytes, value >= 1); it is
+/// zero-length (absent) on application and terminal records. Invalid
+/// kind, `hw = 0` on a receipt, nonzero hw on an application record, or
+/// an hw field on a terminal record all reject; a full-arm receipt's hw
+/// must additionally not exceed the session's
+/// `highest_contiguous_received_seq` (semantic validation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SendKind {
+    Application = 1,
+    Receipt = 2,
+}
+
 /// Send record (object type `0x0007`). Both arms are encoded under the
 /// same field IDs with zero length meaning absent, per the optional-field
 /// rule: `Pending` carries queue, packet and signature (digest absent);
@@ -611,6 +631,9 @@ pub(crate) struct SendRecord {
     pub(crate) expires_at: u64,
     pub(crate) send_signature: Option<Ed25519Signature>,
     pub(crate) packet_digest: Option<[u8; 32]>,
+    pub(crate) kind: SendKind,
+    /// Present (>= 1) only on a full-arm receipt record (field 11).
+    pub(crate) receipt_high_water: Option<u64>,
 }
 
 impl SendRecord {
@@ -635,6 +658,12 @@ impl SendRecord {
             expires_at: u64_value(object.field(7)?)?,
             send_signature: optional(object.field(8)?, signature)?,
             packet_digest: optional(object.field(9)?, tlv::fixed::<32>)?,
+            kind: match u8_value(object.field(10)?)? {
+                1 => SendKind::Application,
+                2 => SendKind::Receipt,
+                _ => return Err(LabError::Storage),
+            },
+            receipt_high_water: optional(object.field(11)?, u64_value)?,
         };
         object.finish()?;
         if !record.arms_consistent() {
@@ -643,9 +672,9 @@ impl SendRecord {
         Ok(record)
     }
 
-    /// The optional fields must match the state arm exactly.
+    /// The optional fields must match the state arm and kind exactly.
     pub(crate) fn arms_consistent(&self) -> bool {
-        if self.state.carries_full_arm() {
+        let arm_ok = if self.state.carries_full_arm() {
             self.queue_id.is_some()
                 && self.packet.is_some()
                 && self.send_signature.is_some()
@@ -655,7 +684,14 @@ impl SendRecord {
                 && self.packet.is_none()
                 && self.send_signature.is_none()
                 && self.packet_digest.is_some()
-        }
+        };
+        let kind_ok = match (self.state.carries_full_arm(), self.kind) {
+            (true, SendKind::Receipt) => self.receipt_high_water.is_some_and(|hw| hw >= 1),
+            // Full-arm application records and every terminal record
+            // carry no high water.
+            (true, SendKind::Application) | (false, _) => self.receipt_high_water.is_none(),
+        };
+        arm_ok && kind_ok
     }
 
     pub(crate) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
@@ -675,6 +711,10 @@ impl SendRecord {
         let digest = self
             .packet_digest
             .map_or_else(Vec::new, |digest| digest.to_vec());
+        let kind = [self.kind as u8];
+        let high_water = self
+            .receipt_high_water
+            .map_or_else(Vec::new, |hw| hw.to_be_bytes().to_vec());
         let object = tlv::write_object(
             SEND_TYPE,
             &[
@@ -687,6 +727,8 @@ impl SendRecord {
                 (7, &expires_at),
                 (8, &signature_bytes),
                 (9, &digest),
+                (10, &kind),
+                (11, &high_water),
             ],
         )?;
         Ok(Zeroizing::new(object))

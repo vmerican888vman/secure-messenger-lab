@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 use super::records::{
     self, AckIntent, ActiveSession, DedupRecord, InboundRecord, PeerBinding, PendingPreKey,
-    RegistrationRecord, SendRecord,
+    RegistrationRecord, SendKind, SendRecord,
 };
 use super::tlv;
 use super::validate::{prekey_signing_bytes, receipt_signing_bytes, send_signing_bytes};
@@ -146,6 +146,8 @@ fn make_send_records(
             expires_at,
             send_signature: Some(signature),
             packet_digest: None,
+            kind: SendKind::Application,
+            receipt_high_water: None,
         });
     }
     sends.push(SendRecord {
@@ -158,6 +160,8 @@ fn make_send_records(
         expires_at: NOW + 3_600,
         send_signature: None,
         packet_digest: Some(digest(b"stored-packet")),
+        kind: SendKind::Application,
+        receipt_high_water: None,
     });
     Ok(sends)
 }
@@ -307,7 +311,7 @@ fn make_active_session(
         receipt: Some(receipt),
         received_above_high_water: vec![3],
         conversation_id,
-        last_staged_receipt_high_water: 1,
+        last_delivered_receipt_high_water: 1,
     })
 }
 
@@ -1197,7 +1201,7 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
     // public key, an enum or the received set; flipping it must fail. The
     // ACK array ends in the ACK state byte (Pending = 1, flipping bit 0
     // makes the invalid 0). For the session (index 14) the flip targets
-    // the high byte of field 19 (`last_staged_receipt_high_water`), eight
+    // the high byte of field 19 (`last_delivered_receipt_high_water`), eight
     // bytes in from the end — the value becomes enormous and exceeds the
     // received high water.
     for index in [11_usize, 12, 13, 17] {
@@ -2028,7 +2032,7 @@ fn receipt_only_session_validates() -> Result<(), Box<dyn Error>> {
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
     active.received_above_high_water.clear();
-    active.last_staged_receipt_high_water = 0;
+    active.last_delivered_receipt_high_water = 0;
     // peer_contiguous_high_water stays 1 with its genuine receipt.
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
@@ -2089,6 +2093,8 @@ fn delivery_unknown_transition_uses_digest_arm_and_round_trips() -> Result<(), B
         expires_at: pending.expires_at,
         send_signature: None,
         packet_digest: Some(packet_digest),
+        kind: SendKind::Application,
+        receipt_high_water: None,
     };
     fixture.state.sends[0] = transitioned;
     let encoded = fixture.state.encode()?;
@@ -2140,7 +2146,7 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     set_water(&mut fixture, 32, 0, SessionMode::ReceiptLocked)?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
-    active.last_staged_receipt_high_water = 0;
+    active.last_delivered_receipt_high_water = 0;
     active.received_above_high_water.clear();
 
     // Keep the two genuine Pending records (sequences 1-2), drop the
@@ -2166,6 +2172,8 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
             expires_at: NOW + 3_600,
             send_signature: None,
             packet_digest: Some(digest(b"packet")),
+            kind: SendKind::Application,
+            receipt_high_water: None,
         });
     }
     // Re-add a terminal record at sequence 3 and sort by message ID.
@@ -2179,6 +2187,8 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
         expires_at: NOW + 3_600,
         send_signature: None,
         packet_digest: Some(digest(b"stored-packet")),
+        kind: SendKind::Application,
+        receipt_high_water: None,
     });
     fixture
         .state
@@ -2199,6 +2209,8 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
         expires_at: NOW + 3_600,
         send_signature: None,
         packet_digest: Some(digest(b"another")),
+        kind: SendKind::Application,
+        receipt_high_water: None,
     });
     assert!(fixture.state.encode().is_err());
     Ok(())
@@ -2855,25 +2867,26 @@ fn dedup_expiry_must_match_inbound_record() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-// --- review D2b v3: field 19 ------------------------------------------------
+// --- review D2b v4: field 19 (delivered-receipt marker) ----------------------
 
-/// Field 19 (`last_staged_receipt_high_water`) may never exceed the
+/// Field 19 (`last_delivered_receipt_high_water`) may never exceed the
 /// contiguous received high water; equal and lower values are fine.
 #[test]
-fn last_staged_receipt_high_water_never_exceeds_received() -> Result<(), Box<dyn Error>> {
-    // The populated fixture stages with hcr = 1 and last_staged = 1.
-    for (last_staged, valid) in [(2_u64, false), (1, true), (0, true)] {
+fn last_delivered_receipt_high_water_never_exceeds_received() -> Result<(), Box<dyn Error>> {
+    // The populated fixture stages with hcr = 1 and the delivered
+    // marker = 1.
+    for (last_delivered, valid) in [(2_u64, false), (1, true), (0, true)] {
         let mut fixture = populated_fixture()?;
         fixture
             .state
             .active_session
             .as_mut()
             .ok_or("no session")?
-            .last_staged_receipt_high_water = last_staged;
+            .last_delivered_receipt_high_water = last_delivered;
         assert_eq!(
             fixture.state.encode().is_ok(),
             valid,
-            "last_staged {last_staged}"
+            "last_delivered {last_delivered}"
         );
     }
 
@@ -2882,7 +2895,7 @@ fn last_staged_receipt_high_water_never_exceeds_received() -> Result<(), Box<dyn
     let mut fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
-    active.last_staged_receipt_high_water = 99;
+    active.last_delivered_receipt_high_water = 99;
     let session_bytes = active.encode()?;
     let bytes = splice_top(&encoded, 14, field_block(15, &session_bytes)?)?;
     assert!(ClientStateV1::decode(&bytes).is_err());
@@ -2890,16 +2903,147 @@ fn last_staged_receipt_high_water_never_exceeds_received() -> Result<(), Box<dyn
 }
 
 /// A populated state carrying the new field round-trips byte-identically
-/// (the fixture carries `last_staged` = hcr = 1).
+/// (the fixture carries the delivered marker = hcr = 1).
 #[test]
 fn field_19_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let active = fixture.state.active_session.as_ref().ok_or("no session")?;
-    assert_eq!(active.last_staged_receipt_high_water, 1);
+    assert_eq!(active.last_delivered_receipt_high_water, 1);
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
     let reencoded = decoded.encode()?;
     assert_eq!(&encoded[..], &reencoded[..]);
+    Ok(())
+}
+
+// --- review D2b v4: SendRecord kind/receipt_high_water arms -------------------
+
+/// Decode a genuine populated encoding whose first send element is
+/// replaced by a hand-crafted object carrying the given kind byte and
+/// high-water field; returns true when the splice decodes.
+fn decode_with_spliced_send(kind: u8, hw: Option<u64>) -> Result<bool, Box<dyn Error>> {
+    let fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let blocks = split_top(&encoded)?;
+    let mut elements = split_array(blocks.get(16).ok_or("sends")?.get(6..).ok_or("sends")?)?;
+    let record = fixture.state.sends.first().ok_or("no pending send")?;
+    let object = owned_object(
+        records::SEND_TYPE,
+        &[
+            (1, record.message_id.as_bytes().to_vec()),
+            (2, vec![record.state as u8]),
+            (3, record.epoch_id.to_vec()),
+            (4, record.sequence.to_be_bytes().to_vec()),
+            (
+                5,
+                record
+                    .queue_id
+                    .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
+            ),
+            (
+                6,
+                record
+                    .packet
+                    .as_ref()
+                    .map_or_else(Vec::new, |packet| packet.as_bytes().to_vec()),
+            ),
+            (7, record.expires_at.to_be_bytes().to_vec()),
+            (
+                8,
+                record
+                    .send_signature
+                    .map_or_else(Vec::new, |sig| sig.to_bytes().to_vec()),
+            ),
+            (9, Vec::new()),
+            (10, vec![kind]),
+            (
+                11,
+                hw.map_or_else(Vec::new, |high_water| high_water.to_be_bytes().to_vec()),
+            ),
+        ],
+    )?;
+    let mut element = u32::try_from(object.len())?.to_be_bytes().to_vec();
+    element.extend_from_slice(&object);
+    *elements.get_mut(0).ok_or("no element")? = element;
+    let bytes = splice_top(&encoded, 16, field_block(17, &join_array(&elements)?)?)?;
+    Ok(ClientStateV1::decode(&bytes).is_ok())
+}
+
+/// Fields 10 (`kind`) and 11 (`receipt_high_water`): the kind matrix holds
+/// on both paths. Full-arm receipt records must carry `hw >= 1` and not
+/// above the received high water; application records must not carry it;
+/// terminal records never carry it; invalid kind bytes reject.
+#[test]
+fn send_record_kind_arm_rules() -> Result<(), Box<dyn Error>> {
+    // Encode path (the fixture's sends[0] is Pending, sends[2] terminal
+    // Stored; the received high water is 1).
+    for (hw, valid) in [
+        (Some(1_u64), true),
+        (Some(0), false),
+        (Some(2), false),
+        (None, false),
+    ] {
+        let mut fixture = populated_fixture()?;
+        let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
+        record.kind = SendKind::Receipt;
+        record.receipt_high_water = hw;
+        assert_eq!(fixture.state.encode().is_ok(), valid, "receipt hw {hw:?}");
+    }
+    // A valid full-arm receipt round-trips byte-identically.
+    let mut fixture = populated_fixture()?;
+    {
+        let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
+        record.kind = SendKind::Receipt;
+        record.receipt_high_water = Some(1);
+    }
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+    // An application record may not carry a high water.
+    let mut fixture = populated_fixture()?;
+    fixture
+        .state
+        .sends
+        .get_mut(0)
+        .ok_or("no pending send")?
+        .receipt_high_water = Some(1);
+    assert!(fixture.state.encode().is_err());
+    // A terminal record may be receipt-kind with the water absent...
+    let mut fixture = populated_fixture()?;
+    fixture
+        .state
+        .sends
+        .get_mut(2)
+        .ok_or("no terminal send")?
+        .kind = SendKind::Receipt;
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+    // ...but never with a high water.
+    fixture
+        .state
+        .sends
+        .get_mut(2)
+        .ok_or("no terminal send")?
+        .receipt_high_water = Some(1);
+    assert!(fixture.state.encode().is_err());
+
+    // Decode path: hand-crafted array elements spliced into the genuine
+    // encoding — invalid kind byte, receipt with hw 0, receipt with hw
+    // above the received water all reject; a valid full-arm receipt
+    // (hw == hcr) decodes.
+    for (kind, hw, valid) in [
+        (3_u8, Option::<u64>::None, false),
+        (2, Some(0), false),
+        (2, Some(9), false),
+        (2, Some(1), true),
+    ] {
+        assert_eq!(
+            decode_with_spliced_send(kind, hw)?,
+            valid,
+            "kind {kind} hw {hw:?}"
+        );
+    }
     Ok(())
 }
 
