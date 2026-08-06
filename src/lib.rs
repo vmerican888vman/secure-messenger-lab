@@ -17,8 +17,8 @@ pub mod relay;
 mod state;
 
 pub use capability::{
-    MailboxOwner, MailboxRegistration, ManageCapability, ReceiveCapability, SendCapability,
-    VerifiedEnvelope,
+    AckRequest, FetchRequest, MailboxOwner, MailboxRegistration, ManageCapability,
+    ReceiveCapability, SendCapability, SendRequest, VerifiedEnvelope,
 };
 pub use client::{
     EncryptedPacket, OlmClient, OpenedMessage, PeerPreKey, PlainMessage, VerifiedPeerPreKey,
@@ -27,8 +27,8 @@ pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
 pub use persistence::{ClientStateStore, ProfileBinding, ProtectionLevel, StateKeyProtector};
 pub use persistent::{
-    DeliveryUnknownView, DurableAction, PersistentClient, PublicIdentity, RedactedContactOffer,
-    RegistrationOutcome, SendOutcome,
+    AcceptOutcome, AckOutcomeView, DeliveryUnknownView, DurableAction, InboundView,
+    PersistentClient, PublicIdentity, RedactedContactOffer, RegistrationOutcome, SendOutcome,
 };
 pub use private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 pub use relay::{AckOutcome, EnqueueOutcome, Relay, StoredEnvelope};

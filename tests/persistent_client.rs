@@ -992,3 +992,49 @@ fn escape_inflated_body_rejected_as_invalid_payload() -> Result<(), Box<dyn Erro
     assert_eq!(payload["send_seq"], 1);
     Ok(())
 }
+
+// --- combined review round additions -----------------------------------------
+
+/// Finding 6: every type appearing in the façade's public signatures is
+/// reachable from the crate root. Each line fails compilation if an
+/// export disappears.
+#[test]
+fn public_signature_types_are_exported() {
+    let _: Option<secure_messenger_lab::AcceptOutcome> = None;
+    let _: Option<secure_messenger_lab::AckOutcomeView> = None;
+    let _: Option<secure_messenger_lab::InboundView> = None;
+    let _: Option<secure_messenger_lab::DeliveryUnknownView> = None;
+    let _: Option<secure_messenger_lab::SendOutcome> = None;
+    let _: Option<secure_messenger_lab::RegistrationOutcome> = None;
+    let _: Option<secure_messenger_lab::DurableAction<secure_messenger_lab::SendRequest>> = None;
+    let _: Option<secure_messenger_lab::DurableAction<secure_messenger_lab::FetchRequest>> = None;
+    let _: Option<secure_messenger_lab::DurableAction<secure_messenger_lab::AckRequest>> = None;
+    let _: Option<secure_messenger_lab::DurableAction<secure_messenger_lab::MailboxRegistration>> =
+        None;
+    let _: Option<secure_messenger_lab::PublicIdentity> = None;
+    let _: Option<secure_messenger_lab::RedactedContactOffer> = None;
+    let _: Option<secure_messenger_lab::PersistentClient<TestProtector>> = None;
+}
+
+/// Finding 4 (D2a): the presented request's message ID must bind to the
+/// token and the durable record.
+#[test]
+fn send_result_requires_message_id_binding() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let (mut client, _peer) = send_ready_client(&temp)?;
+    let action = client.stage_send("bound", NOW, NOW + 3_600, NOW)?;
+
+    // Foreign message ID in the request, correct token.
+    let mut foreign = action.clone();
+    foreign.request.message_id = secure_messenger_lab::MessageId::random();
+    assert!(
+        client
+            .record_send_result(&foreign, SendOutcome::Stored)
+            .is_err(),
+        "foreign message_id accepted"
+    );
+
+    // Untouched by the rejection: the genuine action consumes.
+    client.record_send_result(&action, SendOutcome::Stored)?;
+    Ok(())
+}

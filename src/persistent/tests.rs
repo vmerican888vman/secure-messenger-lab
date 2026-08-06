@@ -966,3 +966,190 @@ fn accept_path_reconcile_required_on_commit_failure() -> std::result::Result<(),
     assert!(matches!(outcome, AcceptOutcome::Application(_)));
     Ok(())
 }
+
+// --- combined review round: ACK binding + expiry sweep -----------------------
+
+#[test]
+fn ack_result_requires_full_request_binding() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0, 1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let inbound = a.pending_inbound()?;
+    let id1 = inbound
+        .iter()
+        .find(|view| view.body == "m1")
+        .ok_or("m1 missing")?
+        .message_id;
+    let id2 = inbound
+        .iter()
+        .find(|view| view.body == "m2")
+        .ok_or("m2 missing")?
+        .message_id;
+    a.consume_inbound(id1, NOW + 3_600, NOW)?;
+    a.consume_inbound(id2, NOW + 3_600, NOW)?;
+    let actions = a.ack_actions(NOW)?;
+    let action = actions
+        .iter()
+        .find(|candidate| candidate.request.message_id == id1)
+        .ok_or("m1 ack missing")?
+        .clone();
+    let action_two = actions
+        .iter()
+        .find(|candidate| candidate.request.message_id == id2)
+        .ok_or("m2 ack missing")?
+        .clone();
+
+    // Wrong message ID in the request, right token.
+    let mut wrong_id = action.clone();
+    wrong_id.request.message_id = MessageId::random();
+    assert!(
+        a.record_ack_result(&wrong_id, AckOutcomeView::Deleted)
+            .is_err(),
+        "foreign message_id accepted"
+    );
+
+    // Wrong signature over otherwise-correct fields.
+    let mut wrong_sig = action.clone();
+    let mut signature_bytes = wrong_sig.request.signature.to_bytes();
+    signature_bytes[0] ^= 0x01;
+    wrong_sig.request.signature = vodozemac::Ed25519Signature::from_slice(&signature_bytes)?;
+    assert!(
+        a.record_ack_result(&wrong_sig, AckOutcomeView::Deleted)
+            .is_err(),
+        "forged signature accepted"
+    );
+
+    // Right token, wrong durable field (validity).
+    let mut wrong_field = action.clone();
+    wrong_field.request.valid_until += 1;
+    assert!(
+        a.record_ack_result(&wrong_field, AckOutcomeView::Deleted)
+            .is_err(),
+        "field mismatch accepted"
+    );
+
+    // Cross-action: a token that matches nothing, and a token from a
+    // different intent with this request.
+    let cross = super::DurableAction {
+        token: action_two.token,
+        request: action.request.clone(),
+    };
+    assert!(
+        a.record_ack_result(&cross, AckOutcomeView::Deleted)
+            .is_err(),
+        "cross-action accepted"
+    );
+
+    // Nothing mutated: both genuine actions consume, and replay rejects.
+    a.record_ack_result(&action, AckOutcomeView::Deleted)?;
+    a.record_ack_result(&action_two, AckOutcomeView::AlreadyGone)?;
+    assert!(
+        a.record_ack_result(&action, AckOutcomeView::Deleted)
+            .is_err(),
+        "replay accepted"
+    );
+    Ok(())
+}
+
+#[test]
+fn expired_ack_intents_are_swept() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0, 1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let inbound = a.pending_inbound()?;
+    let expired_id = inbound
+        .iter()
+        .find(|view| view.body == "m1")
+        .ok_or("m1 missing")?
+        .message_id;
+    let fresh_id = inbound
+        .iter()
+        .find(|view| view.body == "m2")
+        .ok_or("m2 missing")?
+        .message_id;
+    // One intent expires soon, one stays valid.
+    a.consume_inbound(expired_id, NOW + 60, NOW)?;
+    a.consume_inbound(fresh_id, NOW + 3_600, NOW)?;
+    assert_eq!(a.state.acks.len(), 2);
+
+    // The next clock-taking mutator at NOW+120 sweeps the expired intent
+    // and expires its dedup record; the unexpired intent is untouched.
+    a.stage_send("trigger", NOW + 120, NOW + 120 + 3_600, NOW + 120)?;
+    assert_eq!(a.state.acks.len(), 1);
+    assert_eq!(a.state.acks[0].message_id, fresh_id);
+    let expired = a
+        .state
+        .dedup
+        .iter()
+        .find(|record| record.message_id == expired_id)
+        .ok_or("expired dedup missing")?;
+    assert_eq!(expired.state, DedupState::Expired);
+    let fresh = a
+        .state
+        .dedup
+        .iter()
+        .find(|record| record.message_id == fresh_id)
+        .ok_or("fresh dedup missing")?;
+    assert_eq!(fresh.state, DedupState::Accepted);
+    Ok(())
+}
+
+#[test]
+fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+    // One genuine accept so the ratchet has received (current-epoch dedup
+    // is receive-authoritative).
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+
+    // Fabricate a full bound of 32 self-consistent pending intents with
+    // matching dedup records, all expired.
+    let epoch_id = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    let queue_id = a.state.mailbox_queue_id;
+    for index in 0u8..32 {
+        let message_id = MessageId::random();
+        let packet_digest = crate::capability::digest(&[index]);
+        a.state.acks.push(crate::state::AckIntent {
+            message_id,
+            epoch_id,
+            sequence: 1,
+            queue_id,
+            packet_digest,
+            valid_until: NOW + 60,
+            state: crate::state::AckState::Pending,
+        });
+        a.state.dedup.push(crate::state::DedupRecord {
+            message_id,
+            epoch_id,
+            sequence: 1,
+            queue_id,
+            packet_digest,
+            expires_at: NOW + 3_600,
+            state: DedupState::Accepted,
+        });
+    }
+    a.state
+        .acks
+        .sort_by(|x, y| x.message_id.as_bytes().cmp(y.message_id.as_bytes()));
+    a.state
+        .dedup
+        .sort_by(|x, y| x.message_id.as_bytes().cmp(y.message_id.as_bytes()));
+    assert_eq!(a.state.acks.len(), 32);
+
+    a.stage_send("trigger", NOW + 120, NOW + 120 + 3_600, NOW + 120)?;
+    assert!(a.state.acks.is_empty(), "expired intents not swept");
+    assert!(
+        a.state
+            .dedup
+            .iter()
+            .filter(|record| record.message_id != a.state.inbound[0].message_id)
+            .all(|record| record.state == DedupState::Expired),
+        "swept dedup records not Expired"
+    );
+    Ok(())
+}
