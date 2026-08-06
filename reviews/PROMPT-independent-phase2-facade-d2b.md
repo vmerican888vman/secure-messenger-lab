@@ -1,5 +1,24 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v2)
+
+Version 1 (head `cf891ea336573869dc51efd6f632af2fcd01392f`) was dual-RETURNED
+(verdicts transcribed in `reviews/REVIEW-combined-codec-v5-d2a-d2b.md`):
+
+1. Both reviewers: `record_ack_result` removed the ACK intent without
+   validating the presented request. The amended head requires
+   `message_id == token == intent message_id`, exact
+   queue/packet_hash/valid_until equality with the durable fields, and a
+   valid `AckRequest` signature against the receive-capability public key,
+   all in the step-2 bounds before staging.
+2. Sol: missing public exports — lib.rs now re-exports every type appearing
+   in the façade's public signatures, with a compile-level test naming each
+   from the external crate path.
+3. Sol: expired pending ACK intents were never swept, exhausting the bounded
+   ACK slots — clock-taking mutators now remove expired Pending intents and
+   transition their dedup records to `Expired` (high-water/budget state
+   untouched).
+
 Review `secure-messenger-lab` at the exact head SHA supplied with this brief. Confirm the
 checked-out SHA and that the worktree is clean before reviewing. This same brief is being sent
 separately to Fable and Sol; do not seek, read, summarize, or defer to the other reviewer's response

@@ -1,5 +1,16 @@
 # Independent review — façade leg D2a: ClientPayloadV2 + outbound send path
 
+## Remediation history (v2)
+
+Version 1 (head `16adc902591196bfd0366be2bdb679bcc9253253`): Fable PASS, Sol
+RETURN — `record_send_result` substituted the stored message ID instead of
+validating the presented request's `message_id`. The amended head requires
+`request.message_id == token == record.message_id` in the step-2 bounds
+before the digest comparison; mismatches reject without mutation. The
+inbound leg (D2b) also landed between the two heads — it is out of scope for
+this brief; the D2a-relevant delta is confined to `record_send_result` and
+its tests.
+
 Review `secure-messenger-lab` at the exact head SHA supplied with this brief. Confirm the
 checked-out SHA and that the worktree is clean before reviewing. This same brief is being sent
 separately to Fable and Sol; do not seek, read, summarize, or defer to the other reviewer's response

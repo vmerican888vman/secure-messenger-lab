@@ -25,6 +25,17 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
+Version 5 (head `d8795fabb0bb5f9fb685c7a0f12e33ac2039b174`) was dual-RETURNED
+(verdicts transcribed in `reviews/REVIEW-combined-codec-v5-d2a-d2b.md`):
+Fable found the `u64::MAX` counter wrap (`wrapping_add` onto retained key id
+0); Sol found a non-zeroizing full-plaintext copy and mailbox capability
+collapse. The amended head under review now: requires
+`next_key_id <= u64::MAX - 1_000_000_000` (wrap headroom, documented);
+Zeroizing-wraps the one full-plaintext assembly in `ClientStateV1::encode`
+(all other copies audited — none remain); and requires the three mailbox
+capability public keys pairwise distinct in addition to keypair/registration
+correspondence.
+
 Version 4 (head `eb9d26f1fe59a9b51fa347b18f0ca45f53985222`) was RETURNED by
 Sol with one blocker (verdict in `reviews/REVIEW-sol-client-state-codec-v4.md`):
 `check_one_time_key_consistency` ignored `next_key_id`, so a canonical pickle
