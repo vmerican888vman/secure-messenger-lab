@@ -300,7 +300,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     assert!(client.establish_outbound_session(NOW).is_err());
 
     // Registration action and confirmed result.
-    let action = client.registration_action(NOW + 3_600)?;
+    let action = client.registration_action(NOW + 60, NOW)?;
     assert_eq!(action.request.nonce.as_bytes(), &action.token);
     action
         .request
@@ -346,12 +346,12 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     );
 
     // Terminal-failed registration also round-trips.
-    let failed = client.registration_action(NOW + 3_600)?;
+    let failed = client.registration_action(NOW + 60, NOW)?;
     client.record_registration_result(&failed, RegistrationOutcome::Failed)?;
     drop(client);
     let mut client = open_client(&temp)?;
     assert_eq!(client.public_identity()?, identity);
-    let third = client.registration_action(NOW + 3_600)?;
+    let third = client.registration_action(NOW + 60, NOW)?;
     client.record_registration_result(&third, RegistrationOutcome::Confirmed)?;
     Ok(())
 }
@@ -377,7 +377,7 @@ fn crash_reopen_discipline_between_every_mutator() -> Result<(), Box<dyn Error>>
     assert!(client.establish_outbound_session(NOW).is_err());
     // The durable action token survives the reopen: mint now, consume
     // after the next reopen.
-    let action = client.registration_action(NOW + 3_600)?;
+    let action = client.registration_action(NOW + 60, NOW)?;
     drop(client);
 
     let mut client = open_client(&temp)?;
@@ -403,7 +403,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     let mut client = create_client(&temp)?;
     let identity = client.public_identity()?;
     let offer = client.prekey_action(NOW + 300)?;
-    let pending_action = client.registration_action(NOW + 3_600)?;
+    let pending_action = client.registration_action(NOW + 60, NOW)?;
 
     // Tamper with the stored nonce through a second connection so the
     // next commit's exact-generation CAS fails (simulating an authentic
@@ -422,7 +422,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     )?;
 
     // The next mutator fails at commit (CAS) and enters ReconcileRequired.
-    assert!(client.registration_action(NOW + 3_600).is_err());
+    assert!(client.registration_action(NOW + 60, NOW).is_err());
     // ReconcileRequired: every operation rejects, including reads of
     // secret state; only the non-failing protection level stays.
     assert!(client.public_identity().is_err());
@@ -442,7 +442,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
             .is_err()
     );
     assert!(client.establish_outbound_session(NOW).is_err());
-    assert!(client.registration_action(NOW + 3_600).is_err());
+    assert!(client.registration_action(NOW + 60, NOW).is_err());
     assert!(
         client
             .record_registration_result(&pending_action, RegistrationOutcome::Confirmed)
@@ -475,11 +475,11 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
 fn action_token_and_digest_both_verified() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let mut client = create_client(&temp)?;
-    let action_a = client.registration_action(NOW + 3_600)?;
+    let action_a = client.registration_action(NOW + 60, NOW)?;
     // Minting a second action while the first is unconsumed REPLACES the
     // durable record (crash recovery: a lost token must not brick
     // registration).
-    let action_b = client.registration_action(NOW + 3_600)?;
+    let action_b = client.registration_action(NOW + 60, NOW)?;
 
     // Sol's scenario: presenting the superseded action A rejects, both as
     // a whole and in each cross-case.
@@ -521,14 +521,14 @@ fn action_token_and_digest_both_verified() -> Result<(), Box<dyn Error>> {
 
     // A token that matches nothing at all rejects without mutation; the
     // durable record is unaffected and a fresh action still consumes.
-    let mut wrong_token = client.registration_action(NOW + 3_600)?;
+    let mut wrong_token = client.registration_action(NOW + 60, NOW)?;
     wrong_token.token = [0xAB; 16];
     assert!(
         client
             .record_registration_result(&wrong_token, RegistrationOutcome::Confirmed)
             .is_err()
     );
-    let fresh = client.registration_action(NOW + 3_600)?;
+    let fresh = client.registration_action(NOW + 60, NOW)?;
     client.record_registration_result(&fresh, RegistrationOutcome::Failed)?;
     Ok(())
 }
@@ -975,7 +975,7 @@ fn fetch_request_verifies_against_real_relay() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let mut relay = secure_messenger_lab::Relay::open_in_memory()?;
     let mut client = create_client(&temp)?;
-    let registration = client.registration_action(NOW + 60)?;
+    let registration = client.registration_action(NOW + 60, NOW)?;
     relay.register(&registration.request, NOW)?;
     client.record_registration_result(&registration, RegistrationOutcome::Confirmed)?;
 

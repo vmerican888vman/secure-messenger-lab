@@ -205,7 +205,7 @@ fn payload_generation_tracks_store_generation() -> std::result::Result<(), Box<d
     assert_eq!(client.state.generation, client.store.generation()?);
     assert_eq!(client.state.generation, 2);
 
-    let action = client.registration_action(NOW + 60)?;
+    let action = client.registration_action(NOW + 60, NOW)?;
     client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
     assert_eq!(client.state.generation, client.store.generation()?);
     assert_eq!(client.state.generation, 4);
@@ -426,7 +426,7 @@ fn register_on_relay(
     client: &mut PersistentClient<TestProtector>,
     relay: &mut Relay,
 ) -> std::result::Result<(), Box<dyn Error>> {
-    let action = client.registration_action(NOW + 60)?;
+    let action = client.registration_action(NOW + 60, NOW)?;
     relay.register(&action.request, NOW)?;
     client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
     Ok(())
@@ -1006,8 +1006,8 @@ fn ack_result_requires_full_request_binding() -> std::result::Result<(), Box<dyn
         .find(|view| view.body == "m2")
         .ok_or("m2 missing")?
         .message_id;
-    a.consume_inbound(id1, NOW + 3_600, NOW)?;
-    a.consume_inbound(id2, NOW + 3_600, NOW)?;
+    a.consume_inbound(id1, NOW + 300, NOW)?;
+    a.consume_inbound(id2, NOW + 300, NOW)?;
     let actions = a.ack_actions(NOW)?;
     let action = actions
         .iter()
@@ -1090,7 +1090,7 @@ fn expired_ack_intents_are_swept() -> std::result::Result<(), Box<dyn Error>> {
         .message_id;
     // One intent expires soon, one stays valid.
     a.consume_inbound(expired_id, NOW + 60, NOW)?;
-    a.consume_inbound(fresh_id, NOW + 3_600, NOW)?;
+    a.consume_inbound(fresh_id, NOW + 300, NOW)?;
     assert_eq!(a.state.acks.len(), 2);
 
     // The next clock-taking mutator at NOW+120 sweeps the expired intent
@@ -1172,5 +1172,234 @@ fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<d
             .all(|record| record.state == DedupState::Expired),
         "swept dedup records not Expired"
     );
+    Ok(())
+}
+
+// --- D2b v2 remediation tests ------------------------------------------------
+
+/// Blocker 1: outcome `Failed` gets the full binding verification too.
+#[test]
+fn failed_ack_result_is_verified() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let inbound = a.pending_inbound()?;
+    let message_id = inbound.first().ok_or("no inbound")?.message_id;
+    a.consume_inbound(message_id, NOW + 300, NOW)?;
+    let action = a
+        .ack_actions(NOW)?
+        .into_iter()
+        .next()
+        .ok_or("no ack action")?;
+
+    // A forged token with outcome Failed rejects.
+    let forged = super::DurableAction {
+        token: [0xAB; 16],
+        request: action.request.clone(),
+    };
+    assert!(
+        a.record_ack_result(&forged, AckOutcomeView::Failed)
+            .is_err()
+    );
+    // A bad signature with outcome Failed rejects.
+    let mut bad_sig = action.clone();
+    let mut signature_bytes = bad_sig.request.signature.to_bytes();
+    signature_bytes[0] ^= 0x01;
+    bad_sig.request.signature = vodozemac::Ed25519Signature::from_slice(&signature_bytes)?;
+    assert!(
+        a.record_ack_result(&bad_sig, AckOutcomeView::Failed)
+            .is_err()
+    );
+
+    // A genuine Failed: accepted, no mutation, intent stays Pending.
+    let generation_before = a.store.generation()?;
+    a.record_ack_result(&action, AckOutcomeView::Failed)?;
+    assert_eq!(a.store.generation()?, generation_before);
+    assert_eq!(a.state.acks.len(), 1);
+    assert_eq!(a.state.acks[0].state, crate::state::AckState::Pending);
+    Ok(())
+}
+
+/// Blocker 2, Sol's exact repro shape: 24 terminal sends with the receipt
+/// high water at 24, then 8 more terminal sends; the send array is full,
+/// so the consume must succeed with the ACK intent created and NO receipt
+/// staged. After pruning, a consume stages a receipt normally.
+#[test]
+fn receipt_staging_never_blocks_consume() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, b, mut relay) = conversation_fixture()?;
+    // A accepts the first message, establishing its inbound session.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let epoch_id = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    let conversation_id = a.state.conversation_id;
+
+    // Fabricate Sol's outbox: 32 terminal send records over sequences
+    // 1..=32, the receipt high water at 24 with a genuine peer-signed
+    // receipt.
+    let mut receipt = crate::state::HighWaterReceipt {
+        conversation_id,
+        epoch_id,
+        acknowledged_sender_curve: a.account.curve25519_key(),
+        issuer_curve: b.account.curve25519_key(),
+        high_water: 24,
+        signature: b.account.sign(b""),
+    };
+    receipt.signature = b.account.sign(super::receipt_signing_bytes(&receipt));
+    for sequence in 1..=32_u64 {
+        a.state.sends.push(crate::state::SendRecord {
+            message_id: MessageId::random(),
+            state: crate::state::SendState::Stored,
+            epoch_id,
+            sequence,
+            queue_id: None,
+            packet: None,
+            expires_at: NOW + 3_600,
+            send_signature: None,
+            packet_digest: Some(crate::capability::digest(&sequence.to_be_bytes())),
+        });
+    }
+    a.state
+        .sends
+        .sort_by(|x, y| x.message_id.as_bytes().cmp(y.message_id.as_bytes()));
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 32;
+        active.peer_contiguous_high_water = 24;
+        active.receipt = Some(receipt);
+    }
+
+    // Accept a second application message and consume it: the send array
+    // is at the bound, so the receipt is skipped but the consume commits.
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let inbound = a.pending_inbound()?;
+    let second_id = inbound
+        .iter()
+        .find(|view| view.body == "m2")
+        .ok_or("m2 missing")?
+        .message_id;
+    a.consume_inbound(second_id, NOW + 300, NOW)?;
+    assert_eq!(a.state.acks.len(), 1, "ACK intent not created");
+    assert_eq!(a.state.sends.len(), 32, "a receipt was staged at the bound");
+
+    // Advance the clock past the tombstone window; the next send-path
+    // mutator prunes the terminal records, and the following consume
+    // stages a receipt normally.
+    let past_window = NOW + 3_600 + 7 * 24 * 60 * 60 + 1;
+    a.stage_send(
+        "trigger prune",
+        past_window,
+        past_window + 3_600,
+        past_window,
+    )?;
+    assert_eq!(a.state.sends.len(), 1, "terminal records not pruned");
+    let first_id = inbound
+        .iter()
+        .find(|view| view.body == "m1")
+        .ok_or("m1 missing")?
+        .message_id;
+    a.consume_inbound(first_id, past_window + 300, past_window)?;
+    assert_eq!(a.state.sends.len(), 2, "receipt not staged after pruning");
+    Ok(())
+}
+
+/// Blocker 3: an expired pending prekey must not be consumed by the
+/// pre-key accept path.
+#[test]
+fn expired_pending_prekey_cannot_be_consumed() -> std::result::Result<(), Box<dyn Error>> {
+    let a_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let conversation_id = ConversationId::random();
+    // Our offer is valid only until NOW+60.
+    let offer_a = a.prekey_action(NOW + 60)?;
+    let queue_a = a.state.mailbox_queue_id;
+
+    let mut peer_account = Account::new();
+    let peer_otk = *peer_account
+        .generate_one_time_keys(1)
+        .created
+        .first()
+        .ok_or("no peer one-time key")?;
+    peer_account.mark_keys_as_published();
+    let mut peer_offer = RedactedContactOffer {
+        signing_identity: peer_account.ed25519_key(),
+        curve_identity: peer_account.curve25519_key(),
+        one_time_key: peer_otk,
+        valid_until: NOW + 300,
+        signature: peer_account.sign(b""),
+    };
+    peer_offer.signature = peer_account.sign(in_crate_prekey_signing_bytes(
+        &peer_offer.signing_identity,
+        &peer_offer.curve_identity,
+        &peer_offer.one_time_key,
+        NOW + 300,
+    ));
+    a.commit_verified_contact(
+        peer_offer.signing_identity,
+        peer_offer,
+        conversation_id,
+        QueueId::random(),
+        Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
+        NOW,
+    )?;
+    let mut peer_session = peer_account.create_outbound_session(
+        SessionConfig::version_1(),
+        offer_a.curve_identity,
+        offer_a.one_time_key,
+    )?;
+
+    // Fresh outer expiry, correctly capability-signed, at NOW+120 — past
+    // the offer's validity. Rejected; nothing is consumed or mutated.
+    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1)?;
+    let result = a.accept_envelope(queue_a, id1, packet1.clone(), NOW + 3_600, sig1, NOW + 120);
+    assert!(matches!(result, Err(LabError::PeerVerificationFailed)));
+    assert!(a.state.active_session.is_none());
+    assert!(
+        a.state.pending_prekey.is_some(),
+        "expired offer was consumed"
+    );
+
+    // The same envelope at NOW+30, within the offer's validity, still
+    // establishes.
+    let outcome = a.accept_envelope(queue_a, id1, packet1, NOW + 3_600, sig1, NOW + 30)?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+    assert!(a.state.active_session.is_some());
+    Ok(())
+}
+
+/// Blocker 4: façade-minted requests stay inside the relay's windows.
+#[test]
+fn request_windows_match_the_relay() -> std::result::Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let mut client = create_client(&temp)?;
+
+    // Registration: the relay's request window is 300 seconds.
+    assert!(client.registration_action(NOW + 301, NOW).is_err());
+    assert!(client.registration_action(NOW, NOW).is_err());
+    client.registration_action(NOW + 300, NOW)?;
+
+    // Fetch: same window.
+    assert!(client.fetch_request(NOW + 301, NOW).is_err());
+    assert!(client.fetch_request(NOW, NOW).is_err());
+    client.fetch_request(NOW + 300, NOW)?;
+
+    // Consume (ACK minting): same window, and the rejection mutates
+    // nothing.
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let inbound_before = a.pending_inbound()?.len();
+    let acks_before = a.state.acks.len();
+    let message_id = a.pending_inbound()?.first().ok_or("no inbound")?.message_id;
+    assert!(a.consume_inbound(message_id, NOW + 3_600, NOW).is_err());
+    assert!(a.consume_inbound(message_id, NOW, NOW).is_err());
+    assert_eq!(a.pending_inbound()?.len(), inbound_before);
+    assert_eq!(a.state.acks.len(), acks_before);
+    a.consume_inbound(message_id, NOW + 300, NOW)?;
     Ok(())
 }

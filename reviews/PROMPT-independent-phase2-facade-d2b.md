@@ -1,5 +1,28 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v3)
+
+Version 2 (head `eb2020e8beb178b2e933ef4d62fb9f0b5d1637e1`) was RETURNED by
+Sol with four blockers (verdict in `reviews/REVIEW-sol-facade-d2b-v2.md`),
+all fixed in the head under review:
+
+1. `record_ack_result` runs the FULL binding verification (token, fields,
+   signature) for every outcome including `Failed` — a forged action can no
+   longer be accepted as a failed result.
+2. Receipt staging inside `consume_inbound` is best-effort: skipped
+   silently when the mode blocks control or the send array is at the bound,
+   so a consume can never roll back at the 32-send limit (receipts are
+   coalesced control; the next HCR advance stages a newer one). The ACK
+   bound is checked before mutation and re-checked after the expiry sweep.
+3. The pre-key path requires `pending.valid_until > now` before consuming
+   the OTK — an expired offer can no longer establish a session.
+4. All façade-minted requests now match the relay's acceptance windows:
+   300 s for registration/fetch/ACK (registration_action gained a `now`
+   parameter — a public-signature change to a D1-passed family, flagged for
+   your attention), 7-day TTL for sends.
+
+The v2 history follows unchanged.
+
 ## Remediation history (v2)
 
 Version 1 (head `cf891ea336573869dc51efd6f632af2fcd01392f`) was dual-RETURNED

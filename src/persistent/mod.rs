@@ -158,8 +158,9 @@ use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
 use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
     AckIntent, AckState, ActiveSession, ClientStateV1, DedupRecord, DedupState, HighWaterReceipt,
-    InboundRecord, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, PeerBinding,
-    PeerBundle, PendingPreKey, RegistrationRecord, Role, SendRecord, SendState, SessionMode,
+    InboundRecord, MAX_ACKS, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS,
+    PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendRecord, SendState,
+    SessionMode,
 };
 use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
@@ -180,6 +181,12 @@ const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// The relay's tombstone TTL (private in `relay.rs`; mirrored) — terminal
 /// send records are pruned this long after their expiry.
 const TOMBSTONE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// The relay's request-validity window (`validate_request_time` in
+/// relay.rs: registration, fetch, ACK and delete-mailbox requests must
+/// satisfy `now < valid_until <= now + 300`). Mirrored so the façade
+/// never mints a durable request the relay deterministically rejects
+/// (review blocker 4).
+const REQUEST_WINDOW_SECONDS: u64 = 5 * 60;
 /// Section 4 budget: 24 application advances, then `ControlOnly`.
 const CONTROL_ONLY_THRESHOLD: u64 = 24;
 /// Section 4 absolute maximum outstanding; `ReceiptLocked` at 32.
@@ -743,17 +750,28 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// action token), record it durably, commit, and only then return the
     /// action. Minting while an action is unconsumed REPLACES the durable
     /// record (new nonce/token); a token lost to a crash must not brick
-    /// registration.
+    /// registration. `valid_until` must fall inside the relay's request
+    /// window (`now < valid_until <= now + 300`, review blocker 4) so no
+    /// durable request is minted that the relay deterministically
+    /// rejects.
     ///
     /// # Errors
     ///
-    /// Returns a coarse error when signing or the commit fails.
+    /// Returns [`LabError::InvalidExpiry`] for a validity outside the
+    /// relay's window, or a coarse error when signing or the commit
+    /// fails.
     pub fn registration_action(
         &mut self,
         valid_until: u64,
+        now: u64,
     ) -> Result<DurableAction<MailboxRegistration>> {
         self.mutate(
-            |_current| Ok(()),
+            |_current| {
+                if valid_until <= now || valid_until > now.saturating_add(REQUEST_WINDOW_SECONDS) {
+                    return Err(LabError::InvalidExpiry);
+                }
+                Ok(())
+            },
             |candidate, keypairs| {
                 let nonce = Nonce::random();
                 let (record, request) = mint_registration(
@@ -856,7 +874,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// coarse storage error while the façade is not `Ready`.
     pub fn fetch_request(&self, valid_until: u64, now: u64) -> Result<DurableAction<FetchRequest>> {
         self.ensure_ready()?;
-        if valid_until <= now {
+        // The relay's request window: `now < valid_until <= now + 300`.
+        if valid_until <= now || valid_until > now.saturating_add(REQUEST_WINDOW_SECONDS) {
             return Err(LabError::InvalidExpiry);
         }
         let nonce = Nonce::random();
@@ -1033,8 +1052,21 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 {
                     return Err(LabError::MessageNotFound);
                 }
-                if valid_until <= now {
+                // The ACK request must fall inside the relay's request
+                // window, or the relay deterministically rejects it.
+                if valid_until <= now || valid_until > now.saturating_add(REQUEST_WINDOW_SECONDS) {
                     return Err(LabError::InvalidExpiry);
+                }
+                // Fail clearly BEFORE mutation when the ACK bound is full
+                // with nothing sweepable (review blocker 2).
+                let sweepable = current
+                    .state
+                    .acks
+                    .iter()
+                    .filter(|record| record.state == AckState::Pending && record.valid_until <= now)
+                    .count();
+                if current.state.acks.len() >= MAX_ACKS && sweepable == 0 {
+                    return Err(LabError::Storage);
                 }
                 Ok(())
             },
@@ -1084,72 +1116,37 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         Ok(actions)
     }
 
-    /// Record the relay's answer to a durable ACK action: token (message
-    /// ID) lookup plus the digest check against the durable intent's
-    /// canonical bytes run before staging, and the intent must still be
-    /// `Pending`. `Deleted` and `AlreadyGone` share the terminal handling:
-    /// the intent is removed and the matching dedup record becomes
-    /// `Acked`. `Failed` leaves the intent untouched — no mutation, no
-    /// commit.
+    /// Record the relay's answer to a durable ACK action. The full action
+    /// is presented back and the COMPLETE binding verification (message
+    /// ID to token and durable intent, queue/digest/expiry equality, and
+    /// the signature against our receive-capability public key over the
+    /// exact ACK signing bytes) runs for EVERY outcome, including
+    /// `Failed` — a transport failure is only accepted once the action is
+    /// proven to be the current durable one. `Deleted` and `AlreadyGone`
+    /// share the terminal handling: the intent is removed and the
+    /// matching dedup record becomes `Acked`. A verified `Failed` leaves
+    /// the intent untouched — no mutation, no commit.
     ///
     /// # Errors
     ///
     /// Returns [`LabError::MessageNotFound`] for an unknown token,
     /// [`LabError::MessageGone`] when the intent is no longer `Pending`,
-    /// [`LabError::Unauthorized`] on a request mismatch, or a coarse
+    /// [`LabError::Unauthorized`] on any request mismatch, or a coarse
     /// storage error when the commit fails.
     pub fn record_ack_result(
         &mut self,
         action: &DurableAction<AckRequest>,
         outcome: AckOutcomeView,
     ) -> Result<()> {
+        self.ensure_ready()?;
+        // Full binding verification for every outcome (review blocker:
+        // previously `Failed` skipped it).
+        verify_ack_action(&self.state, action)?;
         if matches!(outcome, AckOutcomeView::Failed) {
-            self.ensure_ready()?;
             return Ok(());
         }
         self.mutate(
-            |current| {
-                let index = current
-                    .state
-                    .acks
-                    .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
-                    .map_err(|_| LabError::MessageNotFound)?;
-                let record = &current.state.acks[index];
-                if record.state != AckState::Pending {
-                    return Err(LabError::MessageGone);
-                }
-                // The presented request must bind completely: message ID
-                // to the token and the durable intent, queue/digest/
-                // expiry to the durable fields, and the signature
-                // verified against our receive-capability public key over
-                // the exact ACK signing bytes (mirroring
-                // `authorize_ack`).
-                let request = &action.request;
-                if request.message_id.as_bytes() != &action.token
-                    || request.message_id != record.message_id
-                    || request.queue_id != record.queue_id
-                    || request.packet_hash != record.packet_digest
-                    || request.valid_until != record.valid_until
-                {
-                    return Err(LabError::Unauthorized);
-                }
-                let signing_bytes = canonical(
-                    ACK_ACTION,
-                    &[
-                        record.queue_id.as_bytes(),
-                        record.message_id.as_bytes(),
-                        &record.packet_digest,
-                        &record.valid_until.to_be_bytes(),
-                    ],
-                );
-                current
-                    .state
-                    .registration
-                    .receive_key
-                    .verify(&signing_bytes, &request.signature)
-                    .map_err(|_| LabError::Unauthorized)?;
-                Ok(())
-            },
+            |current| verify_ack_action(&current.state, action),
             |candidate, _keypairs| {
                 let index = candidate
                     .state
@@ -1574,6 +1571,47 @@ fn sweep_expired_sends(candidate: &mut Candidate, now: u64) -> Result<()> {
     Ok(())
 }
 
+/// The complete ACK-action binding verification, run for EVERY outcome
+/// of `record_ack_result` (review blocker 1): token lookup, the intent
+/// still `Pending`, the request's message ID bound to the token and the
+/// intent, queue/digest/expiry equal to the durable fields, and the
+/// signature verified against our receive-capability public key over the
+/// exact ACK signing bytes (mirroring `authorize_ack`).
+fn verify_ack_action(state: &ClientStateV1, action: &DurableAction<AckRequest>) -> Result<()> {
+    let index = state
+        .acks
+        .binary_search_by(|probe| probe.message_id.as_bytes().cmp(&action.token))
+        .map_err(|_| LabError::MessageNotFound)?;
+    let record = &state.acks[index];
+    if record.state != AckState::Pending {
+        return Err(LabError::MessageGone);
+    }
+    let request = &action.request;
+    if request.message_id.as_bytes() != &action.token
+        || request.message_id != record.message_id
+        || request.queue_id != record.queue_id
+        || request.packet_hash != record.packet_digest
+        || request.valid_until != record.valid_until
+    {
+        return Err(LabError::Unauthorized);
+    }
+    let signing_bytes = canonical(
+        ACK_ACTION,
+        &[
+            record.queue_id.as_bytes(),
+            record.message_id.as_bytes(),
+            &record.packet_digest,
+            &record.valid_until.to_be_bytes(),
+        ],
+    );
+    state
+        .registration
+        .receive_key
+        .verify(&signing_bytes, &request.signature)
+        .map_err(|_| LabError::Unauthorized)?;
+    Ok(())
+}
+
 /// D2b: sweep expired `Pending` ACK intents in clock-taking mutators
 /// (same pattern as the send expiry sweep): the intent is removed and its
 /// dedup record becomes `Expired`. Unexpired intents are never swept;
@@ -1757,8 +1795,14 @@ enum RatchetStep {
 }
 
 /// Step (d) of accept: decode the Olm message and establish or advance
-/// the ratchet on the candidate.
-fn ratchet_step(candidate: &mut Candidate, olm_message: &OlmMessage) -> Result<RatchetStep> {
+/// the ratchet on the candidate. The pre-key path first requires our own
+/// pending offer to be unexpired at `now` (review blocker 3): an expired
+/// offer's one-time key must not be consumed.
+fn ratchet_step(
+    candidate: &mut Candidate,
+    olm_message: &OlmMessage,
+    now: u64,
+) -> Result<RatchetStep> {
     if candidate.state.active_session.is_none() {
         let OlmMessage::PreKey(pre_key) = olm_message else {
             return Err(LabError::ExpectedPreKey);
@@ -1773,6 +1817,9 @@ fn ratchet_step(candidate: &mut Candidate, olm_message: &OlmMessage) -> Result<R
             .pending_prekey
             .as_ref()
             .ok_or(LabError::MissingSession)?;
+        if pending.valid_until <= now {
+            return Err(LabError::PeerVerificationFailed);
+        }
         let creation = candidate
             .account
             .create_inbound_session(
@@ -1906,7 +1953,7 @@ fn accept_envelope_operation(
     // (d) Decode the Olm message and establish or advance the ratchet.
     let olm_message: OlmMessage =
         serde_json::from_slice(packet.as_bytes()).map_err(|_| LabError::Encoding)?;
-    let plaintext = match ratchet_step(candidate, &olm_message)? {
+    let plaintext = match ratchet_step(candidate, &olm_message, now)? {
         RatchetStep::Plaintext(plaintext) => plaintext,
         RatchetStep::GapFailure => return Ok(AcceptArtifact::GapFailure),
     };
@@ -2043,6 +2090,12 @@ fn consume_inbound_operation(
     sweep_expired_sends(candidate, now)?;
     prune_terminal_sends(candidate, now);
     sweep_expired_acks(candidate, now)?;
+    // After the sweep the ACK bound must still have room: the intent is
+    // the point of the consume, so a full bound is a clear pre-mutation
+    // error (the candidate is discarded, nothing installs).
+    if candidate.state.acks.len() >= MAX_ACKS {
+        return Err(LabError::Storage);
+    }
     let index = candidate
         .state
         .inbound
@@ -2064,7 +2117,12 @@ fn consume_inbound_operation(
         .acks
         .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
 
-    // Coalesced receipt staging (see the method's docs for the decision).
+    // Coalesced receipt staging is BEST-EFFORT (review blocker 2): it is
+    // skipped silently when the mode blocks control traffic or the send
+    // array is at its bound, so an unstageable receipt can never roll
+    // back the consume itself. Safe because receipts are coalesced
+    // control: only the latest HCR matters, and the next successful HCR
+    // advance stages a newer receipt.
     let (high_water, mode) = {
         let active = candidate
             .state
@@ -2073,7 +2131,10 @@ fn consume_inbound_operation(
             .ok_or(LabError::MissingSession)?;
         (active.highest_contiguous_received_seq, active.mode)
     };
-    if high_water > 0 && matches!(mode, SessionMode::Ready | SessionMode::ControlOnly) {
+    if high_water > 0
+        && matches!(mode, SessionMode::Ready | SessionMode::ControlOnly)
+        && candidate.state.sends.len() < MAX_SENDS
+    {
         stage_receipt(candidate, high_water, valid_until, now)?;
     }
     let active = candidate
