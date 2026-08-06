@@ -1156,7 +1156,10 @@ fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<d
     assert!(outcomes.iter().all(Result::is_ok));
 
     // Fabricate a full bound of 32 self-consistent pending intents with
-    // matching dedup records, all expired.
+    // matching dedup records, all expired. Sequences are distinct
+    // (codec: one durable send_seq per encryption) and each sits in the
+    // out-of-order received set (codec: current-epoch dedup is
+    // receive-authoritative), above the genuine accept's HCR of 1.
     let epoch_id = a
         .state
         .active_session
@@ -1164,13 +1167,13 @@ fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<d
         .ok_or("no session")?
         .epoch_id;
     let queue_id = a.state.mailbox_queue_id;
-    for index in 0u8..32 {
+    for sequence in 3..=34_u64 {
         let message_id = MessageId::random();
-        let packet_digest = crate::capability::digest(&[index]);
+        let packet_digest = crate::capability::digest(&sequence.to_be_bytes());
         a.state.acks.push(crate::state::AckIntent {
             message_id,
             epoch_id,
-            sequence: 1,
+            sequence,
             queue_id,
             packet_digest,
             valid_until: NOW + 60,
@@ -1179,13 +1182,18 @@ fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<d
         a.state.dedup.push(crate::state::DedupRecord {
             message_id,
             epoch_id,
-            sequence: 1,
+            sequence,
             queue_id,
             packet_digest,
             expires_at: NOW + 3_600,
             state: DedupState::Accepted,
         });
     }
+    a.state
+        .active_session
+        .as_mut()
+        .ok_or("no session")?
+        .received_above_high_water = (3..=34).collect();
     a.state
         .acks
         .sort_by(|x, y| x.message_id.as_bytes().cmp(y.message_id.as_bytes()));

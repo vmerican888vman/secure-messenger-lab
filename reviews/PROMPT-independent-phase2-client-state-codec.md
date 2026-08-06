@@ -25,6 +25,24 @@ the frozen design that is not documented as a deviation.
 
 ## Remediation history
 
+**v7 split verdict:** one reviewer PASSed `89027ea`
+(`reviews/REVIEW-codec-v7-pass.md`); the other RETURNed it
+(`reviews/REVIEW-codec-v7-return.md`) with two blockers, both fixed in the
+head under review:
+
+1. Current-epoch records now enforce unique sequences: dedup records
+   sharing the active epoch must have distinct `sequence` values (retired
+   epochs exempt), and no two inbound records or two ACK intents may share
+   `(epoch, sequence)`. The test that unknowingly required acceptance of
+   the impossible snapshot was inverted; its fixture's "old" dedup record
+   is now genuinely retired-epoch.
+2. No retained OTK may alias the long-term Curve25519 identity: every
+   derived private-key public and every unpublished-map public must differ
+   from the account's `diffie_hellman_key` public. The reviewer's repro
+   (identity secret spliced into the OTK store, prekey re-signed, real 3DH
+   session establishment) is a regression test on both paths, including
+   after a genuine inbound session.
+
 **Late amendment (façade D2b v4):** ActiveSession gained field 19
 `last_staged_receipt_high_water: u64` (ascending order preserved, field
 count 19; validation: never exceeds `highest_contiguous_received_seq`, 0 =

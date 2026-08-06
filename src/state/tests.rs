@@ -199,9 +199,12 @@ fn make_inbound_side(
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
     };
+    // The older record is retired-epoch (dedup retention across rekey,
+    // §4): a different epoch means a different ratchet, so its sequence
+    // number space is independent of the current session's.
     let old_dedup = DedupRecord {
         message_id: MessageId::from_slice(&[0xAA; 16]).ok_or("bad test id")?,
-        epoch_id,
+        epoch_id: digest(b"retired-epoch"),
         sequence: 1,
         queue_id,
         packet_digest: digest(b"old-packet"),
@@ -2897,5 +2900,273 @@ fn field_19_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
     let decoded = ClientStateV1::decode(&encoded)?;
     let reencoded = decoded.encode()?;
     assert_eq!(&encoded[..], &reencoded[..]);
+    Ok(())
+}
+
+// --- review blockers: (epoch, sequence) uniqueness + OTK/identity alias ------
+
+/// Blocker 1 (inverted from the pre-fix test at this history's
+/// tests.rs:2292): two current-epoch dedup records sharing one sequence
+/// are an impossible snapshot and must reject on both paths.
+#[test]
+fn current_epoch_dedup_sequences_are_unique() -> Result<(), Box<dyn Error>> {
+    // Duplicate (current epoch, sequence 3) with a distinct message ID.
+    let mut fixture = populated_fixture()?;
+    let epoch_id = fixture
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0xEE; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence: 3,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"impostor"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Accepted,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    assert!(
+        fixture.state.encode().is_err(),
+        "duplicate current-epoch sequence accepted"
+    );
+
+    // Decode path: encode a genuine state, then splice in the dedup
+    // array with only the duplicated record added.
+    let mut fixture = populated_fixture()?;
+    let epoch_id = fixture
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .epoch_id;
+    let encoded = fixture.state.encode()?;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0xEE; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence: 3,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"impostor"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Accepted,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let array = records::encode_record_array(
+        &fixture.state.dedup,
+        MAX_DEDUP,
+        records::DedupRecord::encode,
+    )?;
+    let bytes = splice_top(&encoded, 18, field_block(19, &array)?)?;
+    assert!(ClientStateV1::decode(&bytes).is_err());
+
+    // Same sequence under a RETIRED epoch is a different ratchet: accepts.
+    let mut fixture = populated_fixture()?;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0x02; 16]).ok_or("bad test id")?,
+        epoch_id: digest(b"retired-epoch"),
+        sequence: 3,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"old"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Expired,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?;
+    Ok(())
+}
+
+/// Blocker 1: the same uniqueness rule across inbound records and ACK
+/// intents.
+#[test]
+fn inbound_and_ack_sequences_are_unique_per_epoch() -> Result<(), Box<dyn Error>> {
+    // Two inbound records sharing (epoch, sequence).
+    let mut fixture = populated_fixture()?;
+    let first = &fixture.state.inbound[0];
+    let second = InboundRecord {
+        message_id: MessageId::from_slice(&[0x03; 16]).ok_or("bad test id")?,
+        epoch_id: first.epoch_id,
+        sender_sequence: first.sender_sequence,
+        queue_id: first.queue_id,
+        packet_digest: first.packet_digest,
+        expires_at: first.expires_at,
+        accepted_at: first.accepted_at,
+        body: "second".to_owned(),
+    };
+    fixture.state.inbound.push(second);
+    fixture
+        .state
+        .inbound
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    // The second inbound needs its own dedup record to reach the
+    // uniqueness check.
+    let epoch_id = fixture.state.inbound[0].epoch_id;
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0x03; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence: 3,
+        queue_id: fixture.state.mailbox_queue_id,
+        packet_digest: digest(b"second-packet"),
+        expires_at: NOW + 3_600,
+        state: DedupState::Accepted,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    assert!(
+        fixture.state.encode().is_err(),
+        "duplicate inbound sequence"
+    );
+
+    // Two ACK intents sharing (epoch, sequence).
+    let mut fixture = populated_fixture()?;
+    let second = {
+        let first = &fixture.state.acks[0];
+        AckIntent {
+            message_id: MessageId::from_slice(&[0x04; 16]).ok_or("bad test id")?,
+            epoch_id: first.epoch_id,
+            sequence: first.sequence,
+            queue_id: first.queue_id,
+            packet_digest: first.packet_digest,
+            valid_until: first.valid_until,
+            state: AckState::Pending,
+        }
+    };
+    fixture.state.acks.push(second);
+    fixture
+        .state
+        .acks
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    let (epoch_id, sequence, queue_id, packet_digest) = {
+        let first = &fixture.state.acks[0];
+        (
+            first.epoch_id,
+            first.sequence,
+            first.queue_id,
+            first.packet_digest,
+        )
+    };
+    fixture.state.dedup.push(DedupRecord {
+        message_id: MessageId::from_slice(&[0x04; 16]).ok_or("bad test id")?,
+        epoch_id,
+        sequence,
+        queue_id,
+        packet_digest,
+        expires_at: NOW + 3_600,
+        state: DedupState::Accepted,
+    });
+    fixture
+        .state
+        .dedup
+        .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+    assert!(fixture.state.encode().is_err(), "duplicate ACK sequence");
+    Ok(())
+}
+
+/// Extract the canonical `diffie_hellman_key` secret array text from an
+/// account pickle JSON.
+fn dh_secret_text(json: &str) -> Result<String, Box<dyn Error>> {
+    let marker = "\"diffie_hellman_key\":";
+    let start = json.find(marker).ok_or("diffie_hellman_key missing")? + marker.len();
+    let end = json[start..].find(']').ok_or("unterminated")? + start;
+    Ok(json[start..=end].to_owned())
+}
+
+/// Blocker 2, the reviewer's reproduction: the `diffie_hellman_key`
+/// secret spliced into a retained OTK slot must reject on both paths,
+/// even with a correctly re-signed prekey.
+#[test]
+fn otk_must_not_alias_curve25519_identity() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    let identity = fixture.our_account.curve25519_key();
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let dh_secret = dh_secret_text(&json)?;
+
+    // Replace private_keys["0"]'s secret array with the identity secret.
+    let marker = "\"private_keys\":{\"0\":";
+    let start = json.find(marker).ok_or("private_keys[0] missing")? + marker.len();
+    let end = json[start..].find(']').ok_or("unterminated")? + start;
+    let spliced = format!("{}{}{}", &json[..start], dh_secret, &json[end + 1..]);
+    // The splice stays canonical: typed re-serialization is byte-equal,
+    // so only the alias check can reject.
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(spliced.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        spliced.as_bytes(),
+        "splice broke canonical form"
+    );
+
+    // Re-sign the pending prekey for the identity public key.
+    fixture.state.account_pickle = Zeroizing::new(spliced.clone().into_bytes());
+    let prekey = fixture.state.pending_prekey.as_mut().ok_or("no prekey")?;
+    prekey.one_time_key = identity;
+    prekey.signature = fixture
+        .our_account
+        .sign(prekey_signing_bytes(&prekey.bundle()));
+    assert!(fixture.state.encode().is_err(), "encode accepted the alias");
+
+    // Decode path: splice the hostile pickle AND the re-signed prekey
+    // into the genuine encoding.
+    let valid = populated_fixture()?;
+    let encoded = valid.state.encode()?;
+    let bytes = splice_top(&encoded, 8, field_block(9, spliced.as_bytes())?)?;
+    let prekey_bytes = fixture
+        .state
+        .pending_prekey
+        .as_ref()
+        .ok_or("no prekey")?
+        .encode()?;
+    let bytes = splice_top(&bytes, 12, field_block(13, &prekey_bytes)?)?;
+    assert!(
+        ClientStateV1::decode(&bytes).is_err(),
+        "decode accepted the alias"
+    );
+    Ok(())
+}
+
+/// Blocker 2, real-session regression: a genuine inbound session is
+/// established; the aliased pickle cannot pass validation afterward.
+#[test]
+fn aliased_otk_fails_after_genuine_inbound_session() -> Result<(), Box<dyn Error>> {
+    // The genuine session establishment (covered elsewhere) leaves the
+    // account with the consumed key gone and a fresh published OTK held.
+    let mut fixture = inbound_fixture()?;
+    let identity = fixture.our_account.curve25519_key();
+    let encoded = fixture.state.encode()?;
+    ClientStateV1::decode(&encoded)?; // the normal random OTK accepts
+
+    let json = String::from_utf8(fixture.state.account_pickle.to_vec())?;
+    let dh_secret = dh_secret_text(&json)?;
+    // The prekey's OTK is id 1 (id 0 was consumed by the session).
+    let marker = "\"private_keys\":{\"1\":";
+    let start = json.find(marker).ok_or("private_keys[1] missing")? + marker.len();
+    let end = json[start..].find(']').ok_or("unterminated")? + start;
+    let spliced = format!("{}{}{}", &json[..start], dh_secret, &json[end + 1..]);
+    let typed: vodozemac::olm::AccountPickle = serde_json::from_slice(spliced.as_bytes())?;
+    assert_eq!(
+        serde_json::to_vec(&typed)?,
+        spliced.as_bytes(),
+        "splice broke canonical form"
+    );
+
+    fixture.state.account_pickle = Zeroizing::new(spliced.into_bytes());
+    let prekey = fixture.state.pending_prekey.as_mut().ok_or("no prekey")?;
+    prekey.one_time_key = identity;
+    prekey.signature = fixture
+        .our_account
+        .sign(prekey_signing_bytes(&prekey.bundle()));
+    assert!(fixture.state.encode().is_err());
     Ok(())
 }

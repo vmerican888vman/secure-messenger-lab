@@ -209,7 +209,7 @@ fn check_account(state: &ClientStateV1) -> Result<Account> {
     {
         return Err(LabError::Storage);
     }
-    check_one_time_key_consistency(&state.account_pickle)?;
+    check_one_time_key_consistency(&state.account_pickle, account.curve25519_key())?;
     Ok(account)
 }
 
@@ -240,8 +240,18 @@ const NEXT_KEY_ID_HEADROOM: u64 = 1_000_000_000;
 ///   but safe: one billion generations vastly exceeds anything a
 ///   peer-scoped account can legitimately produce (each conversation
 ///   consumes a handful of one-time keys), so a counter that close to the
-///   wrap is hostile, never real.
-fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
+///   wrap is hostile, never real;
+/// - no retained one-time key may alias the account's long-term
+///   Curve25519 identity (review v6+ blocker): a canonical pickle reusing
+///   the `diffie_hellman_key` secret as a published OTK would let a real
+///   inbound 3DH session "consume" the identity key. The identity used
+///   here comes from the typed account (deserialized from this same
+///   pickle), which `check_account` has already proven equal to the
+///   stored own public curve identity.
+fn check_one_time_key_consistency(
+    canonical_pickle: &[u8],
+    identity: Curve25519PublicKey,
+) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_slice(canonical_pickle).map_err(|_| LabError::Storage)?;
     let one_time_keys = value.get("one_time_keys").ok_or(LabError::Storage)?;
@@ -263,12 +273,15 @@ fn check_one_time_key_consistency(canonical_pickle: &[u8]) -> Result<()> {
     let mut derived_publics: Vec<Curve25519PublicKey> = Vec::with_capacity(private_keys.len());
     for secret in private_keys.values() {
         let public = Curve25519PublicKey::from(secret);
-        if derived_publics.contains(&public) {
+        if public == identity || derived_publics.contains(&public) {
             return Err(LabError::Storage);
         }
         derived_publics.push(public);
     }
     for (key_id, stored_public) in &unpublished {
+        if *stored_public == identity {
+            return Err(LabError::Storage);
+        }
         let secret = private_keys.get(key_id).ok_or(LabError::Storage)?;
         if &Curve25519PublicKey::from(secret) != stored_public {
             return Err(LabError::Storage);
@@ -670,6 +683,11 @@ fn check_receipt(
 }
 
 fn check_inbound(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    // §4 assigns one durable send_seq per Olm encryption, so (epoch,
+    // sequence) is unique across inbound records (review blocker: two
+    // message IDs sharing one epoch/sequence is an impossible snapshot).
+    // Inbound records are all current-epoch by the check below.
+    let mut sequences: Vec<u64> = Vec::with_capacity(state.inbound.len());
     for record in &state.inbound {
         if record.epoch_id != active.epoch_id
             || record.queue_id != state.mailbox_queue_id
@@ -678,6 +696,10 @@ fn check_inbound(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
         {
             return Err(LabError::Storage);
         }
+        if sequences.contains(&record.sender_sequence) {
+            return Err(LabError::Storage);
+        }
+        sequences.push(record.sender_sequence);
         // An accepted sequence above the contiguous high water must be in
         // the bounded out-of-order set.
         if record.sender_sequence > active.highest_contiguous_received_seq
@@ -748,6 +770,9 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
 }
 
 fn check_acks(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    // Same §4 uniqueness rule as inbound records: one ACK intent per
+    // (current epoch, sequence).
+    let mut sequences: Vec<u64> = Vec::with_capacity(state.acks.len());
     for record in &state.acks {
         if record.epoch_id != active.epoch_id
             || record.queue_id != state.mailbox_queue_id
@@ -755,6 +780,10 @@ fn check_acks(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
         {
             return Err(LabError::Storage);
         }
+        if sequences.contains(&record.sequence) {
+            return Err(LabError::Storage);
+        }
+        sequences.push(record.sequence);
         let dedup = find_dedup(state, &record.message_id)?;
         if dedup.epoch_id != record.epoch_id
             || dedup.sequence != record.sequence
@@ -768,6 +797,11 @@ fn check_acks(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
 }
 
 fn check_dedup(state: &ClientStateV1, current: Option<(&ActiveSession, &Session)>) -> Result<()> {
+    // §4 assigns one durable send_seq per Olm encryption: sequences are
+    // unique across the dedup records of the current epoch (review
+    // blocker). Retired-epoch records are exempt — different epoch,
+    // different ratchet.
+    let mut current_epoch_sequences: Vec<u64> = Vec::new();
     for record in &state.dedup {
         if record.queue_id != state.mailbox_queue_id || record.sequence == 0 {
             return Err(LabError::Storage);
@@ -786,6 +820,10 @@ fn check_dedup(state: &ClientStateV1, current: Option<(&ActiveSession, &Session)
                 if !session.has_received_message() || !covered {
                     return Err(LabError::Storage);
                 }
+                if current_epoch_sequences.contains(&record.sequence) {
+                    return Err(LabError::Storage);
+                }
+                current_epoch_sequences.push(record.sequence);
             }
         }
     }
