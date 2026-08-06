@@ -4,8 +4,8 @@
 //! clients can exchange Olm-encrypted payloads through a relay that only stores
 //! opaque envelopes and deletes them after an authenticated recipient ACK.
 
-pub mod capability;
-pub mod client;
+mod capability;
+mod client;
 mod companion;
 pub mod error;
 pub mod ids;
@@ -17,21 +17,21 @@ mod private_store_dir;
 pub mod relay;
 mod state;
 
+// §2: only the relay's wire types stay public from the old client/
+// capability surface. `OlmClient`, `OpenedMessage`, `ClientStateStore`,
+// `PlainMessage`, the prekey bundle types, `MailboxOwner` and the
+// capability owners are crate-private: their public mutations were
+// production bypasses of the persistence-owning façade.
 pub use capability::{
-    AckRequest, FetchRequest, MailboxOwner, MailboxRegistration, ManageCapability,
-    ReceiveCapability, SendCapability, SendRequest, VerifiedEnvelope,
+    AckRequest, DeleteMailboxRequest, FetchRequest, MailboxRegistration, SendRequest,
 };
-pub use client::{
-    EncryptedPacket, OlmClient, OpenedMessage, PeerPreKey, PlainMessage, VerifiedPeerPreKey,
-};
+pub use client::EncryptedPacket;
 pub use error::{LabError, Result};
 pub use ids::{ConversationId, MessageId, Nonce, QueueId};
 pub use lifecycle::{
     DestructiveResetAuth, LifecycleManager, LifecycleState, LockReason, ProvisionOutcome,
 };
-pub use persistence::{
-    ClientStateStore, KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector,
-};
+pub use persistence::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector};
 pub use persistent::{
     AcceptOutcome, AckOutcomeView, DeliveryUnknownView, DurableAction, InboundView,
     PersistentClient, PublicIdentity, RedactedContactOffer, RegistrationOutcome, SendOutcome,

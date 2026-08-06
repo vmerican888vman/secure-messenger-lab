@@ -27,10 +27,9 @@ use super::{
     MAX_RECEIVED_SET, MAX_SENDS, MAX_SESSION_PICKLE, MAX_TOTAL_PLAINTEXT, PeerBundle, Role,
     SendState, SessionMode,
 };
+use crate::capability::MailboxOwner;
 use crate::capability::digest;
-use crate::{
-    ConversationId, EncryptedPacket, MailboxOwner, MailboxRegistration, MessageId, QueueId,
-};
+use crate::{ConversationId, EncryptedPacket, MailboxRegistration, MessageId, QueueId};
 
 const NOW: u64 = 1_800_000_000;
 

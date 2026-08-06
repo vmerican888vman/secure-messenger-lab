@@ -1,6 +1,8 @@
 use std::error::Error;
 
-use secure_messenger_lab::{ConversationId, LabError, MailboxOwner, OlmClient, Relay};
+use crate::capability::MailboxOwner;
+use crate::client::OlmClient;
+use crate::{ConversationId, LabError, Relay};
 
 const NOW: u64 = 1_800_000_000;
 

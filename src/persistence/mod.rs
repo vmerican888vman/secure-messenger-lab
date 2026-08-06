@@ -10,4 +10,6 @@ mod protector;
 mod sqlite;
 
 pub use protector::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector};
-pub use sqlite::ClientStateStore;
+// Crate-private per §2: the raw store commit cannot be a production
+// bypass of the façade.
+pub(crate) use sqlite::ClientStateStore;

@@ -59,6 +59,9 @@
 
 mod acl;
 
+#[cfg(test)]
+mod store_boundary_tests;
+
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File};
 use std::os::unix::ffi::OsStrExt;

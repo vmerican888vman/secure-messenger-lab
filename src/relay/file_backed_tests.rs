@@ -12,9 +12,10 @@ use std::thread;
 
 use rusqlite::Connection;
 
+use crate::capability::MailboxOwner;
+use crate::client::{OlmClient, VerifiedPeerPreKey};
 use crate::{
-    AckOutcome, ConversationId, EncryptedPacket, EnqueueOutcome, LabError, MailboxOwner, MessageId,
-    OlmClient, Relay, VerifiedPeerPreKey,
+    AckOutcome, ConversationId, EncryptedPacket, EnqueueOutcome, LabError, MessageId, Relay,
 };
 
 const NOW: u64 = 1_800_000_000;

@@ -33,17 +33,33 @@ unaudited, and unsuitable for sensitive or production messaging.
       without application mutation, and recovers a real valid hot rollback journal.
 - [x] The opaque local-state foundation authenticates one bounded encrypted snapshot against an
       independently obtained profile/key binding and survives forced death as a complete old/new row.
+- [x] The persistence-owning façade commits every account/ratchet/outbox mutation as one validated,
+      generation-CAS snapshot through the canonical `ClientStateV1` codec; commit failure locks the
+      profile until reopen. Legacy public mutation and raw-commit paths are crate-private, so no
+      production bypass remains.
+- [x] Strict `ClientPayloadV2` payloads (conversation/epoch/sequence-bound), the §4 send budget and
+      receipt machinery, durable ACK intents, dedup, and out-of-order receive assembly, tested
+      end-to-end over a real in-memory relay including a durable gap-induced `RekeyRequired`.
+- [x] Private-store boundary: owner-only ACL-free directories, exact content validation, torn
+      companion rejection, strictly non-blocking lifecycle lock; the platform-key lifecycle manager
+      drives create/recovery/reset with exact-state CAS and tested failure arms.
 
 ## Blocking any app or public-security claim
 
 - [ ] Independently reviewed protocol and complete formal threat model.
-- [ ] Verified QR/contact ceremony that binds stable identity to peer-scoped session keys.
+- [ ] Verified QR/contact ceremony that binds stable identity to peer-scoped session keys, including a
+      public handle for the out-of-band send-capability transfer (currently absent — see src/main.rs).
 - [ ] Transactional one-time-key publication and single claim without relay key substitution.
 - [ ] Identity-bound envelope authentication before any mailbox send capability is shared or delegated
       beyond the single verified peer assumed by this harness.
-- [ ] Encrypted, atomic persistence of every mutated Olm account and ratchet state.
-- [ ] Hardware-backed local wrapping key where available plus a safe fallback policy.
-- [ ] Crash/restart tests at every send, fetch, decrypt, persistence, and ACK boundary.
+- [x] Encrypted, atomic persistence of every mutated Olm account and ratchet state (through the
+      façade; the crate-private legacy client keeps keys in memory and is test-only).
+- [ ] Hardware-backed local wrapping key where available plus a safe fallback policy (the lifecycle
+      manager models the states; real platform adapters are open).
+- [ ] Crash/restart tests at every send, fetch, decrypt, persistence, and ACK boundary (the façade's
+      crash/reopen and reconcile paths are tested; the full boundary matrix is not).
+- [ ] Façade/lifecycle wiring (create/open currently go through the store directly), the §4
+      rebootstrap ceremony, and receipt coalescing (D2c).
 - [x] Exact fail-closed SQLite schema-shape validation for current and documented legacy schemas.
 - [ ] Real authenticated network protocol, TLS configuration, request limits, and traffic/log capture.
 - [ ] Periodic expiry scheduler and a measured wall-clock deletion SLA for an otherwise idle relay.

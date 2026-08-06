@@ -1,9 +1,8 @@
 use std::error::Error;
 
-use secure_messenger_lab::{
-    AckOutcome, ConversationId, EncryptedPacket, LabError, MailboxOwner, MessageId, OlmClient,
-    Relay,
-};
+use crate::capability::MailboxOwner;
+use crate::client::OlmClient;
+use crate::{AckOutcome, ConversationId, EncryptedPacket, LabError, MessageId, Relay};
 
 const NOW: u64 = 1_800_000_000;
 const MAX_MESSAGE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;

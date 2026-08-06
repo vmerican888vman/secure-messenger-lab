@@ -1,10 +1,9 @@
 use sha2::{Digest, Sha256};
 use vodozemac::{Ed25519Keypair, Ed25519PublicKey, Ed25519Signature};
 
+use crate::client::OpenedMessage;
 use crate::relay::StoredEnvelope;
-use crate::{
-    EncryptedPacket, LabError, MessageId, Nonce, OpenedMessage, PROTOCOL_DOMAIN, QueueId, Result,
-};
+use crate::{EncryptedPacket, LabError, MessageId, Nonce, PROTOCOL_DOMAIN, QueueId, Result};
 
 const ACTION_REGISTER: &[u8] = b"register";
 const ACTION_SEND: &[u8] = b"send";
@@ -16,6 +15,10 @@ const ACTION_DELETE: &[u8] = b"delete-mailbox";
 ///
 /// The queue identifier only locates the mailbox. It cannot send, receive, ACK,
 /// or manage anything without the matching signing capability.
+///
+/// Crate-private legacy: exercised by the in-crate proof tests; the
+/// façade builds its own mailbox material (`src/persistent`).
+#[allow(dead_code)]
 pub struct MailboxOwner {
     queue_id: QueueId,
     send: Ed25519Keypair,
@@ -23,6 +26,7 @@ pub struct MailboxOwner {
     manage: Ed25519Keypair,
 }
 
+#[allow(dead_code)]
 impl MailboxOwner {
     #[must_use]
     pub fn new() -> Self {
@@ -110,11 +114,13 @@ impl Default for MailboxOwner {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct SendCapability {
     queue_id: QueueId,
     signing_key: Ed25519Keypair,
 }
 
+#[allow(dead_code)]
 impl SendCapability {
     #[must_use]
     pub const fn queue_id(&self) -> QueueId {
@@ -148,12 +154,14 @@ impl SendCapability {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ReceiveCapability {
     queue_id: QueueId,
     signing_key: Ed25519Keypair,
     send_verification_key: Ed25519PublicKey,
 }
 
+#[allow(dead_code)]
 impl ReceiveCapability {
     #[must_use]
     pub fn authorize_fetch(&self, valid_until: u64) -> FetchRequest {
@@ -232,6 +240,7 @@ impl ReceiveCapability {
 /// An outer envelope authenticated with the peer's mailbox send capability.
 /// Only `ReceiveCapability::verify_envelope` can construct this type.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct VerifiedEnvelope {
     queue_id: QueueId,
     message_id: MessageId,
@@ -239,6 +248,7 @@ pub struct VerifiedEnvelope {
     expires_at: u64,
 }
 
+#[allow(dead_code)]
 impl VerifiedEnvelope {
     #[must_use]
     pub const fn queue_id(&self) -> QueueId {
@@ -262,11 +272,13 @@ impl VerifiedEnvelope {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct ManageCapability {
     queue_id: QueueId,
     signing_key: Ed25519Keypair,
 }
 
+#[allow(dead_code)]
 impl ManageCapability {
     #[must_use]
     pub fn authorize_delete(&self, valid_until: u64) -> DeleteMailboxRequest {

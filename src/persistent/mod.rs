@@ -229,6 +229,14 @@ fn prekey_signing_bytes(bundle: &PeerBundle) -> Vec<u8> {
 /// The request is returned only after the exact request and the candidate
 /// state have committed; presenting a result requires both the token and
 /// the durable request binding to match (see module docs).
+///
+/// Post-commit-crash retry semantics: if the process dies between the
+/// commit and the return of a minting call, the returned action is lost
+/// but the durable record is not — after reopen, the exact committed
+/// action is reconstructed by the family's recovery view
+/// (`pending_send_actions`, `pending_prekey_offer`, `ack_actions`), and
+/// re-minting replaces the durable record per each family's documented
+/// replacement rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableAction<T> {
     pub token: [u8; 16],
@@ -316,7 +324,10 @@ pub struct DeliveryUnknownView {
 
 /// Bookkeeping for the §2 mutator discipline. `Mutating` is never
 /// observable across operations because everything is synchronous
-/// `&mut self`; it exists to make the discipline explicit.
+/// `&mut self`; it exists to make the discipline explicit. Because no
+/// observer can ever see it, `ensure_ready` intentionally collapses
+/// `Mutating` and `ReconcileRequired` into one rejection path — that
+/// branch is unreachable-by-construction for `Mutating`, not dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FacadeState {
     Ready,
@@ -789,20 +800,6 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         )
     }
 
-    /// Record the relay's answer to a durable registration action. The
-    /// presented token must equal the durable record's nonce (the random
-    /// action ID), and the durable request binding — the manage signature
-    /// over the exact request plus the canonical-bytes digest — is
-    /// re-verified. On a match the action is consumed (the nonce is
-    /// re-minted) and the record marked terminal: `Confirmed` keeps the
-    /// exact request's expiry, `Failed` re-signs with `valid_until = 0`.
-    /// Any mismatch rejects without mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LabError::Unauthorized`] for a wrong, replayed or
-    /// cross-action token, or a coarse storage error when the commit
-    /// fails.
     /// Record the relay's answer to a durable registration action. The
     /// full action is presented back: BOTH the token must equal the
     /// durable record's nonce (the random action ID) AND SHA-256 over the
@@ -1786,7 +1783,6 @@ fn receipt_signing_bytes(receipt: &HighWaterReceipt) -> Vec<u8> {
     )
 }
 
-/// Step 4 of `accept_envelope`: ratchet, payload, sequence, records.
 /// The ratchet step's product: the decrypted plaintext, or the §4 gap
 /// failure (whose mode change is the durable outcome).
 enum RatchetStep {

@@ -18,7 +18,11 @@ use crate::{EncryptedPacket, LabError, MessageId, Nonce, QueueId, Result};
 // constructors they exercise (review remediation: those constructors are
 // `#[cfg(test)] pub(crate)`, so their tests must be too).
 #[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
 mod file_backed_tests;
+#[cfg(test)]
+mod request_boundary_tests;
 #[cfg(test)]
 mod schema_upgrade_tests;
 

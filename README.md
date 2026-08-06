@@ -22,8 +22,6 @@ shippable messenger is secure.
   capabilities authorize operations.
 - A missing session, altered ciphertext, wrong recipient, wrong capability, expired request, expired
   verified pre-key/envelope, or mismatched acknowledgement fails closed.
-- Inbound account and ratchet mutations are staged in memory and committed only after the encrypted
-  conversation/message binding succeeds.
 - Fetching does not delete. A recipient-signed ACK binds the queue, message ID, and ciphertext hash;
   the client API can create it only after verifying the sender-signed outer envelope and successfully
   decrypting its inner binding. One transaction then deletes ciphertext and adds a bounded replay
@@ -32,16 +30,28 @@ shippable messenger is secure.
   capabilities, and post-ACK ciphertext residue.
 - Relay startup now validates the complete current/legacy `SQLite` manifest and exercises real hot
   rollback-journal recovery before accepting or migrating a database.
-- The persistence implementation has an opaque-state foundation: one XChaCha20-Poly1305 snapshot,
-  platform-expected profile binding, exact generation CAS, and forced-death old/new recovery tests.
+- **Phase 2:** the persistence-owning `PersistentClient` façade exclusively owns the encrypted
+  client-state store, the Olm account/session, capabilities, bindings and outboxes. Every mutation is
+  staged as a complete candidate, validated by the bespoke canonical `ClientStateV1` TLV codec
+  (bounds-before-allocation, canonical-JSON pickles, signature/epoch/high-water cross-checks), and
+  committed as one generation-CAS snapshot; a commit failure forces reconcile-on-reopen.
+  `OlmClient`/capability owners/raw store commits are crate-private — the old production bypasses are
+  gone.
+- Payloads are strict canonical `ClientPayloadV2` (conversation/epoch/sequence-bound); the §4
+  high-water budget, receipt and `RekeyRequired` machinery is implemented and tested, including
+  genuine out-of-order assembly and gap-induced rekey locking over a real in-memory relay.
+- The private-store boundary enforces owner-only ACL-free directories with exact content checks and a
+  strictly non-blocking lifecycle lock; the platform-key lifecycle manager drives
+  provisional/expected/locked/deleting transitions with exact-state CAS and tested recovery arms.
 
 ## What this does **not** prove
 
 - There is no Android or iOS app, network server, TLS layer, notification path, or public deployment.
 - Contact bundles are exchanged directly in the test. There is no QR verification UI, key directory,
-  or transactional one-time-key claim service.
-- Ratchet, identity, capabilities, and outboxes are not yet wired into the encrypted snapshot.
-  Hardware-backed platform adapters and atomic session/outbox state machines remain blockers.
+  or transactional one-time-key claim service — and no public handle yet for the out-of-band
+  send-capability transfer (the demo stops there; see `src/main.rs`).
+- The façade is not yet wired to the lifecycle manager (create/open go through the store directly),
+  and the §4 rebootstrap ceremony and D2c receipt coalescing remain open.
 - IP addresses, packet timing, ciphertext size, and traffic correlation are not hidden.
 - A malicious relay can copy ciphertext before deletion. Filesystem snapshots, host logs, backups,
   memory, and storage-device remanence are outside the current proof.
@@ -70,21 +80,31 @@ cargo fmt --check
 Expected demo output:
 
 ```text
-PASS: two clients exchanged encrypted messages; relay queue is empty after authenticated ACKs
+PASS: two façade clients created durable profiles, registered mailboxes on a real relay, minted redacted contact offers, and fetched (empty) mailboxes with verified signatures
+NOTE: the demo stops before the conversation: the public API has no handle for the out-of-band send-capability transfer (see the module docs for the exact gap)
 ```
 
 ## Repository map
 
-- `src/client.rs` — peer-scoped Olm session and fail-closed encrypted payload handling.
-- `src/capability.rs` — separate signed mailbox capabilities and canonical command binding.
+- `src/persistent/` — the Phase-2 persistence-owning façade (the only public client API).
+- `src/state/` — the canonical `ClientStateV1` TLV codec and semantic validation (crate-private).
+- `src/payload.rs` — strict `ClientPayloadV2` canonical-JSON payloads.
+- `src/lifecycle.rs` — platform-key lifecycle manager (provisional/expected/locked/deleting).
+- `src/private_store_dir/` — the enforced private-directory boundary (incl. ACL rejection).
+- `src/persistence/` — envelope + profile binding + the one-row encrypted state store
+  (crate-private).
 - `src/relay.rs` — minimal opaque SQLite store, authenticated ACK, TTL, and replay tombstones.
-- `tests/` — adversarial end-to-end, state-staging, boundary, concurrency, expiry, and migration checks.
+- `src/client.rs` / `src/capability.rs` — Phase-0 client and capability owners, crate-private,
+  retained for the in-crate proof tests.
+- `tests/` — adversarial end-to-end, state-staging, boundary, concurrency, expiry, and migration
+  checks (path-level hostile fixtures live in-crate beside the modules they exercise).
 - `THREAT_MODEL.md` — adversaries, guarantees, non-goals, and the metadata budget.
 - `SECURITY_STATUS.md` — current security gate and unresolved blockers.
 - `docs/architecture.md` — exact prototype flow and trust boundaries.
 - `docs/acceptance-tests.md` — what is automated now and what still needs a real network/device lab.
 - `docs/persistence-spike-design.md` — independently passed encrypted-state/crash-recovery contract;
   only its disposable implementation spike is authorized.
+- `docs/phase2-design-decisions.md` — the frozen Phase-2 decisions this codebase implements.
 
 ## Phase boundary
 

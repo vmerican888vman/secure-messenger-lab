@@ -690,8 +690,8 @@ fn send_ready_client(
 }
 
 fn assert_same_request(
-    action: &DurableAction<secure_messenger_lab::capability::SendRequest>,
-    request: &secure_messenger_lab::capability::SendRequest,
+    action: &DurableAction<secure_messenger_lab::SendRequest>,
+    request: &secure_messenger_lab::SendRequest,
 ) {
     assert_eq!(action.request.queue_id, request.queue_id);
     assert_eq!(action.request.message_id, request.message_id);

@@ -1,11 +1,24 @@
+// The whole module is crate-private legacy retained for the in-crate
+// end-to-end proof tests; the façade (`src/persistent`) is the
+// production path and does not use it.
+#![allow(dead_code)]
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use vodozemac::olm::{Account, OlmMessage, Session, SessionConfig};
 use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 
+use crate::capability::VerifiedEnvelope;
 use crate::capability::{canonical, digest};
-use crate::{ConversationId, LabError, MessageId, Result, VerifiedEnvelope};
+use crate::{ConversationId, LabError, MessageId, Result};
+
+// Path-level staging and expiry tests live in-crate with the crate-private
+// client types they exercise.
+#[cfg(test)]
+mod expiry_tests;
+#[cfg(test)]
+mod staging_tests;
 
 const PAYLOAD_VERSION: u8 = 1;
 const CONTACT_BUNDLE_ACTION: &[u8] = b"peer-prekey";
