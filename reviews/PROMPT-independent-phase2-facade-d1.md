@@ -1,5 +1,41 @@
 # Independent review — `PersistentClient` façade, leg D1
 
+## Remediation history (v2)
+
+Version 1 (head `73257357f912b79e5fbf656ff1fe0cfbc3885d45`) was RETURNED by
+Sol with five blockers (verdict in `reviews/REVIEW-sol-facade-d1.md`). The
+amended head under review fixes all five:
+
+1. Result presentation now requires the full action:
+   `record_registration_result(&DurableAction<MailboxRegistration>, outcome)`
+   verifies BOTH the random token AND the canonical request digest against
+   the current durable record (step-2 check, before any staging). Minting
+   while an action is unconsumed replaces the durable record (crash-recovery
+   requirement, documented).
+2. Payload generation now tracks the store: `mutate` pins
+   `candidate.state.generation = store.generation + 1` before serialization,
+   verifies post-commit, and the open path requires generation equality plus
+   profile/key-ref equality with the store's independent binding. Sol's
+   divergence repro is a regression test.
+3. New `pending_prekey_offer()` view returns the committed offer after a
+   crash between COMMIT and artifact return, so a committed prekey can never
+   be orphaned.
+4. `commit_verified_contact` now takes the peer send capability as bounded
+   canonical serialized bytes (`Zeroizing<Vec<u8>>`); the typed keypair is
+   constructed only inside the façade. The remaining caller-side erasure
+   duty is documented (the vendored type is `Clone`/`Serialize` —
+   unpreventable against a caller that already held the key).
+5. The mutator sequence is restored to the frozen order:
+   `mutate(bounds, operation)` — Ready gate, then known-bounds checks on
+   current state, then candidate staging, then mutation/validation/
+   serialization, commit, install. All per-family input validation now runs
+   inside the mutator; nothing validates or serializes before the Ready
+   gate.
+
+One judgment call flagged: the post-commit generation comparison enters
+`ReconcileRequired` on mismatch although the commit succeeded — unreachable
+by construction, kept as defensive fail-closed.
+
 Review `secure-messenger-lab` at the exact head SHA supplied with this brief. Confirm the
 checked-out SHA and that the worktree is clean before reviewing. This same brief is being sent
 separately to Fable and Sol; do not seek, read, summarize, or defer to the other reviewer's response

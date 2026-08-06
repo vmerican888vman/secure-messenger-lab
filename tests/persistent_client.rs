@@ -211,7 +211,7 @@ fn commit_contact_and_establish(
         peer.offer.signing_identity,
         peer.offer,
         peer.queue_id,
-        peer.send_keypair,
+        Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
         NOW,
     )?;
     client.establish_outbound_session(NOW)?;
@@ -264,7 +264,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
         peer.offer.signing_identity,
         peer.offer,
         peer.queue_id,
-        peer.send_keypair,
+        Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
         NOW,
     )?;
     client.establish_outbound_session(NOW)?;
@@ -281,7 +281,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
             &action.request.signature,
         )
         .map_err(|_| "registration signature did not verify")?;
-    client.record_registration_result(action.token, RegistrationOutcome::Confirmed)?;
+    client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
 
     drop(client);
     let mut client = open_client(&temp)?;
@@ -298,7 +298,7 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
                 peer2.offer.signing_identity,
                 peer2.offer,
                 peer2.queue_id,
-                peer2.send_keypair,
+                Zeroizing::new(serde_json::to_vec(&peer2.send_keypair)?),
                 NOW,
             )
             .is_err(),
@@ -310,19 +310,19 @@ fn create_mutate_reopen_round_trips() -> Result<(), Box<dyn Error>> {
     );
     assert!(
         client
-            .record_registration_result(action.token, RegistrationOutcome::Confirmed)
+            .record_registration_result(&action, RegistrationOutcome::Confirmed)
             .is_err(),
         "consumed token replayed"
     );
 
     // Terminal-failed registration also round-trips.
     let failed = client.registration_action(NOW + 3_600)?;
-    client.record_registration_result(failed.token, RegistrationOutcome::Failed)?;
+    client.record_registration_result(&failed, RegistrationOutcome::Failed)?;
     drop(client);
     let mut client = open_client(&temp)?;
     assert_eq!(client.public_identity()?, identity);
     let third = client.registration_action(NOW + 3_600)?;
-    client.record_registration_result(third.token, RegistrationOutcome::Confirmed)?;
+    client.record_registration_result(&third, RegistrationOutcome::Confirmed)?;
     Ok(())
 }
 
@@ -351,7 +351,7 @@ fn crash_reopen_discipline_between_every_mutator() -> Result<(), Box<dyn Error>>
     drop(client);
 
     let mut client = open_client(&temp)?;
-    client.record_registration_result(action.token, RegistrationOutcome::Confirmed)?;
+    client.record_registration_result(&action, RegistrationOutcome::Confirmed)?;
     drop(client);
 
     let mut client = open_client(&temp)?;
@@ -360,7 +360,7 @@ fn crash_reopen_discipline_between_every_mutator() -> Result<(), Box<dyn Error>>
     assert!(client.establish_outbound_session(NOW).is_err());
     assert!(
         client
-            .record_registration_result(action.token, RegistrationOutcome::Confirmed)
+            .record_registration_result(&action, RegistrationOutcome::Confirmed)
             .is_err()
     );
     let _ = offer;
@@ -372,7 +372,8 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     let temp = TempDir::new()?;
     let mut client = create_client(&temp)?;
     let identity = client.public_identity()?;
-    client.prekey_action(NOW + 300)?;
+    let offer = client.prekey_action(NOW + 300)?;
+    let pending_action = client.registration_action(NOW + 3_600)?;
 
     // Tamper with the stored nonce through a second connection so the
     // next commit's exact-generation CAS fails (simulating an authentic
@@ -390,10 +391,12 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
         params![tampered],
     )?;
 
+    // The next mutator fails at commit (CAS) and enters ReconcileRequired.
     assert!(client.registration_action(NOW + 3_600).is_err());
     // ReconcileRequired: every operation rejects, including reads of
     // secret state; only the non-failing protection level stays.
     assert!(client.public_identity().is_err());
+    assert!(client.pending_prekey_offer().is_err());
     assert!(client.prekey_action(NOW + 300).is_err());
     let peer = peer_material(NOW + 300)?;
     assert!(
@@ -402,7 +405,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
                 peer.offer.signing_identity,
                 peer.offer,
                 peer.queue_id,
-                peer.send_keypair,
+                Zeroizing::new(serde_json::to_vec(&peer.send_keypair)?),
                 NOW,
             )
             .is_err()
@@ -411,7 +414,7 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     assert!(client.registration_action(NOW + 3_600).is_err());
     assert!(
         client
-            .record_registration_result([0xAB; 16], RegistrationOutcome::Confirmed)
+            .record_registration_result(&pending_action, RegistrationOutcome::Confirmed)
             .is_err()
     );
     assert_eq!(client.protection_level(), ProtectionLevel::SoftwareBacked);
@@ -426,42 +429,76 @@ fn reconcile_required_rejects_everything_until_reopen() -> Result<(), Box<dyn Er
     drop(client);
     let mut client = open_client(&temp)?;
     assert_eq!(client.public_identity()?, identity);
+    assert_eq!(client.pending_prekey_offer()?, Some(offer));
     assert!(
         client.prekey_action(NOW + 300).is_err(),
         "last committed state (pending prekey) not recovered"
     );
+    // The action minted before the crash is still the durable record and
+    // remains consumable.
+    client.record_registration_result(&pending_action, RegistrationOutcome::Confirmed)?;
     Ok(())
 }
 
 #[test]
-fn token_discipline_wrong_replayed_and_cross_action() -> Result<(), Box<dyn Error>> {
+fn action_token_and_digest_both_verified() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let mut client = create_client(&temp)?;
-    let action = client.registration_action(NOW + 3_600)?;
+    let action_a = client.registration_action(NOW + 3_600)?;
+    // Minting a second action while the first is unconsumed REPLACES the
+    // durable record (crash recovery: a lost token must not brick
+    // registration).
+    let action_b = client.registration_action(NOW + 3_600)?;
 
-    // Wrong token: rejected without mutation; the action stays consumable.
+    // Sol's scenario: presenting the superseded action A rejects, both as
+    // a whole and in each cross-case.
     assert!(
         client
-            .record_registration_result([0xAB; 16], RegistrationOutcome::Confirmed)
-            .is_err()
+            .record_registration_result(&action_a, RegistrationOutcome::Confirmed)
+            .is_err(),
+        "superseded action accepted"
     );
-    client.record_registration_result(action.token, RegistrationOutcome::Confirmed)?;
-
-    // Replayed token.
+    let token_a_request_b = secure_messenger_lab::DurableAction {
+        token: action_a.token,
+        request: action_b.request.clone(),
+    };
     assert!(
         client
-            .record_registration_result(action.token, RegistrationOutcome::Confirmed)
+            .record_registration_result(&token_a_request_b, RegistrationOutcome::Confirmed)
+            .is_err(),
+        "token-right/request-wrong accepted"
+    );
+    let token_b_request_a = secure_messenger_lab::DurableAction {
+        token: action_b.token,
+        request: action_a.request.clone(),
+    };
+    assert!(
+        client
+            .record_registration_result(&token_b_request_a, RegistrationOutcome::Confirmed)
+            .is_err(),
+        "request-right/token-wrong accepted"
+    );
+
+    // The current action consumes.
+    client.record_registration_result(&action_b, RegistrationOutcome::Confirmed)?;
+    // And its replay rejects.
+    assert!(
+        client
+            .record_registration_result(&action_b, RegistrationOutcome::Confirmed)
             .is_err()
     );
 
-    // Token from a different (older) action.
-    let newer = client.registration_action(NOW + 3_600)?;
+    // A token that matches nothing at all rejects without mutation; the
+    // durable record is unaffected and a fresh action still consumes.
+    let mut wrong_token = client.registration_action(NOW + 3_600)?;
+    wrong_token.token = [0xAB; 16];
     assert!(
         client
-            .record_registration_result(action.token, RegistrationOutcome::Failed)
+            .record_registration_result(&wrong_token, RegistrationOutcome::Confirmed)
             .is_err()
     );
-    client.record_registration_result(newer.token, RegistrationOutcome::Confirmed)?;
+    let fresh = client.registration_action(NOW + 3_600)?;
+    client.record_registration_result(&fresh, RegistrationOutcome::Failed)?;
     Ok(())
 }
 
@@ -480,7 +517,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
                 impostor.ed25519_key(),
                 peer.offer,
                 peer.queue_id,
-                Ed25519Keypair::new(),
+                Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW,
             )
             .is_err()
@@ -492,7 +529,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
                 peer.offer.signing_identity,
                 peer.offer,
                 peer.queue_id,
-                Ed25519Keypair::new(),
+                Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW + 300,
             )
             .is_err()
@@ -505,7 +542,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
                 wide.offer.signing_identity,
                 wide.offer,
                 wide.queue_id,
-                wide.send_keypair,
+                Zeroizing::new(serde_json::to_vec(&wide.send_keypair)?),
                 NOW,
             )
             .is_err()
@@ -521,7 +558,7 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
                 broken.signing_identity,
                 broken,
                 peer.queue_id,
-                Ed25519Keypair::new(),
+                Zeroizing::new(serde_json::to_vec(&Ed25519Keypair::new())?),
                 NOW,
             )
             .is_err()
@@ -542,10 +579,31 @@ fn verification_failures_do_not_mutate() -> Result<(), Box<dyn Error>> {
         expiring.offer.signing_identity,
         expiring.offer,
         expiring.queue_id,
-        expiring.send_keypair,
+        Zeroizing::new(serde_json::to_vec(&expiring.send_keypair)?),
         NOW,
     )?;
     assert!(client2.establish_outbound_session(NOW + 300).is_err());
+    Ok(())
+}
+
+/// Finding 3: a committed prekey whose returned offer was lost to a crash
+/// is retrievable through the recovery view, byte-identical.
+#[test]
+fn pending_prekey_offer_recovers_committed_offer() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let mut client = create_client(&temp)?;
+    // None before any prekey exists.
+    assert_eq!(client.pending_prekey_offer()?, None);
+
+    let offer = client.prekey_action(NOW + 300)?;
+    assert_eq!(client.pending_prekey_offer()?, Some(offer));
+
+    // Crash without using the returned offer; the committed offer is
+    // retrievable, identical, and re-running the action still rejects.
+    drop(client);
+    let mut client = open_client(&temp)?;
+    assert_eq!(client.pending_prekey_offer()?, Some(offer));
+    assert!(client.prekey_action(NOW + 300).is_err());
     Ok(())
 }
 
