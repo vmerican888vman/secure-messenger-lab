@@ -161,22 +161,36 @@
 //!     both-stuck corner (the peer locked with all its receipts expired
 //!     undelivered, so no signal is on the wire — the other side
 //!     eventually congests locally and arms at its next accept).
-//!   - **Peer signal (v7):** the just-accepted payload's
+//!   - **Peer signal (v7/v8):** the just-accepted payload's
 //!     `issuer_outstanding` at or above the threshold. Payloads carry
-//!     the issuer's staging-time outstanding on BOTH arms (this leg's
-//!     format; the frozen `HighWaterReceipt` is untouched). The value is
-//!     PEER-REPORTED and informational: no validation, and lying is
-//!     self-harming (over-signaling costs the peer at most one
-//!     idempotent receipt — bounded by the in-flight guard and
-//!     one-staged-per-pass — while under-signaling wedges only the
-//!     liar's own budget). A stale out-of-order payload can over-arm;
-//!     that is harmless for the same bound, and under-arming — the
-//!     dangerous direction — cannot come from a truthful signal.
+//!     the issuer's POST-advance outstanding on BOTH arms (this leg's
+//!     format; the frozen `HighWaterReceipt` is untouched): the send's
+//!     own sequence counts, so the 24th send reports 24 and actually
+//!     signals (v8 P1-3). The value is PEER-REPORTED and informational:
+//!     no validation. A stale out-of-order payload can over-arm; that is
+//!     bounded, and under-arming — the dangerous direction — cannot
+//!     come from a truthful signal.
 //!
-//!   While armed and the contiguous water is ahead of the delivered
-//!   marker, the owed rule stages one receipt per pass even with zero
-//!   application debt, and staging clears the flag. The freshness gate
-//!   (`HCR > marker`) applies to both arms: if we already reported
+//!   The accept tail arms (and clears) FIRST, then attempts owed
+//!   staging — a debt armed by the accept itself flushes in the SAME
+//!   pass (v8 P1-3b), including when the accept crossed the threshold.
+//!   Flag lifecycle (v8 P1-2): set on arming (either source); NOT
+//!   cleared on staging; cleared only by confirmed relay delivery (a
+//!   receipt-kind send reaching `Stored`/`Duplicate` in
+//!   `record_send_result` — the peer will fetch and drain) or by a
+//!   fresh accepted payload reporting `issuer_outstanding < 24` (the
+//!   peer says it recovered; a malicious peer could clear it with a
+//!   low-signal packet, but that only stops receipts IT wanted —
+//!   self-harming, acceptable). The local sample always re-arms on
+//!   genuine local congestion, so the clear sticks only when the
+//!   acceptor is itself below the threshold. Guards (v8 P1-4): the
+//!   application-debt arm keeps the per-current-water in-flight rule
+//!   (honest path), while the peer-signaled/control arm stages only
+//!   when NO receipt-kind send is `Pending` AT ALL — a malicious peer
+//!   streaming authenticated `hw=0` receipts that each occupy a sender
+//!   sequence (each arming anew) gets ≈ one victim receipt per
+//!   delivery-or-expiry cycle regardless of attack rate. The freshness
+//!   gate (`HCR > marker`) applies to both arms: if we already reported
 //!   everything, the peer's congestion is not ours to fix with empty
 //!   receipts. Below the threshold on both sources nothing changes: v6
 //!   quiescence holds exactly.
@@ -202,13 +216,20 @@
 //!   staging, so the §4 recovery path (a valid receipt lowers
 //!   outstanding, the mode recomputes, the armed debt stages once
 //!   control is allowed) is what actually un-wedges the corner.
-//! - **Gap failure commits.** A previously unseen, peer-authenticated
+//! - **Gap failure commits; `RekeyRequired` closes inbound.** A
+//!   previously unseen, peer-authenticated
 //!   packet on the current session whose decrypt fails with
 //!   `TooBigMessageGap`/`MissingMessageKey` commits `RekeyRequired` and
 //!   only then reports `LabError::Crypto` — the mode change IS the
 //!   durable outcome (§4). "Current-epoch" is structural: the façade
 //!   keeps exactly one session, so every accepted candidate packet is
-//!   current-epoch by construction.
+//!   current-epoch by construction. Once the mode is `RekeyRequired`,
+//!   EVERY further packet on that session rejects at the top of
+//!   `accept_envelope`'s bounds — no decrypt, no dedup write, no commit
+//!   (review D2b v8 P1-1): inbound is closed until the future
+//!   rebootstrap leg, so a replayed gap packet cannot re-commit and no
+//!   later application can be accepted and exposed. Relay-level ACK
+//!   actions are unaffected (they never touch the ratchet).
 //! - **Terminal-record pruning** runs in the send-path mutators that take
 //!   a clock (`stage_send`, `consume_inbound`): terminal records
 //!   (`Stored`/`Duplicate`/`Expired`) are removed once
@@ -999,7 +1020,10 @@ impl<P: StateKeyProtector> PersistentClient<P> {
 
     /// Accept a fetched envelope: authenticate, establish or advance the
     /// ratchet, strictly decode the payload, track the sender sequence,
-    /// and durably record the outcome. The lettered steps of the D2b
+    /// and durably record the outcome. Once the session is
+    /// `RekeyRequired`, EVERY packet rejects at the top of the bounds —
+    /// inbound is closed until the future rebootstrap leg (review D2b v8
+    /// P1-1). The lettered steps of the D2b
     /// specification map onto the mutator discipline as: (a) bounds, then
     /// (c) envelope signature verification and (b) dedup, in THAT order —
     /// signature before dedup, the stronger order — in the step-2 bounds
@@ -1025,7 +1049,9 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// Returns coarse errors for envelope authentication failure
     /// ([`LabError::Unauthorized`]), duplicates
     /// ([`LabError::DuplicateMessage`]), decoding and crypto failures, or
-    /// storage failures. A gap failure returns [`LabError::Crypto`] AFTER
+    /// storage failures — including [`LabError::Storage`] for every
+    /// packet on a `RekeyRequired` session. A gap failure returns
+    /// [`LabError::Crypto`] AFTER
     /// the `RekeyRequired` mode change has committed.
     // The packet arrives by value per the frozen family signature; only
     // its digest is persisted (the inbound record holds digest+expiry).
@@ -1042,6 +1068,20 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         let packet_digest = packet.digest();
         let artifact = self.mutate(
             |current| {
+                // Inbound lock (review D2b v8 P1-1): once the session is
+                // `RekeyRequired`, the conversation is closed until the
+                // (future, out-of-scope) rebootstrap leg. Reject EVERY
+                // packet here, at the top of the step-2 bounds — no
+                // decrypt, no dedup write, no generation commit — so a
+                // replayed gap packet cannot re-commit and no later
+                // application can be accepted and exposed. Relay-level
+                // ACK actions are unaffected (they never touch the
+                // ratchet).
+                if let Some(active) = &current.state.active_session {
+                    if active.mode == SessionMode::RekeyRequired {
+                        return Err(LabError::Storage);
+                    }
+                }
                 // (a) bounds.
                 if expires_at <= now {
                     return Err(LabError::RequestExpired);
@@ -1481,6 +1521,12 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                         // newer one never moves the marker backward.
                         active.last_delivered_receipt_high_water =
                             active.last_delivered_receipt_high_water.max(high_water);
+                        // Confirmed relay delivery discharges the armed
+                        // control debt (review D2b v8 P1-2): the peer
+                        // will fetch the receipt and drain. The flag is
+                        // cleared only here and on a fresh low-signal
+                        // accept — never at staging.
+                        active.control_debt_armed = 0;
                     }
                     recompute_mode(active);
                 }
@@ -1886,16 +1932,18 @@ fn admit_application_send(
             .active_session
             .as_ref()
             .ok_or(LabError::MissingSession)?;
+        let send_seq = active
+            .last_assigned_send_seq
+            .checked_add(1)
+            .ok_or(LabError::Storage)?;
         (
             active.epoch_id,
-            active
-                .last_assigned_send_seq
-                .checked_add(1)
-                .ok_or(LabError::Storage)?,
+            send_seq,
             candidate.state.conversation_id,
-            // The congestion signal (review D2b v7): the local outstanding
-            // sampled at staging time, before this send's own advance.
-            active.last_assigned_send_seq - active.peer_contiguous_high_water,
+            // The congestion signal (review D2b v7/v8): the POST-advance
+            // outstanding — this send's own sequence counted — so the
+            // 24th send reports 24 and actually signals (v8 P1-3).
+            send_seq - active.peer_contiguous_high_water,
         )
     };
     let message_id = MessageId::random();
@@ -2317,6 +2365,31 @@ fn accept_envelope_operation(
 /// receipt clears it; and the freshness gate (`HCR > marker`) applies
 /// to both arms — if we already reported everything, the peer's
 /// congestion is not ours to fix with empty receipts.
+/// Control debt (review D2b v6/v7/v8, codec field 21): the flag is
+/// armed FIRST in this tail — the LOCAL sample (acceptor's own
+/// outstanding at or above the `ControlOnly` threshold at accept ENTRY
+/// or END, v6) and the PEER-SIGNALED sample (the just-accepted
+/// payload's `issuer_outstanding` at or above the threshold, v7) are
+/// applied BEFORE the owed-staging attempt, so a debt armed by THIS
+/// accept flushes in the SAME pass (review D2b v8 P1-3b) — including
+/// when the accept itself crossed the threshold. A payload reporting
+/// `issuer_outstanding < 24` instead CLEARS the flag (review D2b v8
+/// P1-2b): the peer says it recovered, and a fresh signal supersedes
+/// any earlier arm (a malicious peer could clear it with a low-signal
+/// packet, but that only stops receipts IT wanted — self-harming,
+/// acceptable). The flag is never cleared on staging; confirmed relay
+/// delivery (`Stored`/`Duplicate` in `record_send_result`) is the only
+/// other clear. The peer signal is informational only: a stale
+/// out-of-order payload can over-arm, which costs at most one
+/// idempotent receipt (bounded by the any-pending guard, v8 P1-4, and
+/// one-staged-per-pass) — over-arming is harmless; under-arming is the
+/// dangerous direction and cannot come from a truthful signal. The
+/// LOCAL sample stays as the backstop for the both-stuck corner (the
+/// peer locked with all its receipts expired undelivered, so no signal
+/// is on the wire: the other side eventually congests locally and arms
+/// at its next accept). The freshness gate (`HCR > marker`) applies to
+/// both arms — if we already reported everything, the peer's congestion
+/// is not ours to fix with empty receipts.
 fn accept_staging_tail(
     candidate: &mut Candidate,
     congested_at_entry: bool,
@@ -2330,6 +2403,21 @@ fn accept_staging_tail(
             .as_mut()
             .ok_or(LabError::MissingSession)?;
         recompute_mode(active);
+        // Arm/clear FIRST (v8 P1-3b): the staging attempt below sees the
+        // flag this accept set, so newly armed debt flushes in this
+        // same pass. A fresh low signal supersedes any earlier arm
+        // (v8 P1-2b); the local sample always re-arms on congestion.
+        if issuer_outstanding >= CONTROL_ONLY_THRESHOLD {
+            active.control_debt_armed = 1;
+        } else {
+            active.control_debt_armed = 0;
+        }
+        if congested_at_entry
+            || active.last_assigned_send_seq - active.peer_contiguous_high_water
+                >= CONTROL_ONLY_THRESHOLD
+        {
+            active.control_debt_armed = 1;
+        }
     }
     maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
@@ -2338,13 +2426,6 @@ fn accept_staging_tail(
         .as_mut()
         .ok_or(LabError::MissingSession)?;
     recompute_mode(active);
-    if congested_at_entry
-        || issuer_outstanding >= CONTROL_ONLY_THRESHOLD
-        || active.last_assigned_send_seq - active.peer_contiguous_high_water
-            >= CONTROL_ONLY_THRESHOLD
-    {
-        active.control_debt_armed = 1;
-    }
     Ok(())
 }
 
@@ -2485,17 +2566,19 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
             Role::Inbound => active.identity_key,
             Role::Outbound => active.transcript.curve_identity,
         };
+        let send_seq = active
+            .last_assigned_send_seq
+            .checked_add(1)
+            .ok_or(LabError::Storage)?;
         (
             active.epoch_id,
-            active
-                .last_assigned_send_seq
-                .checked_add(1)
-                .ok_or(LabError::Storage)?,
+            send_seq,
             peer_curve,
             candidate.state.conversation_id,
-            // The congestion signal (review D2b v7): the local outstanding
-            // sampled at staging time, before this receipt's own advance.
-            active.last_assigned_send_seq - active.peer_contiguous_high_water,
+            // The congestion signal (review D2b v7/v8): the POST-advance
+            // outstanding — this receipt's own sequence counted — so the
+            // 24th send reports 24 and actually signals (v8 P1-3).
+            send_seq - active.peer_contiguous_high_water,
         )
     };
     let mut receipt = HighWaterReceipt {
@@ -2574,31 +2657,37 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
 }
 
 /// Stage the owed receipt, if any; returns true when one staged (review
-/// D2b v5 debt model, v6 control arm).
+/// D2b v5 debt model, v6 control arm, v8 lifecycle and signal guard).
 ///
 /// A receipt is owed ⇔ the freshness gate
 /// (`highest_contiguous_received_seq > last_delivered_receipt_high_water`
 /// — there is a NEW contiguous water worth reporting; a receipt carrying
-/// nothing new is pointless traffic) AND no `Pending` receipt-kind send
-/// with `receipt_high_water` equal to the current high water is in
-/// flight, AND EITHER debt arm fires:
+/// nothing new is pointless traffic) AND EITHER debt arm fires, each
+/// with its OWN in-flight guard (review D2b v8 P1-4 asymmetry):
 ///
-/// - **Application debt** (v5): `receipt_debt_up_to > marker` — consumed
-///   application debt the peer has not provably heard about. A delivered
-///   receipt reports the contiguous water (never the debt), so it covers
-///   exactly the debt at or below that water; debt ABOVE the water (an
-///   out-of-order consumption) stays owed until the water drains past
-///   it. Debt comes only from `consume_inbound` (codec field 20), so
-///   receipt-only exchanges never create it (quiescence by
-///   construction).
-/// - **Control debt** (v6 P1, codec field 21): `control_debt_armed == 1`
-///   — the acceptor armed at a congested accept end (outstanding at or
-///   above the `ControlOnly` threshold). Receipts consume the shared
-///   send counter, so one-directional traffic otherwise strands the
-///   receiver's own sends with no drain path; the armed flag lets the
-///   congested side report its fresh water, which is how the peer's
-///   counter-receipt later drains IT. Staging clears the flag; when the
-///   freshness gate fails the flag stays set for the next advance.
+/// - **Application debt** (v5, honest path): `receipt_debt_up_to >
+///   marker` AND no `Pending` receipt with `receipt_high_water` equal to
+///   the CURRENT high water in flight. A delivered receipt reports the
+///   contiguous water (never the debt), so it covers exactly the debt at
+///   or below that water; debt ABOVE the water (an out-of-order
+///   consumption) stays owed until the water drains past it. Debt comes
+///   only from `consume_inbound` (codec field 20), so receipt-only
+///   exchanges never create it (quiescence by construction).
+/// - **Control debt** (v6/v7/v8, codec field 21): `control_debt_armed
+///   == 1` AND NO receipt-kind send record `Pending` AT ALL (any high
+///   water). The peer-signaled arm answers REPORTED congestion, which a
+///   malicious peer can fabricate continuously (each signaling packet
+///   occupies a sender sequence, so a per-current-water guard passes
+///   every time — Sol's 33-packet probe); the any-pending guard bounds
+///   the response to ≈ one victim receipt per delivery-or-expiry cycle
+///   regardless of attack rate. The flag's lifecycle (review D2b v8
+///   P1-2): it is set on arming (local or signal), is NOT cleared on
+///   staging, and clears only when a receipt-kind send reaches
+///   `Stored`/`Duplicate` (confirmed relay delivery, in
+///   `record_send_result`) or when a newer accepted payload reports
+///   `issuer_outstanding < 24` (the peer says it recovered — a
+///   malicious peer could clear the flag with a low-signal packet, but
+///   that only stops receipts IT wanted: self-harming, acceptable).
 ///
 /// It stages at most one receipt per mutator pass, only when the mode
 /// allows control traffic and the send array has capacity; otherwise it
@@ -2612,21 +2701,25 @@ fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<bool>
     let high_water = active.highest_contiguous_received_seq;
     let marker = active.last_delivered_receipt_high_water;
     let fresh = high_water > marker;
-    let owed = (active.receipt_debt_up_to > marker || active.control_debt_armed == 1) && fresh;
     let mode_allows = matches!(active.mode, SessionMode::Ready | SessionMode::ControlOnly);
-    let in_flight = candidate.state.sends.iter().any(|record| {
+    let hcr_receipt_pending = candidate.state.sends.iter().any(|record| {
         record.state == SendState::Pending
             && record.kind == SendKind::Receipt
             && record.receipt_high_water == Some(high_water)
     });
-    if owed && !in_flight && mode_allows && candidate.state.sends.len() < MAX_SENDS {
+    let any_receipt_pending = candidate
+        .state
+        .sends
+        .iter()
+        .any(|record| record.state == SendState::Pending && record.kind == SendKind::Receipt);
+    let debt_owed = active.receipt_debt_up_to > marker && !hcr_receipt_pending;
+    let control_owed = active.control_debt_armed == 1 && !any_receipt_pending;
+    if (debt_owed || control_owed)
+        && fresh
+        && mode_allows
+        && candidate.state.sends.len() < MAX_SENDS
+    {
         stage_receipt(candidate, high_water, now)?;
-        // Staging discharges the armed control debt: the receipt reports
-        // the freshest water; re-arming happens at the next congested
-        // accept end.
-        if let Some(active) = candidate.state.active_session.as_mut() {
-            active.control_debt_armed = 0;
-        }
         return Ok(true);
     }
     Ok(false)

@@ -1,5 +1,35 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v9)
+
+Version 8 (head `a3d96c35c10c655ddfa0e10c1d0d5e38644b762a`): Fable PASS, Sol
+RETURN with four P1 blockers (verdict in
+`reviews/REVIEW-sol-facade-d2b-v8.md`), all fixed in the head under review
+(façade + payload-sampling only; the codec layouts are untouched):
+
+1. **`RekeyRequired` locks inbound.** `accept_envelope` rejects any packet
+   on a rekey-locked session before any ratchet touch — no decrypt, dedup,
+   or commit; replayed gap packets cannot bump generation; post-gap
+   applications are not exposed. Relay-level ACK actions unaffected.
+2. **Control debt survives failure.** `control_debt_armed` no longer clears
+   on staging; it clears only on confirmed delivery (`Stored`/`Duplicate`)
+   or on a fresh peer payload reporting recovery (`issuer_outstanding < 24`
+   — with the documented ordering that local congestion always re-arms, so
+   the clear sticks only when the acceptor is itself below threshold).
+   DeliveryUnknown/expiry/reopen re-stage at the next mutator.
+3. **Post-advance signal + same-pass flush.** `issuer_outstanding` is now
+   sampled AFTER the send's own advance (the 24th send reports 24 and
+   signals), and the accept tail arms before staging, so newly armed debt
+   flushes in the same pass — including outbound threshold crossings.
+4. **Over-signaling cannot lock the victim.** Peer-signaled staging now
+   requires NO receipt-kind send Pending at all (any high water), bounding
+   an attacker to roughly one victim receipt per delivery-or-expiry cycle
+   (the application-debt arm keeps the per-HCR rule — documented asymmetry).
+   Sol's 33-packet probe is the regression test: at most one pending victim
+   receipt at any time.
+
+The v2–v8 histories follow unchanged.
+
 ## Remediation history (v8)
 
 Version 7 (head `2d88375a7b166197f3ac3129aa97ea11d2b313bb`) was RETURNED by
