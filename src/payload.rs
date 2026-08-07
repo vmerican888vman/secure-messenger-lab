@@ -77,6 +77,17 @@ impl ReceiptV2 {
 /// One strict payload. Both arms are always serialized (`null` when
 /// absent); arm consistency is mandatory: `Application` carries
 /// `body: Some` and `receipt: None`, `Receipt` the reverse.
+///
+/// **Format amendment (review D2b v7):** `issuer_outstanding` is the
+/// issuer's own outstanding count (`last_assigned_send_seq -
+/// peer_contiguous_high_water`) sampled at staging time, carried on
+/// BOTH arms. It is PEER-REPORTED and informational only — the acceptor
+/// uses it solely as a congestion signal for control-debt arming, and
+/// no validation is applied to the value. Lying is self-harming:
+/// over-signaling costs the peer at most one idempotent receipt
+/// (bounded by the in-flight guard and one-staged-per-pass), while
+/// under-signaling wedges only the liar's own budget (the peer never
+/// learns it is starving).
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ClientPayloadV2 {
     pub(crate) version: u8,
@@ -88,6 +99,7 @@ pub(crate) struct ClientPayloadV2 {
     pub(crate) kind: u8,
     pub(crate) body: Option<String>,
     pub(crate) receipt: Option<ReceiptV2>,
+    pub(crate) issuer_outstanding: u64,
 }
 
 /// An application payload; the body is bounded at 65,536 UTF-8 bytes.
@@ -95,6 +107,8 @@ pub(crate) struct ClientPayloadV2 {
 /// bound after JSON escaping, so the encoded size is computed here and
 /// now, and any overflow rejects with [`LabError::InvalidPayload`] before
 /// any sequence assignment. The decode path enforces the same bound.
+/// `issuer_outstanding` is the staging-time local outstanding sample
+/// (see the struct docs).
 pub(crate) fn application(
     conversation_id: ConversationId,
     message_id: MessageId,
@@ -102,6 +116,7 @@ pub(crate) fn application(
     send_seq: u64,
     sent_at: u64,
     body: String,
+    issuer_outstanding: u64,
 ) -> Result<ClientPayloadV2> {
     if body.len() > MAX_BODY {
         return Err(LabError::InvalidPayload);
@@ -116,6 +131,7 @@ pub(crate) fn application(
         kind: KIND_APPLICATION,
         body: Some(body),
         receipt: None,
+        issuer_outstanding,
     };
     let size =
         Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| LabError::InvalidPayload)?).len();
@@ -218,6 +234,7 @@ mod tests {
             1,
             1_800_000_000,
             "payload body".to_owned(),
+            0,
         )?)
     }
 
@@ -312,6 +329,7 @@ mod tests {
             1,
             1,
             "x".repeat(MAX_BODY),
+            0,
         )?;
         let encoded = encode(&maximum)?;
         decode(&encoded)?;
@@ -322,6 +340,7 @@ mod tests {
             1,
             1,
             "x".repeat(MAX_BODY + 1),
+            0,
         );
         assert!(oversized.is_err());
         let mut crafted = sample()?;
@@ -406,6 +425,52 @@ mod tests {
     }
 
     #[test]
+    fn issuer_outstanding_required_on_both_arms() -> std::result::Result<(), Box<dyn Error>> {
+        // Carried values round-trip on both arms (nonzero included).
+        let mut payload = sample()?;
+        payload.issuer_outstanding = 24;
+        let encoded = encode(&payload)?;
+        let decoded = decode(&encoded)?;
+        assert_eq!(decoded.issuer_outstanding, 24);
+        assert_eq!(encode(&decoded)?[..], encoded[..]);
+        let mut receipt_payload = sample()?;
+        receipt_payload.kind = KIND_RECEIPT;
+        receipt_payload.body = None;
+        receipt_payload.receipt = Some(sample_receipt());
+        receipt_payload.issuer_outstanding = 7;
+        let encoded = encode(&receipt_payload)?;
+        let decoded = decode(&encoded)?;
+        assert_eq!(decoded.issuer_outstanding, 7);
+        assert_eq!(encode(&decoded)?[..], encoded[..]);
+
+        // Missing field rejects (serde required field).
+        let json = String::from_utf8(encode(&sample()?)?.to_vec())?;
+        let needle = ",\"issuer_outstanding\":0";
+        let position = json.find(needle).ok_or("field missing")?;
+        let removed = format!("{}{}", &json[..position], &json[position + needle.len()..]);
+        assert!(
+            decode(removed.as_bytes()).is_err(),
+            "missing field accepted"
+        );
+        // Renamed field rejects (the required field is then absent).
+        let renamed = json.replace("\"issuer_outstanding\"", "\"issuer_outstanding_x\"");
+        assert!(
+            decode(renamed.as_bytes()).is_err(),
+            "renamed field accepted"
+        );
+        // An extra unknown field rejects (canonical reserialize mismatch).
+        let with_extra = json.replace(
+            "\"issuer_outstanding\":0",
+            "\"issuer_outstanding\":0,\"extra_unknown\":1",
+        );
+        assert!(
+            decode(with_extra.as_bytes()).is_err(),
+            "extra field accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn escape_inflated_body_rejected_as_invalid_payload() -> std::result::Result<(), Box<dyn Error>>
     {
         // A body of 40,000 quotes is within the 65,536-byte body bound but
@@ -418,6 +483,7 @@ mod tests {
             1,
             1,
             heavy,
+            0,
         );
         assert!(matches!(result, Err(LabError::InvalidPayload)));
         // A same-length body without escapes stays under the bound.
@@ -429,6 +495,7 @@ mod tests {
             1,
             1,
             light,
+            0,
         )?;
         assert!(decode(&encode(&ok)?).is_ok());
         Ok(())

@@ -874,11 +874,14 @@ fn accept_envelope_rejects_forgery_expiry_and_wrong_variant()
 }
 
 /// Signed envelope around a genuine payload from a raw peer session.
+/// `issuer_outstanding` is the congestion signal the payload carries
+/// (review D2b v7); callers pass the honest sample or a test override.
 fn raw_peer_envelope(
     peer_session: &mut vodozemac::olm::Session,
     a: &PersistentClient<TestProtector>,
     conversation_id: ConversationId,
     seq: u64,
+    issuer_outstanding: u64,
 ) -> std::result::Result<(MessageId, EncryptedPacket, vodozemac::Ed25519Signature), Box<dyn Error>>
 {
     let epoch_id = super::epoch_of(peer_session.session_keys());
@@ -891,6 +894,7 @@ fn raw_peer_envelope(
         seq,
         NOW,
         format!("gap-message-{seq}"),
+        issuer_outstanding,
     )?;
     let encoded = payload::encode(&outgoing)?;
     let message = peer_session.encrypt(&encoded[..])?;
@@ -953,7 +957,7 @@ fn gap_failure_commits_rekey_required() -> std::result::Result<(), Box<dyn Error
     )?;
 
     // Message 1 establishes A's inbound session.
-    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1)?;
+    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1, 0)?;
     let outcome = a.accept_envelope(queue_a, id1, packet1, NOW + 3_600, sig1, NOW)?;
     assert!(matches!(outcome, AcceptOutcome::Application(_)));
 
@@ -964,7 +968,7 @@ fn gap_failure_commits_rekey_required() -> std::result::Result<(), Box<dyn Error
     let mut second = None;
     let mut last = None;
     for seq in 2..=45 {
-        let envelope = raw_peer_envelope(&mut peer_session, &a, conversation_id, seq)?;
+        let envelope = raw_peer_envelope(&mut peer_session, &a, conversation_id, seq, 0)?;
         if seq == 2 {
             second = Some(envelope);
         } else if seq == 45 {
@@ -1568,7 +1572,7 @@ fn expired_pending_prekey_cannot_be_consumed() -> std::result::Result<(), Box<dy
 
     // Fresh outer expiry, correctly capability-signed, at NOW+120 — past
     // the offer's validity. Rejected; nothing is consumed or mutated.
-    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1)?;
+    let (id1, packet1, sig1) = raw_peer_envelope(&mut peer_session, &a, conversation_id, 1, 0)?;
     let result = a.accept_envelope(queue_a, id1, packet1.clone(), NOW + 3_600, sig1, NOW + 120);
     assert!(matches!(result, Err(LabError::PeerVerificationFailed)));
     assert!(a.state.active_session.is_none());
@@ -2166,12 +2170,15 @@ fn owed_receipt_wins_freed_slot_over_application_send() -> std::result::Result<(
 /// A forged-but-authentic receipt envelope from B to A: a genuine
 /// B-signed `HighWaterReceipt` payload, encrypted with B's real session
 /// and signed for A's mailbox exactly like `stage_receipt` does.
+/// `issuer_outstanding` is the congestion signal the payload carries
+/// (review D2b v7); callers pass the honest sample or a test override.
 fn forge_receipt_envelope(
     b: &mut PersistentClient<TestProtector>,
     a: &PersistentClient<TestProtector>,
     high_water: u64,
     send_seq: u64,
     now: u64,
+    issuer_outstanding: u64,
 ) -> std::result::Result<
     (MessageId, EncryptedPacket, vodozemac::Ed25519Signature, u64),
     Box<dyn Error>,
@@ -2198,6 +2205,7 @@ fn forge_receipt_envelope(
         kind: payload::KIND_RECEIPT,
         body: None,
         receipt: Some(payload::ReceiptV2::from(&receipt)),
+        issuer_outstanding,
     };
     let encoded = payload::encode(&outgoing)?;
     let message = session.encrypt(&encoded[..])?;
@@ -2244,8 +2252,9 @@ fn receipt_locked_recovery_stages_owed_receipt_in_accept_pass()
     // The peer's receipt covering all 32 outstanding sends arrives IN
     // ORDER (B.seq 2 == A's HCR + 1): the accept applies it, recomputes
     // the mode, and stages the owed receipt in this same pass.
+    let b_signal = outstanding(&b)?;
     let (message_id, packet, signature, expires_at) =
-        forge_receipt_envelope(&mut b, &a, 32, 2, NOW)?;
+        forge_receipt_envelope(&mut b, &a, 32, 2, NOW, b_signal)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
@@ -2269,8 +2278,9 @@ fn receipt_locked_recovery_stages_owed_receipt_in_accept_pass()
 fn rekey_required_still_blocks_owed_staging_after_receipt()
 -> std::result::Result<(), Box<dyn Error>> {
     let (_a_dir, _b_dir, mut a, mut b, _relay) = locked_fixture(SessionMode::RekeyRequired)?;
+    let b_signal = outstanding(&b)?;
     let (message_id, packet, signature, expires_at) =
-        forge_receipt_envelope(&mut b, &a, 32, 2, NOW)?;
+        forge_receipt_envelope(&mut b, &a, 32, 2, NOW, b_signal)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
@@ -2387,7 +2397,7 @@ fn reordered_receipts_commit_sequence_progress() -> std::result::Result<(), Box<
     // A future high water remains a forgery class: hard error, and
     // nothing (not even the sequence insert) commits.
     let (forged_id, forged_packet, forged_sig, forged_exp) =
-        forge_receipt_envelope(&mut b, &a, 99, 7, NOW)?;
+        forge_receipt_envelope(&mut b, &a, 99, 7, NOW, 0)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(
         queue_id,
@@ -2440,8 +2450,9 @@ fn owed_receipt_crossing_control_threshold_rejects_application()
 
     // A peer receipt covering all 24 outstanding sends frees the budget;
     // the retry stages the body (mode recomputed before the decision).
+    let b_signal = outstanding(&b)?;
     let (message_id, packet, signature, expires_at) =
-        forge_receipt_envelope(&mut b, &a, 24, 2, NOW)?;
+        forge_receipt_envelope(&mut b, &a, 24, 2, NOW, b_signal)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
@@ -2482,9 +2493,10 @@ fn gap_filling_receipt_stages_consumed_debt_in_same_pass() -> std::result::Resul
     // ahead of the marker (1), so there is nothing new to report.
     let queue_id = a.state.mailbox_queue_id;
     let conversation_id = a.state.conversation_id;
+    let b_signal = outstanding(&b)?;
     let (app_id, app_packet, app_sig) = {
         let session = b.session.as_mut().ok_or("no b session")?;
-        raw_peer_envelope(session, &a, conversation_id, 3)?
+        raw_peer_envelope(session, &a, conversation_id, 3, b_signal)?
     };
     let outcome = a.accept_envelope(queue_id, app_id, app_packet, NOW + 3_600, app_sig, NOW)?;
     assert!(matches!(outcome, AcceptOutcome::Application(_)));
@@ -2503,7 +2515,9 @@ fn gap_filling_receipt_stages_consumed_debt_in_same_pass() -> std::result::Resul
     // B's seq-2 receipt arrives (hw 1, applied): the water drains to 3,
     // and the SAME accept pass stages the receipt reporting HCR 3 —
     // debt 3 ahead of the marker 1, water 3 ahead of the marker.
-    let (rcpt_id, rcpt_packet, rcpt_sig, rcpt_exp) = forge_receipt_envelope(&mut b, &a, 1, 2, NOW)?;
+    let b_signal = outstanding(&b)?;
+    let (rcpt_id, rcpt_packet, rcpt_sig, rcpt_exp) =
+        forge_receipt_envelope(&mut b, &a, 1, 2, NOW, b_signal)?;
     let outcome = a.accept_envelope(queue_id, rcpt_id, rcpt_packet, rcpt_exp, rcpt_sig, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
     {
@@ -2531,7 +2545,8 @@ fn gap_filling_receipt_stages_consumed_debt_in_same_pass() -> std::result::Resul
     relay.enqueue(&action.request, NOW)?;
     a.record_send_result(&action, SendOutcome::Stored)?;
     assert_eq!(delivered_marker(&a)?, 3);
-    let (id2, packet2, sig2, exp2) = forge_receipt_envelope(&mut b, &a, 1, 4, NOW)?;
+    let b_signal = outstanding(&b)?;
+    let (id2, packet2, sig2, exp2) = forge_receipt_envelope(&mut b, &a, 1, 4, NOW, b_signal)?;
     let outcome = a.accept_envelope(queue_id, id2, packet2, exp2, sig2, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptIdempotent);
     assert!(
@@ -2862,8 +2877,9 @@ fn receipt_locked_recovers_and_armed_control_debt_stages() -> std::result::Resul
     // A genuine peer receipt covering all 32 sends arrives IN ORDER
     // (B.seq 3): it applies, the mode recomputes to Ready, and the
     // armed control debt stages in the same pass.
+    let b_signal = outstanding(&b)?;
     let (message_id, packet, signature, expires_at) =
-        forge_receipt_envelope(&mut b, &a, 32, 3, NOW)?;
+        forge_receipt_envelope(&mut b, &a, 32, 3, NOW, b_signal)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
@@ -2887,5 +2903,361 @@ fn receipt_locked_recovers_and_armed_control_debt_stages() -> std::result::Resul
             "entry congestion should re-arm after the discharge"
         );
     }
+    Ok(())
+}
+
+// --- D2b v7 remediation tests (peer-signaled congestion) ----------------------
+
+/// Signal-vs-local independence (P1): the two arming sources fire
+/// independently — a peer reporting 0 does not suppress the local arm,
+/// and a peer reporting congestion arms an uncongested acceptor.
+#[test]
+fn congestion_signal_and_local_arm_are_independent() -> std::result::Result<(), Box<dyn Error>> {
+    // Part 1: local arm with a SILENT peer — A at 24 outstanding accepts
+    // a payload reporting issuer_outstanding 0; the local sample arms.
+    let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 24;
+        active.mode = SessionMode::ControlOnly;
+    }
+    let queue_id = a.state.mailbox_queue_id;
+    let conversation_id = a.state.conversation_id;
+    let (app_id, app_packet, app_sig) = {
+        let session = b.session.as_mut().ok_or("no b session")?;
+        raw_peer_envelope(session, &a, conversation_id, 2, 0)?
+    };
+    let outcome = a.accept_envelope(queue_id, app_id, app_packet, NOW + 3_600, app_sig, NOW)?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .control_debt_armed,
+        1,
+        "the local arm did not fire past a silent (0) peer signal"
+    );
+
+    // Part 2: signal arm with an UNCONGESTED acceptor — a fresh pair; A
+    // at 0 outstanding accepts a payload reporting issuer_outstanding
+    // 24; the peer signal arms.
+    let (_a2_dir, _b2_dir, mut a2, mut b2, mut relay2) = conversation_fixture()?;
+    let outcomes = deliver(&mut a2, &mut relay2, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    assert_eq!(outstanding(&a2)?, 0);
+    let queue_id = a2.state.mailbox_queue_id;
+    let conversation_id = a2.state.conversation_id;
+    let (app_id, app_packet, app_sig) = {
+        let session = b2.session.as_mut().ok_or("no b2 session")?;
+        raw_peer_envelope(session, &a2, conversation_id, 2, 24)?
+    };
+    let outcome = a2.accept_envelope(queue_id, app_id, app_packet, NOW + 3_600, app_sig, NOW)?;
+    assert!(matches!(outcome, AcceptOutcome::Application(_)));
+    assert_eq!(
+        a2.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .control_debt_armed,
+        1,
+        "the peer signal did not arm an uncongested acceptor"
+    );
+    Ok(())
+}
+
+/// The staged payload's congestion signal equals the local outstanding
+/// (`last_assigned_send_seq - peer_contiguous_high_water`) sampled at
+/// staging time — verified by decrypting the wire packets with a CLONE
+/// of the peer's session (its ratchet is left untouched).
+#[test]
+fn staged_payloads_carry_the_local_outstanding() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let mut peer_clone =
+        vodozemac::olm::Session::from_pickle(b.session.as_ref().ok_or("no b session")?.pickle());
+    let mut decode_next = |packet: &EncryptedPacket| -> std::result::Result<u64, Box<dyn Error>> {
+        let olm_message: vodozemac::olm::OlmMessage = serde_json::from_slice(packet.as_bytes())?;
+        let plaintext = peer_clone
+            .decrypt(&olm_message)
+            .map_err(|_| "clone decrypt failed")?;
+        Ok(payload::decode(&plaintext)?.issuer_outstanding)
+    };
+
+    // Uncongested: A's first send carries 0.
+    let first = stage_app(&mut a, "ping", NOW, NOW + 3_600, NOW)?;
+    assert_eq!(decode_next(&first.request.packet)?, 0);
+
+    // Fabricate 8 outstanding: the next send carries 8.
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 8;
+    }
+    let second = stage_app(&mut a, "ping2", NOW, NOW + 3_600, NOW)?;
+    assert_eq!(decode_next(&second.request.packet)?, 8);
+    Ok(())
+}
+
+/// Fable's lockstep reproduction (P1): one staged body per round with a
+/// prompt consume and receipt, ~60 rounds with 8-day clock jumps. The v7
+/// head (local-only arm) wedged A at `ReceiptLocked` permanently; with
+/// the peer-signaled arm, A's receipts signal the congestion, B arms and
+/// counter-receipts, and A drains back below the threshold.
+#[test]
+fn lockstep_traffic_never_deadlocks_budget() -> std::result::Result<(), Box<dyn Error>> {
+    const ROUND_SECONDS: u64 = 6 * 24 * 60 * 60;
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    let mut last_hcr = 0_u64;
+    let mut a_was_congested = false;
+    let mut a_drained_after_congestion = false;
+    for round in 0..60_u64 {
+        // Round 0 runs at NOW so A's inbound session establishes inside
+        // the prekey bundle's validity. Each round jumps 6 days — under
+        // the 7-day message TTL, so a receipt staged late in a round
+        // still reaches the peer next round; tombstone pruning then
+        // keeps the arrays small every other round.
+        let now = NOW + round * ROUND_SECONDS;
+        // One staged body per round (B's budget is drained each round).
+        // Drive EVERYTHING pending in sequence order right after the
+        // stage: an armed counter-receipt may precede the body in
+        // sequence, and the peer must see envelopes in order.
+        let _action = stage_app(&mut b, &format!("lockstep-{round}"), now, now + 3_600, now)?;
+        drive_pending(&mut b, &mut relay, now)?;
+        // A accepts and consumes it; its owed receipt is driven back.
+        let outcomes = fetch_and_accept_all(&mut a, &mut relay, now)?;
+        for outcome in outcomes {
+            if let AcceptOutcome::Application(message_id) = outcome {
+                a.consume_inbound(message_id, now + 300, now)?;
+            }
+        }
+        drive_pending(&mut a, &mut relay, now)?;
+        // B accepts A's receipt(s); if A's payload now signals
+        // congestion, B arms and counter-receipts; drive everything.
+        let _b_outcomes = fetch_and_accept_all(&mut b, &mut relay, now)?;
+        drive_pending(&mut b, &mut relay, now)?;
+        // A accepts B's counter-receipt(s); A drains.
+        fetch_and_accept_all(&mut a, &mut relay, now)?;
+        drive_pending(&mut a, &mut relay, now)?;
+
+        assert_ne!(
+            active_mode(&a)?,
+            SessionMode::ReceiptLocked,
+            "A locked in {round}"
+        );
+        assert_ne!(
+            active_mode(&b)?,
+            SessionMode::ReceiptLocked,
+            "B locked in {round}"
+        );
+        assert!(
+            outstanding(&a)? < 32,
+            "A's outstanding hit the lock in {round}"
+        );
+        assert!(
+            outstanding(&b)? < 32,
+            "B's outstanding hit the lock in {round}"
+        );
+        let hcr = a
+            .state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq;
+        assert!(hcr > last_hcr, "no water progress in round {round}");
+        last_hcr = hcr;
+        if outstanding(&a)? >= 24 {
+            a_was_congested = true;
+        }
+        if a_was_congested && outstanding(&a)? < 24 {
+            a_drained_after_congestion = true;
+        }
+    }
+    assert!(
+        a_was_congested,
+        "A's receipt sends never congested (the lockstep setup drifted)"
+    );
+    assert!(
+        a_drained_after_congestion,
+        "A never drained back below the threshold: the peer signal never armed B"
+    );
+    let a_peer_hw = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .peer_contiguous_high_water;
+    assert!(
+        a_peer_hw > 0,
+        "B never counter-receipted on A's congestion signal"
+    );
+    Ok(())
+}
+
+/// The action of the newest pending receipt-kind send (by sequence).
+fn newest_receipt_action(
+    client: &PersistentClient<TestProtector>,
+) -> std::result::Result<super::DurableAction<crate::capability::SendRequest>, Box<dyn Error>> {
+    let receipts = pending_receipts(client);
+    let newest = receipts.last().ok_or("no pending receipt")?;
+    client
+        .pending_send_actions()?
+        .into_iter()
+        .find(|action| action.request.message_id == newest.message_id)
+        .ok_or("no receipt action".into())
+}
+
+/// Phase 1 of the both-stuck corner: 24 interleaved rounds of B staging
+/// one application body and A accepting+consuming it, so A's 24 wire
+/// receipts are staged BEFORE A congests (each carries a signal below
+/// the threshold). The receipts are enqueued but never confirmed: A's
+/// delivered marker stays 0 and B never fetches, so no signal crosses.
+fn interleaved_flood_24(
+    a: &mut PersistentClient<TestProtector>,
+    b: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+) -> std::result::Result<(), Box<dyn Error>> {
+    for index in 0..24_u32 {
+        let action = stage_app(b, &format!("flood-{index}"), NOW, NOW + 3_600, NOW)?;
+        relay.enqueue(&action.request, NOW)?;
+        b.record_send_result(&action, SendOutcome::Stored)?;
+        let outcomes = fetch_and_accept_all(a, relay, NOW)?;
+        for outcome in outcomes {
+            if let AcceptOutcome::Application(message_id) = outcome {
+                a.consume_inbound(message_id, NOW + 300, NOW)?;
+            }
+        }
+        relay.enqueue(&newest_receipt_action(a)?.request, NOW)?;
+    }
+    Ok(())
+}
+
+/// Both-stuck corner (P1, local-arm backstop): A is driven to
+/// `ReceiptLocked` through real mutators while B never accepts A's
+/// receipts, so the wire carries NO congestion signal (proved by
+/// decrypting the newest wire receipt). B's next accept at its own
+/// 24-outstanding fires the LOCAL arm alone; B's counter-receipt
+/// recovers A below the lock, and the exchange resumes both ways.
+#[test]
+fn both_stuck_corner_recovers_via_local_arm() -> std::result::Result<(), Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    interleaved_flood_24(&mut a, &mut b, &mut relay)?;
+    assert_eq!(outstanding(&b)?, 24);
+
+    // Churn A's counter to the lock through real mutators: report
+    // DeliveryUnknown on the newest pending receipt, consume the record,
+    // and the owed rule re-stages it (+1 advance per cycle) until 32.
+    // The churn receipts are never enqueued — nothing new reaches the
+    // wire, and the wire receipts still carry their pre-congestion
+    // signals.
+    for _ in 0..8 {
+        let action = newest_receipt_action(&a)?;
+        a.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
+        a.consume_delivery_unknown(action.request.message_id, NOW)?;
+    }
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_assigned_send_seq, 32);
+        assert_eq!(active.mode, SessionMode::ReceiptLocked);
+        assert_eq!(active.last_delivered_receipt_high_water, 0);
+    }
+
+    // The wire carries NO signal: the newest live receipt was staged at
+    // outstanding 23. Prove it by decrypting the envelope with a clone
+    // of B's session (the real ratchet is untouched).
+    let fetch = b.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    assert_eq!(envelopes.len(), 24, "unexpected wire traffic");
+    {
+        let envelope = envelopes.last().ok_or("no wire receipt")?;
+        let olm_message: vodozemac::olm::OlmMessage =
+            serde_json::from_slice(envelope.packet.as_bytes())?;
+        let mut clone = vodozemac::olm::Session::from_pickle(
+            b.session.as_ref().ok_or("no b session")?.pickle(),
+        );
+        // Walk the clone's ratchet across the whole wire batch so the
+        // last envelope decrypts in chain order.
+        for skipped in envelopes.iter().take(envelopes.len() - 1) {
+            let message: vodozemac::olm::OlmMessage =
+                serde_json::from_slice(skipped.packet.as_bytes())?;
+            let _ = clone.decrypt(&message).map_err(|_| "clone walk failed")?;
+        }
+        let plaintext = clone
+            .decrypt(&olm_message)
+            .map_err(|_| "clone decrypt failed")?;
+        let parsed = payload::decode(&plaintext)?;
+        assert!(
+            parsed.issuer_outstanding < 24,
+            "the wire carried a congestion signal: {}",
+            parsed.issuer_outstanding
+        );
+    }
+
+    // B accepts the whole stale batch in order at its own 24
+    // outstanding: the FIRST accept fires the LOCAL arm (alone — the
+    // wire has no signal) and the armed debt stages exactly one
+    // counter-receipt at the next accept's tail.
+    for envelope in &envelopes {
+        let outcome = b.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            NOW,
+        )?;
+        assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
+    }
+    assert!(outstanding(&b)? < 24, "the stale receipts did not drain B");
+    let b_receipts = pending_receipts(&b);
+    assert_eq!(
+        b_receipts.len(),
+        1,
+        "the local arm did not stage B's counter-receipt"
+    );
+
+    // A applies B's counter-receipt: §4 recovery below the lock, and A
+    // resumes receipting in the same pass (its debt and water are both
+    // ahead of the delivered marker).
+    drive_pending(&mut b, &mut relay, NOW)?;
+    let outcomes = fetch_and_accept_all(&mut a, &mut relay, NOW)?;
+    assert!(outcomes.contains(&AcceptOutcome::ReceiptApplied));
+    assert!(outstanding(&a)? < 32, "A did not recover below the lock");
+    assert_ne!(active_mode(&a)?, SessionMode::ReceiptLocked);
+    assert!(
+        !pending_receipts(&a).is_empty(),
+        "A did not resume receipting on recovery"
+    );
+
+    // The exchange resumes both ways: A's fresh receipts signal B, B
+    // counter-receipts again, and both sides end below the threshold.
+    drive_pending(&mut a, &mut relay, NOW)?;
+    fetch_and_accept_all(&mut b, &mut relay, NOW)?;
+    drive_pending(&mut b, &mut relay, NOW)?;
+    fetch_and_accept_all(&mut a, &mut relay, NOW)?;
+    drive_pending(&mut a, &mut relay, NOW)?;
+    assert!(
+        outstanding(&a)? < 24,
+        "A did not recover below the threshold"
+    );
+    assert!(outstanding(&b)? < 24, "B did not drain");
     Ok(())
 }

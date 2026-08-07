@@ -1,5 +1,34 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v8)
+
+Version 7 (head `2d88375a7b166197f3ac3129aa97ea11d2b313bb`) was RETURNED by
+Fable with one P1 (verdict in `reviews/REVIEW-fable-facade-d2b-v7.md`): the
+control-debt arm keys off LOCAL congestion, but in natural lockstep traffic
+the application sender is never locally congested (the receiver receipts
+promptly), so Sol's v6 deadlock survives — arming needs the PEER's
+congestion, which the wire didn't carry. The head under review fixes it
+structurally:
+
+- **`ClientPayloadV2` gains `issuer_outstanding: u64`** on both arms,
+  sampled as `last_assigned_send_seq - peer_contiguous_high_water` at
+  staging. Peer-reported, informational; lying is self-harming. The frozen
+  HighWaterReceipt is untouched.
+- **Dual arming of `control_debt_armed` (field 21):** local (v7, kept as
+  the backstop for the both-stuck corner where no signal is on the wire)
+  plus peer-signaled (any accepted payload reporting `issuer_outstanding
+  >= 24` arms the acceptor). Staging, clearing, freshness gate, one-per-pass
+  all unchanged.
+- Lockstep convergence (in the module docs and proven by Fable's own repro
+  as a 60-round test): once the receiver's receipts carry `>= 24`, the
+  sender arms and counter-receipts, the receiver drains below 24 in one
+  round trip, and low-signal payloads stop the arming. The both-stuck
+  corner recovers via the local arm (test proves the wire is signal-free).
+- Lying is bounded: over-signaling costs one idempotent receipt (in-flight
+  guard, one-per-pass); under-signaling wedges only the liar's own budget.
+
+The v2–v7 histories follow unchanged.
+
 ## Remediation history (v7)
 
 Version 6 (head `2b8c0b758817766d04007163bfea6c36751a505f`) was RETURNED by
