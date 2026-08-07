@@ -1696,10 +1696,22 @@ fn owed_receipt_stages_after_capacity_returns_and_unlocks_peer()
     );
     assert_eq!(delivered_marker(&a)?, 0, "the marker moved at staging");
 
-    // Drive the receipt through the relay: the Stored result finally
-    // advances the marker, and the peer accepts the receipt IN ORDER —
-    // its high water advances, recovering its budget, with no
-    // counter-receipt staged (quiescence).
+    drive_receipt_to_b_and_assert_unlock(&mut a, &mut b, &mut relay, &trigger, past_window)?;
+    Ok(())
+}
+
+/// Drive A's staged receipt (everything pending that is not `trigger`)
+/// to B through the real relay — the Stored result advancing A's
+/// delivered marker to 24 — and prove B applies it IN ORDER: budget
+/// recovered, the armed control debt discharging exactly one
+/// counter-receipt (the v6 drain path), application traffic unlocked.
+fn drive_receipt_to_b_and_assert_unlock(
+    a: &mut PersistentClient<TestProtector>,
+    b: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    trigger: &super::DurableAction<crate::capability::SendRequest>,
+    past_window: u64,
+) -> std::result::Result<(), Box<dyn Error>> {
     let receipt_action = a
         .pending_send_actions()?
         .into_iter()
@@ -1708,7 +1720,7 @@ fn owed_receipt_stages_after_capacity_returns_and_unlocks_peer()
     relay.enqueue(&receipt_action.request, past_window)?;
     a.record_send_result(&receipt_action, SendOutcome::Stored)?;
     assert_eq!(
-        delivered_marker(&a)?,
+        delivered_marker(a)?,
         24,
         "the marker did not advance on the Stored result"
     );
@@ -1740,14 +1752,29 @@ fn owed_receipt_stages_after_capacity_returns_and_unlocks_peer()
         let active = b.state.active_session.as_ref().ok_or("no session")?;
         assert_eq!(active.peer_contiguous_high_water, 24);
         assert_eq!(active.highest_contiguous_received_seq, 33);
-        // B consumed nothing, so B has no receipt debt (v5 model) and
-        // the delivered marker never moved.
+        // B consumed nothing, so B has no APPLICATION debt (v5 model)
+        // and the delivered marker never moved.
         assert_eq!(active.receipt_debt_up_to, 0);
         assert_eq!(active.last_delivered_receipt_high_water, 0);
     }
-    assert!(
-        b.pending_send_actions()?.is_empty(),
-        "an in-order receipt staged a counter-receipt"
+    // Not a v5 violation: B armed its control debt back at the ping
+    // accept (its outstanding was 24), and this receipt's fresh water
+    // lets B discharge it — exactly one counter-receipt reporting HCR
+    // 33, the v6 drain path. Staging cleared the flag; the accept's
+    // ENTRY congestion sample (24) armed it again in the same pass, so
+    // it reads 1 — bounded by the in-flight rule, which blocks any
+    // second counter-receipt until the water next advances.
+    let b_receipts = pending_receipts(b);
+    assert_eq!(b_receipts.len(), 1, "the armed control debt did not stage");
+    assert_eq!(b_receipts[0].high_water, Some(33));
+    assert_eq!(
+        b.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .control_debt_armed,
+        1,
+        "entry congestion should re-arm after the discharge"
     );
     // The unlock proof: B can stage application traffic again.
     b.stage_send("unlocked", past_window, past_window + 3_600, past_window)?;
@@ -2511,5 +2538,354 @@ fn gap_filling_receipt_stages_consumed_debt_in_same_pass() -> std::result::Resul
         pending_receipts(&a).is_empty(),
         "a receipt-only accept staged a receipt"
     );
+    Ok(())
+}
+
+// --- D2b v6 remediation tests (threshold-armed control debt) ------------------
+
+/// Outstanding = `last_assigned_send_seq - peer_contiguous_high_water`.
+fn outstanding(
+    client: &PersistentClient<TestProtector>,
+) -> std::result::Result<u64, Box<dyn Error>> {
+    let active = client.state.active_session.as_ref().ok_or("no session")?;
+    Ok(active.last_assigned_send_seq - active.peer_contiguous_high_water)
+}
+
+/// Drive every pending send action through the relay in send-sequence
+/// order, recording `Stored` for each; returns how many were driven.
+fn drive_pending(
+    client: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    now: u64,
+) -> std::result::Result<usize, Box<dyn Error>> {
+    let mut actions = client.pending_send_actions()?;
+    actions.sort_by_key(|action| {
+        client
+            .state
+            .sends
+            .iter()
+            .find(|record| record.message_id == action.request.message_id)
+            .map_or(u64::MAX, |record| record.sequence)
+    });
+    let count = actions.len();
+    for action in &actions {
+        relay.enqueue(&action.request, now)?;
+        client.record_send_result(action, SendOutcome::Stored)?;
+    }
+    Ok(count)
+}
+
+/// Fetch and accept every waiting envelope in relay order. The relay
+/// holds envelopes until expiry, so already-accepted backlog comes back
+/// as duplicates and is skipped; every other error propagates.
+fn fetch_and_accept_all(
+    client: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    now: u64,
+) -> std::result::Result<Vec<AcceptOutcome>, Box<dyn Error>> {
+    let fetch = client.fetch_request(now + 60, now)?;
+    let envelopes = relay.fetch(&fetch.request, now)?;
+    let mut outcomes = Vec::new();
+    for envelope in &envelopes {
+        match client.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            now,
+        ) {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(LabError::DuplicateMessage) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(outcomes)
+}
+
+/// One round of the one-directional flood: B stages applications until
+/// its budget refuses more (driving each, including any armed
+/// receipt-flush), then A accepts and consumes everything, and the
+/// receipt exchanges both ways are driven. Returns the number of
+/// receipts each side drove this round `(a_drove, b_drove)`.
+fn flood_round(
+    a: &mut PersistentClient<TestProtector>,
+    b: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    now: u64,
+    round: u64,
+) -> std::result::Result<(usize, usize), Box<dyn Error>> {
+    // B floods applications until its budget refuses more. After EVERY
+    // stage_send, drive everything pending in send-sequence order: an
+    // armed control receipt may have staged inside the operation AHEAD
+    // of the application body, and the peer must see envelopes in
+    // sequence order (a skipped sequence gaps the receiver's water).
+    let mut staged_this_round = 0_u32;
+    for index in 0..40_u32 {
+        let body = format!("r{round}-m{index}");
+        match b.stage_send(&body, now, now + 3_600, now) {
+            Ok(super::StageSendOutcome::Staged(_)) => {
+                drive_pending(b, relay, now)?;
+                staged_this_round += 1;
+            }
+            Ok(super::StageSendOutcome::ReceiptFlushedRetry) => {
+                drive_pending(b, relay, now)?;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        staged_this_round > 0,
+        "B made no application progress in round {round}"
+    );
+    // A accepts and consumes one envelope at a time, so each consume
+    // can stage for the freshest water.
+    let outcomes = fetch_and_accept_all(a, relay, now)?;
+    for outcome in outcomes {
+        if let AcceptOutcome::Application(message_id) = outcome {
+            a.consume_inbound(message_id, now + 300, now)?;
+        }
+    }
+    let a_drove = drive_pending(a, relay, now)?;
+    fetch_and_accept_all(b, relay, now)?;
+    let b_drove = drive_pending(b, relay, now)?;
+    fetch_and_accept_all(a, relay, now)?;
+    drive_pending(a, relay, now)?;
+    Ok((a_drove, b_drove))
+}
+
+/// Sol's one-directional reproduction (P1): B floods A with
+/// application traffic across 15-day clock jumps. The v6 head wedged A
+/// permanently at `ReceiptLocked`; with threshold-armed control debt
+/// neither side ever locks, A keeps staging receipts, B keeps
+/// draining, and B's armed counter-receipts give A's own sends their
+/// drain path (B has zero application debt throughout).
+#[test]
+fn one_directional_traffic_never_deadlocks_budget() -> std::result::Result<(), Box<dyn Error>> {
+    const ROUND_SECONDS: u64 = 15 * 24 * 60 * 60;
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    let mut last_hcr = 0_u64;
+    let mut b_counter_receipted = false;
+    for round in 0..8_u64 {
+        // Round 0 runs at NOW: A's inbound session is established from
+        // B's first envelope and the prekey bundle (valid_until NOW+300)
+        // must still be live. Later rounds jump 15 days for pruning.
+        let now = NOW + round * ROUND_SECONDS;
+        let (a_drove, _b_drove) = flood_round(&mut a, &mut b, &mut relay, now, round)
+            .map_err(|error| format!("round {round}: {error:?}"))?;
+        assert_ne!(
+            active_mode(&a)?,
+            SessionMode::ReceiptLocked,
+            "A locked in {round}"
+        );
+        assert_ne!(
+            active_mode(&b)?,
+            SessionMode::ReceiptLocked,
+            "B locked in {round}"
+        );
+        assert!(
+            outstanding(&a)? < 32,
+            "A's outstanding hit the lock in {round}"
+        );
+        assert!(
+            outstanding(&b)? < 32,
+            "B's outstanding hit the lock in {round}"
+        );
+        let hcr = a
+            .state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq;
+        assert!(hcr > last_hcr, "no water progress in round {round}");
+        last_hcr = hcr;
+        // A is the receiver: it consumes and keeps staging receipts.
+        assert!(a_drove > 0, "A staged no receipt in round {round}");
+        // The control-arm proof: B NEVER consumes (application debt 0),
+        // so any receipt-kind record in B's outbox can only come from
+        // the armed control debt — and A's peer high water advancing is
+        // the end-to-end proof that B's counter-receipts drain A.
+        assert_eq!(
+            b.state
+                .active_session
+                .as_ref()
+                .ok_or("no session")?
+                .receipt_debt_up_to,
+            0,
+            "B acquired application debt"
+        );
+        if b.state
+            .sends
+            .iter()
+            .any(|record| record.kind == crate::state::SendKind::Receipt)
+        {
+            b_counter_receipted = true;
+        }
+    }
+    assert!(
+        b_counter_receipted,
+        "B never counter-receipted: the armed control debt never fired"
+    );
+    let a_peer_hw = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .peer_contiguous_high_water;
+    assert!(
+        a_peer_hw > 0,
+        "A's own sends were never acknowledged: no drain path back"
+    );
+    Ok(())
+}
+
+/// Convergence (P1 quiescence arm): after congested rounds, stop all
+/// application traffic and let the receipt exchange run — both sides
+/// drain below the `ControlOnly` threshold, arming stops, and NO
+/// further receipts stage (no counter-receipt storm: record counts
+/// stabilize).
+#[test]
+fn control_debt_converges_without_counter_receipt_storm() -> std::result::Result<(), Box<dyn Error>>
+{
+    const ROUND_SECONDS: u64 = 15 * 24 * 60 * 60;
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    // Congest: four flooded rounds (round 0 at NOW so A's inbound
+    // session establishes inside the prekey bundle's validity).
+    for round in 0..4_u64 {
+        let now = NOW + round * ROUND_SECONDS;
+        flood_round(&mut a, &mut b, &mut relay, now, round)?;
+    }
+
+    // Quiesce: no new application bodies, only the receipt exchange.
+    let mut drained_below_threshold = false;
+    for round in 4..7_u64 {
+        let now = NOW + round * ROUND_SECONDS;
+        // Only fetches and drives — no stage_send attempts at all.
+        let outcomes = fetch_and_accept_all(&mut a, &mut relay, now)?;
+        for outcome in outcomes {
+            if let AcceptOutcome::Application(message_id) = outcome {
+                a.consume_inbound(message_id, now + 300, now)?;
+            }
+        }
+        let a_drove = drive_pending(&mut a, &mut relay, now)?;
+        fetch_and_accept_all(&mut b, &mut relay, now)?;
+        let b_drove = drive_pending(&mut b, &mut relay, now)?;
+        fetch_and_accept_all(&mut a, &mut relay, now)?;
+        drive_pending(&mut a, &mut relay, now)?;
+        if outstanding(&a)? < 24 && outstanding(&b)? < 24 {
+            drained_below_threshold = true;
+            assert_eq!(
+                a_drove + b_drove,
+                0,
+                "a receipt staged while both sides were uncongested"
+            );
+        }
+    }
+    assert!(
+        drained_below_threshold,
+        "the exchange never drained below the threshold"
+    );
+    // Record counts stabilize once the water is reported: one more
+    // quiet round changes nothing on either side.
+    let now = NOW + 8 * ROUND_SECONDS;
+    let (a_sends, b_sends, a_dedup, b_dedup) = (
+        a.state.sends.len(),
+        b.state.sends.len(),
+        a.state.dedup.len(),
+        b.state.dedup.len(),
+    );
+    fetch_and_accept_all(&mut a, &mut relay, now)?;
+    drive_pending(&mut a, &mut relay, now)?;
+    fetch_and_accept_all(&mut b, &mut relay, now)?;
+    drive_pending(&mut b, &mut relay, now)?;
+    assert_eq!(a.state.sends.len(), a_sends, "A kept staging");
+    assert_eq!(b.state.sends.len(), b_sends, "B kept staging");
+    assert_eq!(a.state.dedup.len(), a_dedup);
+    assert_eq!(b.state.dedup.len(), b_dedup);
+    Ok(())
+}
+
+/// `ReceiptLocked` recovery (P1): with zero application debt, A's
+/// congested accept arms the control debt; at the lock, a genuine peer
+/// receipt lowers outstanding, the mode recomputes, and the ARMED debt
+/// stages in the same pass — the flag clearing behind it.
+#[test]
+fn receipt_locked_recovers_and_armed_control_debt_stages() -> std::result::Result<(), Box<dyn Error>>
+{
+    let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
+
+    // A accepts m1 (uncongested — no arming), then m2 with its send
+    // counter fabricated to 24 outstanding: the congested accept arms
+    // the control debt with ZERO application debt (nothing consumed).
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 24;
+        // Keep the stored mode consistent with the fabricated water:
+        // `stage()` re-validates the current state before every mutator.
+        active.mode = SessionMode::ControlOnly;
+    }
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(
+            active.control_debt_armed, 1,
+            "the congested accept did not arm"
+        );
+        assert_eq!(active.receipt_debt_up_to, 0);
+    }
+    // Drive the session to the lock; §4 gates all staging there.
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 32;
+        active.mode = SessionMode::ReceiptLocked;
+    }
+
+    // A genuine peer receipt covering all 32 sends arrives IN ORDER
+    // (B.seq 3): it applies, the mode recomputes to Ready, and the
+    // armed control debt stages in the same pass.
+    let (message_id, packet, signature, expires_at) =
+        forge_receipt_envelope(&mut b, &a, 32, 3, NOW)?;
+    let queue_id = a.state.mailbox_queue_id;
+    let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
+    assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
+    assert_eq!(active_mode(&a)?, SessionMode::Ready);
+    let receipts = pending_receipts(&a);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the armed control debt did not stage on recovery"
+    );
+    assert_eq!(receipts[0].high_water, Some(3));
+    assert_eq!(receipts[0].sequence, 33);
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_delivered_receipt_high_water, 0);
+        // Staging cleared the flag; the accept's ENTRY congestion sample
+        // (32) armed it again in the same pass. The in-flight rule bounds
+        // it: nothing further stages until the water next advances.
+        assert_eq!(
+            active.control_debt_armed, 1,
+            "entry congestion should re-arm after the discharge"
+        );
+    }
     Ok(())
 }

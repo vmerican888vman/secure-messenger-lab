@@ -404,7 +404,20 @@ impl HighWaterReceipt {
 /// Validation: 0 (nothing consumed), or a value covered by the
 /// contiguous received high water or present in the out-of-order
 /// received set — nothing can have been consumed before it was
-/// received. The object declares 20 fields.
+/// received.
+///
+/// **Wire-layout amendment (review D2b v6):** field 21,
+/// `control_debt_armed: u8` (a flag: validation accepts only 0 or 1).
+/// Arms at the end of any successful `accept_envelope` (any payload
+/// kind) whose acceptor is congested — outstanding
+/// (`last_assigned_send_seq - peer_contiguous_high_water`) at or above
+/// the `ControlOnly` threshold (24). While armed AND the contiguous
+/// received high water exceeds the delivered marker, the owed rule
+/// stages a receipt even with no application debt: receipts consume the
+/// shared send counter, so one-directional traffic otherwise gives the
+/// receiver's own sends no drain path (the v6 deadlock). Staging clears
+/// the flag. Validation: values above 1 reject. The object declares 21
+/// fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -431,6 +444,9 @@ pub(crate) struct ActiveSession {
     /// Highest consumed application sender sequence; 0 = nothing
     /// consumed (field 20). Never exceeds the received water coverage.
     pub(crate) receipt_debt_up_to: u64,
+    /// Armed control-debt flag; 0 or 1 (field 21). Arms at a congested
+    /// acceptor's accept end; cleared when a receipt stages.
+    pub(crate) control_debt_armed: u8,
 }
 
 impl ActiveSession {
@@ -463,6 +479,7 @@ impl ActiveSession {
         let conversation_id = conversation_id(object.field(18)?)?;
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         let receipt_debt_up_to = u64_value(object.field(20)?)?;
+        let control_debt_armed = u8_value(object.field(21)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -481,6 +498,7 @@ impl ActiveSession {
             conversation_id,
             last_delivered_receipt_high_water,
             receipt_debt_up_to,
+            control_debt_armed,
         })
     }
 
@@ -503,6 +521,7 @@ impl ActiveSession {
         let last_delivered_receipt_high_water =
             self.last_delivered_receipt_high_water.to_be_bytes();
         let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
+        let control_debt_armed = [self.control_debt_armed];
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -526,6 +545,7 @@ impl ActiveSession {
                 (18, self.conversation_id.as_bytes()),
                 (19, &last_delivered_receipt_high_water),
                 (20, &receipt_debt_up_to),
+                (21, &control_debt_armed),
             ],
         )?;
         Ok(Zeroizing::new(object))

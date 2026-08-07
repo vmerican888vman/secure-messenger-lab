@@ -653,6 +653,11 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     {
         return Err(LabError::Storage);
     }
+    // Review D2b v6 (field 21): the control-debt flag is a bit, nothing
+    // wider.
+    if active.control_debt_armed > 1 {
+        return Err(LabError::Storage);
+    }
     Ok(())
 }
 

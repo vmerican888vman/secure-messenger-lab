@@ -313,6 +313,7 @@ fn make_active_session(
         conversation_id,
         last_delivered_receipt_high_water: 1,
         receipt_debt_up_to: 0,
+        control_debt_armed: 0,
     })
 }
 
@@ -1202,9 +1203,10 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
     // public key, an enum or the received set; flipping it must fail. The
     // ACK array ends in the ACK state byte (Pending = 1, flipping bit 0
     // makes the invalid 0). For the session (index 14) the flip targets
-    // the high byte of field 19 (`last_delivered_receipt_high_water`), eight
-    // bytes in from the end — the value becomes enormous and exceeds the
-    // received high water.
+    // the high byte of field 19 (`last_delivered_receipt_high_water`):
+    // fields 20 (6+8 bytes) and 21 (6+1 bytes) follow it in the object,
+    // so its value's high byte sits 29 bytes in from the end — the flip
+    // makes the marker enormous and it exceeds the received high water.
     for index in [11_usize, 12, 13, 17] {
         let (_, end) = field_value_span(&encoded, index)?;
         let mut mutated = encoded.to_vec();
@@ -1216,7 +1218,7 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
     }
     let (_, end) = field_value_span(&encoded, 14)?;
     let mut mutated = encoded.to_vec();
-    *mutated.get_mut(end - 8).ok_or("field 19 high byte")? ^= 0x01;
+    *mutated.get_mut(end - 29).ok_or("field 19 high byte")? ^= 0x01;
     assert!(
         ClientStateV1::decode(&mutated).is_err(),
         "field-19 high-byte flip accepted"
@@ -2957,6 +2959,48 @@ fn receipt_debt_never_exceeds_received_coverage() -> Result<(), Box<dyn Error>> 
         .as_mut()
         .ok_or("no session")?
         .receipt_debt_up_to = 3;
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+    Ok(())
+}
+
+// --- review D2b v6: field 21 (control-debt flag) -----------------------------
+
+/// Field 21 (`control_debt_armed`) is a bit: 0 and 1 validate and
+/// round-trip; anything wider rejects on both paths.
+#[test]
+fn control_debt_armed_is_a_flag() -> Result<(), Box<dyn Error>> {
+    // Encode path: 0 and 1 accept, 2 rejects.
+    for (armed, valid) in [(0_u8, true), (1, true), (2, false), (u8::MAX, false)] {
+        let mut fixture = populated_fixture()?;
+        fixture
+            .state
+            .active_session
+            .as_mut()
+            .ok_or("no session")?
+            .control_debt_armed = armed;
+        assert_eq!(fixture.state.encode().is_ok(), valid, "armed {armed}");
+    }
+
+    // Decode path: splice a session object whose field 21 is 2 into the
+    // genuine encoding.
+    let mut fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.control_debt_armed = 2;
+    let session_bytes = active.encode()?;
+    let bytes = splice_top(&encoded, 14, field_block(15, &session_bytes)?)?;
+    assert!(ClientStateV1::decode(&bytes).is_err());
+
+    // The armed flag round-trips byte-identically.
+    let mut fixture = populated_fixture()?;
+    fixture
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no session")?
+        .control_debt_armed = 1;
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
     assert_eq!(&encoded[..], &decoded.encode()?[..]);

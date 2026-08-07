@@ -1,5 +1,36 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v7)
+
+Version 6 (head `2b8c0b758817766d04007163bfea6c36751a505f`) was RETURNED by
+Sol with one P1 (verdict in `reviews/REVIEW-sol-facade-d2b-v6.md`): the v6
+debt model made ReceiptLocked permanently unrecoverable under
+one-directional traffic — receipt sends consume the budget but were never
+acknowledged, so the receiving side wedged at 32 and its peer with it,
+reproduced over a real relay. The head under review adds a bounded drain:
+
+- **Threshold-armed control debt** (codec field 21 `control_debt_armed`):
+  any successful accept (application or receipt) while the acceptor's
+  outstanding is ≥ 24 — sampled at accept ENTRY or end — arms the flag.
+  The owed rule gains a second arm: armed ∧ `HCR > marker` ∧ mode allows
+  control ∧ capacity ∧ no in-flight coverage ⇒ stage one receipt and clear
+  the flag. Uncongested sessions (outstanding < 24) behave exactly like v6
+  (receipts never create debt). Ping-pong is impossible by construction
+  (receipts with no new information cannot stage; one congested exchange
+  round drains both sides below threshold and arming stops). Sol's
+  reproduction now runs many rounds with progress each round and neither
+  side ever locks.
+- The entry-congestion sample is a documented, empirically forced
+  deviation: post-drain-only sampling is vacuous (an ideal peer always ends
+  accepts at 0 outstanding and never counter-receipts — the deadlock
+  stands).
+- §4 recovery is preserved: ReceiptLocked recovers through a valid receipt,
+  and armed control debt stages once the mode recomputes.
+- The stale accept-order comment is fixed (signature runs BEFORE dedup, as
+  both reviewers noted; the stronger order).
+
+The v2–v6 histories follow unchanged.
+
 ## Remediation history (v6)
 
 Version 5 (head `e3849849b0bac34ed66d4eee2a5b6b5fd3723f3c`) was RETURNED by
