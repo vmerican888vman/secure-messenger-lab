@@ -1,11 +1,124 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
-## v13 — ONE FIX, ONE OPEN DESIGN QUESTION. DO NOT DISPATCH A REVIEW YET.
+## Remediation history (v14 — §4 control-lane split)
 
-Version 12 (head `5dbcca7`): Fable PASS, Sol RETURN with two P1s. **Only
-one of them is fixed here, deliberately.** This head is not a candidate
-for a PASS and should not be sent to reviewers until the open question
-below is decided.
+Version 13 (head `e2f7ffa`) carried a deliberately OPEN P1: the
+peer-signaled control arm was unbounded, and three successive local
+guards had failed on it. The security architect reviewed the design brief
+(`reviews/PROMPT-design-phase2-control-lane.md`) and **authorised the
+control-lane split**, supplying replacement §4 text. This head implements
+that specification.
+
+**The root cause it removes.** `outstanding` counted ALL sends against
+one peer high water, so every control receipt spent application budget
+and any peer-driven receipt was an amplification lever. Bounding it
+locally was impossible: gating on peer acknowledgement deadlocked an
+honest peer (v12), gating on our own congestion was bypassed because the
+ungated local arm took over above the threshold, and bounding concurrency
+alone was defeated by completing the delivery cycle (v11).
+
+### What changed
+
+- **Application accounting is a durable ledger, not a counter.**
+  `ActiveSession` field 22, `unreceipted_application_send_seqs`, holds
+  the shared sequence numbers of application payloads the peer's high
+  water does not yet cover; `application_outstanding` is its length,
+  bounded at 24. A scalar sent/acknowledged pair cannot replace it — the
+  frozen shared high water does not say how many mixed-kind sends it
+  covered once records are pruned. The sequence space is NOT split: every
+  Olm encryption still draws one `send_seq` from the single stream and
+  `HighWaterReceiptV1` is untouched.
+- **Ledger maintenance.** Appended only when an application send is
+  assigned, atomically with the ratchet advance and record. Pruned only
+  by an advancing receipt, before any new capacity is exposed. Send
+  results, expiry, `DeliveryUnknown` consumption and record pruning never
+  return application budget.
+- **`ReceiptLocked` is retired** (discriminant 3 left as a numbering gap
+  so no persisted value silently changes meaning). Modes are `Ready`
+  below 24, `ControlOnly` at exactly 24, more is malformed;
+  `RekeyRequired` remains orthogonal and dominant, accepted across 0..=24.
+- **Control is bounded independently:** at most one UNRESOLVED receipt
+  (`Pending` or `DeliveryUnknown`), at most 8 durable receipt records
+  with terminal-only recycling oldest `(expires_at, message_id)` first,
+  and at most one new receipt per second via durable field 23,
+  `control_send_not_before`. Debt is gated, never discarded. Storage
+  quotas are independent: 32 application + 8 control = 40.
+- **`ControlOnly` no longer gates control.** Only `RekeyRequired` blocks
+  new control encryption.
+- **`issuer_outstanding` now means application outstanding** — an
+  application payload carries the post-advance value, a receipt carries
+  the unchanged current value.
+- **`flush_control(now)` added.** §4's liveness answer for deferred debt
+  is "a local wake at the cooldown boundary", but no mutator existed to
+  BE that wake, so deferred debt could only escape as a side effect of an
+  unrelated call. That is the hidden coupling that produced this leg's
+  liveness defects, and it would leave a quiescent receiver unable to
+  answer a congested peer. It is idempotent and timer-safe.
+
+### Acceptance criteria (as specified)
+
+- `over_signaling_cannot_lock_the_victim` — 32 full delivery cycles,
+  each its own second. The victim never leaves `Ready`, its application
+  ledger stays empty, every victim receipt truthfully reports
+  `issuer_outstanding == 0` (read off the wire by decrypting with a peer
+  session clone), control records stay within quota, and afterwards the
+  victim can still send with its payload reporting 1. The old "exactly
+  one lifetime receipt" assertion is deliberately gone — it encoded the
+  reverted reciprocity gate. Answering every cycle is now correct,
+  because the answers are free.
+- `delayed_signal_then_quiescence_does_not_deadlock_an_honest_peer` —
+  the architect's exact v12 reproduction: delayed sequence 24, B recovers
+  first, A answers, B accepts while uncongested and emits no
+  counter-receipt, B later re-congests, and A must answer again despite
+  never being acknowledged. Any future attempt to bound the arm by
+  conditioning on peer acknowledgement fails here.
+
+### Suite migration — please scrutinise this
+
+66 existing tests asserted the OLD contract and were re-derived. The
+changes are individually reasoned, but the volume is itself a review
+risk, so the classes are stated plainly:
+
+1. **Coalescing.** Receipts are water-coalesced and rate-bounded, so
+   "one receipt per consume" became one receipt plus durable debt.
+   **Wherever a receipt-count assertion was removed, an explicit
+   `receipt_debt_up_to` assertion was added in its place**, so a
+   coalescing bug that DROPS debt fails loudly rather than passing as
+   "fewer receipts, fine". Check that substitution specifically.
+2. **Clock advances.** Tests staging several receipts now space them a
+   second apart. The property is unchanged; only the timing is.
+3. **Lane separation.** Several tests asserted a full application outbox
+   starves control, or that a receipt's advance crosses the application
+   threshold. Both are now false by design; those tests assert the
+   separation instead and are strictly stronger.
+4. **`MAX_SENDS` went 32 → 40**, so any assertion on a 32-record outbox
+   cap is now asserting the wrong bound. Two were caught this way; a
+   reviewer should look for more.
+5. Tests whose entire premise was the retired `ReceiptLocked` mode were
+   rewritten to the reachable `ControlOnly` state or, where the scenario
+   is now unreachable, replaced by one asserting the new guarantee
+   (`control_churn_is_budget_neutral_and_the_local_arm_survives`).
+
+### Open items a reviewer should rule on
+
+- **Nothing bounds the shared sequence distance any more.** It is no
+  longer a budget, per the authorised §4 text, and both lanes are
+  independently bounded — but the old `outstanding > 32` malformed-state
+  check is gone, so a hostile persisted state may carry an arbitrarily
+  large `last_assigned_send_seq`. Deliberate, flagged rather than
+  papered over.
+- **`SCHEMA_VERSION` is still 1** across a third layout change (21 → 23
+  fields). Old stores fail closed on the exact-field-count check rather
+  than misparsing, so it is safe, but it is now a recurring theme.
+
+The v2–v13 histories follow unchanged.
+
+## Remediation history (v13) — the open question above is now CLOSED by v14
+
+Version 12 (head `5dbcca7`): Fable PASS, Sol RETURN with two P1s. Only
+one was fixed at v13, deliberately; the other was escalated as a design
+question and is resolved by the v14 control-lane split above. This
+section is retained as history.
 
 ### Fixed: dedup capacity backpressure and reclamation (Sol's v12 P1-2)
 

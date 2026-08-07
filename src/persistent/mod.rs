@@ -281,9 +281,10 @@ use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
 use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
     AckIntent, AckState, ActiveSession, ClientStateV1, DedupRecord, DedupState, HighWaterReceipt,
-    InboundRecord, MAX_ACKS, MAX_BODY, MAX_DEDUP, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET,
-    MAX_SENDS, PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendKind,
-    SendRecord, SendState, SessionMode,
+    InboundRecord, MAX_ACKS, MAX_APPLICATION_OUTSTANDING, MAX_APPLICATION_SENDS, MAX_BODY,
+    MAX_CONTROL_SENDS, MAX_DEDUP, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, PeerBinding,
+    PeerBundle, PendingPreKey, RegistrationRecord, Role, SendKind, SendRecord, SendState,
+    SessionMode,
 };
 use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
@@ -312,8 +313,6 @@ const TOMBSTONE_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const REQUEST_WINDOW_SECONDS: u64 = 5 * 60;
 /// Section 4 budget: 24 application advances, then `ControlOnly`.
 const CONTROL_ONLY_THRESHOLD: u64 = 24;
-/// Section 4 absolute maximum outstanding; `ReceiptLocked` at 32.
-const MAX_OUTSTANDING: u64 = 32;
 
 /// Canonical length-prefixed signing bytes for a send request; identical
 /// construction to `send_signing_bytes` in `src/capability.rs`.
@@ -893,6 +892,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     last_delivered_receipt_high_water: 0,
                     receipt_debt_up_to: 0,
                     control_debt_up_to: 0,
+                    unreceipted_application_send_seqs: Vec::new(),
+                    control_send_not_before: 0,
                     conversation_id: candidate.state.conversation_id,
                 });
                 candidate.session = Some(session);
@@ -1265,6 +1266,52 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// receipt is never lost. The receipt rides the unchanged D2a send
     /// machinery as a `Pending` send record whose payload is a `Receipt`
     /// kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown or already
+    /// Drive deferred control and receipt debt (§4 control-lane split).
+    ///
+    /// Coalescing plus the one-per-second cooldown means an owed receipt
+    /// is often DEFERRED rather than staged in the pass that created the
+    /// debt. §4's liveness story for that is a local wake at the
+    /// cooldown boundary or when an unresolved send resolves, so the
+    /// caller needs a mutator whose only job is to sweep and flush.
+    /// Without one, deferred debt escapes only as a side effect of an
+    /// unrelated call such as `stage_send` — precisely the hidden
+    /// coupling that produced this leg's liveness defects, and it would
+    /// leave a quiescent receiver unable to ever answer a congested
+    /// peer.
+    ///
+    /// Returns whether a receipt staged. Idempotent and safe to call on
+    /// a timer: with nothing owed, nothing eligible, or the cooldown
+    /// still closed it stages nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a coarse storage error while the façade is not `Ready`,
+    /// or on commit failure.
+    pub fn flush_control(&mut self, now: u64) -> Result<bool> {
+        self.ensure_ready()?;
+        let mut staged = false;
+        self.mutate(
+            |_current| Ok(()),
+            |candidate, _keypairs| {
+                sweep_expired_sends(candidate, now)?;
+                prune_terminal_sends(candidate, now);
+                sweep_expired_acks(candidate, now)?;
+                staged = maybe_stage_owed_receipt(candidate, now)?;
+                if let Some(active) = candidate.state.active_session.as_mut() {
+                    recompute_mode(active);
+                }
+                Ok(())
+            },
+        )?;
+        Ok(staged)
+    }
+
+    /// Consume one accepted inbound record: remove it, create the ACK
+    /// intent, and stage the coalesced receipt when the lane allows.
     ///
     /// # Errors
     ///
@@ -1936,14 +1983,23 @@ fn recompute_mode(active: &mut ActiveSession) {
     if active.mode == SessionMode::RekeyRequired {
         return;
     }
-    let outstanding = active.last_assigned_send_seq - active.peer_contiguous_high_water;
-    active.mode = if outstanding >= MAX_OUTSTANDING {
-        SessionMode::ReceiptLocked
-    } else if outstanding >= CONTROL_ONLY_THRESHOLD {
+    // §4 control-lane split: the budget mode keys off the APPLICATION
+    // lane only — the length of the unreceipted application sequence
+    // set — not the shared sequence distance. Control sends advance the
+    // shared sequence but cost no application capacity, so a peer that
+    // signals congestion can no longer consume our ability to send.
+    active.mode = if application_outstanding(active) >= MAX_APPLICATION_OUTSTANDING {
         SessionMode::ControlOnly
     } else {
         SessionMode::Ready
     };
+}
+
+/// §4 control-lane split: `application_outstanding` is exactly the count
+/// of application sequences the peer's contiguous high water does not
+/// yet cover.
+fn application_outstanding(active: &ActiveSession) -> usize {
+    active.unreceipted_application_send_seqs.len()
 }
 
 /// The step-4 body of `stage_send` (extracted to keep the public method
@@ -1978,7 +2034,13 @@ fn stage_send_operation(
         recompute_mode(active);
         active.mode
     };
-    if candidate.state.sends.len() >= MAX_SENDS || mode != SessionMode::Ready {
+    let application_records = candidate
+        .state
+        .sends
+        .iter()
+        .filter(|record| record.kind == SendKind::Application)
+        .count();
+    if application_records >= MAX_APPLICATION_SENDS || mode != SessionMode::Ready {
         // Review D2b v5 P1-3: when the application cannot be admitted
         // after owed staging (slot or mode), the staged receipt IS this
         // pass's progress — commit it (the operation returns `Ok`, so
@@ -2020,10 +2082,13 @@ fn admit_application_send(
             active.epoch_id,
             send_seq,
             candidate.state.conversation_id,
-            // The congestion signal (review D2b v7/v8): the POST-advance
-            // outstanding — this send's own sequence counted — so the
-            // 24th send reports 24 and actually signals (v8 P1-3).
-            send_seq - active.peer_contiguous_high_water,
+            // §4 control-lane split: `issuer_outstanding` now means the
+            // issuer's APPLICATION outstanding. An application payload
+            // carries the POST-application-advance value — this send's
+            // own sequence counted — so the 24th application send
+            // reports 24 and actually signals (the v8 P1-3 property,
+            // preserved under the new accounting).
+            application_outstanding(active) as u64 + 1,
         )
     };
     let message_id = MessageId::random();
@@ -2091,6 +2156,11 @@ fn admit_application_send(
             .as_mut()
             .ok_or(LabError::MissingSession)?;
         active.last_assigned_send_seq = send_seq;
+        // §4 control-lane split: an APPLICATION send appends its shared
+        // sequence to the durable ledger, atomically with the ratchet
+        // advance and the SendRecord above. This is the only site that
+        // grows `application_outstanding`.
+        active.unreceipted_application_send_seqs.push(send_seq);
         recompute_mode(active);
     }
     Ok(DurableAction {
@@ -2196,6 +2266,8 @@ fn ratchet_step(
             last_delivered_receipt_high_water: 0,
             receipt_debt_up_to: 0,
             control_debt_up_to: 0,
+            unreceipted_application_send_seqs: Vec::new(),
+            control_send_not_before: 0,
             conversation_id: candidate.state.conversation_id,
         });
         candidate.session = Some(session);
@@ -2293,8 +2365,18 @@ fn apply_receipt(
         // so no codec change is needed.)
         Ok(AcceptOutcome::ReceiptIdempotent)
     } else {
+        // §4 control-lane split: commit the new high water, prune every
+        // application sequence it covers, and recompute the mode BEFORE
+        // any new application permission is exposed. Pruning here is the
+        // ONLY site that shrinks `application_outstanding` — send
+        // results, expiry, `DeliveryUnknown` consumption and record
+        // pruning never return application budget.
         active.peer_contiguous_high_water = receipt.high_water;
+        active
+            .unreceipted_application_send_seqs
+            .retain(|sequence| *sequence > receipt.high_water);
         active.receipt = Some(receipt);
+        recompute_mode(active);
         Ok(AcceptOutcome::ReceiptApplied)
     }
 }
@@ -2790,10 +2872,12 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
             send_seq,
             peer_curve,
             candidate.state.conversation_id,
-            // The congestion signal (review D2b v7/v8): the POST-advance
-            // outstanding — this receipt's own sequence counted — so the
-            // 24th send reports 24 and actually signals (v8 P1-3).
-            send_seq - active.peer_contiguous_high_water,
+            // §4 control-lane split: `issuer_outstanding` now means the
+            // issuer's APPLICATION outstanding. A receipt payload
+            // carries the UNCHANGED current value — a control send costs
+            // no application capacity, so there is nothing to advance
+            // past.
+            application_outstanding(active) as u64,
         )
     };
     let mut receipt = HighWaterReceipt {
@@ -2865,6 +2949,10 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
         .as_mut()
         .ok_or(LabError::MissingSession)?;
     active.last_assigned_send_seq = send_seq;
+    // §4 control-lane split: arm the durable one-per-second control
+    // cooldown. This is a LOCAL refillable rate bound — never a per-epoch
+    // cap, and never conditioned on the peer acknowledging this receipt.
+    active.control_send_not_before = now.checked_add(1).ok_or(LabError::Storage)?;
     // The delivered-marker deliberately does NOT move at staging (v4):
     // it advances only when the receipt reaches a delivered terminal
     // state in record_send_result.
@@ -2903,11 +2991,32 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
 ///   standing (v9 finding 4) and a delivery at or above the water
 ///   resolves it.
 ///
-/// It stages at most one receipt per mutator pass, only when the mode
-/// allows control traffic and the send array has capacity; otherwise it
-/// stays owed and the next clock-taking mutator retries, so a skipped
-/// or lost receipt is never silently satisfied. `ReceiptLocked`/
-/// `RekeyRequired` still block staging per §4.
+/// It stages at most one receipt per mutator pass; otherwise the debt
+/// stays owed and the next clock-taking mutator retries, so a skipped or
+/// lost receipt is never silently satisfied.
+///
+/// **§4 control-lane split — the control bound.** Control is bounded
+/// independently of the application budget, by four LOCAL rules: at most
+/// one UNRESOLVED receipt send (`Pending` or `DeliveryUnknown`), at most
+/// `MAX_CONTROL_SENDS` durable receipt-kind records, at most one new
+/// receipt per session per second (`control_send_not_before`), and
+/// water-coalesced debt so one later receipt reports the freshest
+/// contiguous water.
+///
+/// This is a refillable rate bound, not a per-epoch cap, and — critically
+/// — control eligibility NEVER depends on the peer acknowledging an
+/// earlier control response. That conditioning is what deadlocked an
+/// honest peer in v12: an uncongested peer has no reason to
+/// counter-receipt, and receipt-only acceptance creates no debt by
+/// design. Here, after `Stored`/`Duplicate` later coalesced debt becomes
+/// eligible when the local cooldown expires, and `DeliveryUnknown`
+/// becomes eligible after local consumption or expiry — so an honest
+/// peer eventually gets a fresh congestion response with no
+/// receipt-of-receipt, while quiescent receipt-only traffic stays
+/// quiescent.
+///
+/// A gated receipt must never block an otherwise admissible application
+/// send; only `RekeyRequired` blocks new control encryption.
 fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<bool> {
     let Some(active) = candidate.state.active_session.as_ref() else {
         return Ok(false);
@@ -2915,28 +3024,81 @@ fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<bool>
     let high_water = active.highest_contiguous_received_seq;
     let marker = active.last_delivered_receipt_high_water;
     let fresh = high_water > marker;
-    let mode_allows = matches!(active.mode, SessionMode::Ready | SessionMode::ControlOnly);
+    // Only `RekeyRequired` blocks new control encryption; `ControlOnly`
+    // is an APPLICATION restriction and must never gate control.
+    let mode_allows = active.mode != SessionMode::RekeyRequired;
+    // The one-per-second local cooldown (field 23).
+    let cooldown_open = now >= active.control_send_not_before;
     let hcr_receipt_pending = candidate.state.sends.iter().any(|record| {
         record.state == SendState::Pending
             && record.kind == SendKind::Receipt
             && record.receipt_high_water == Some(high_water)
     });
-    let any_receipt_pending = candidate
+    // At most ONE unresolved control send, where unresolved means
+    // `Pending` OR `DeliveryUnknown`.
+    let any_receipt_unresolved = candidate.state.sends.iter().any(|record| {
+        record.kind == SendKind::Receipt
+            && matches!(
+                record.state,
+                SendState::Pending | SendState::DeliveryUnknown
+            )
+    });
+    let debt_owed = active.receipt_debt_up_to > marker && !hcr_receipt_pending;
+    let control_owed = active.control_debt_up_to > marker;
+    if !(debt_owed || control_owed) || !fresh || !mode_allows {
+        return Ok(false);
+    }
+    if any_receipt_unresolved || !cooldown_open {
+        // Gated, not discarded: the debt water stays durable and the
+        // next clock-taking mutator retries at the cooldown boundary or
+        // once the unresolved send resolves.
+        return Ok(false);
+    }
+    if !ensure_control_slot(candidate) {
+        return Ok(false);
+    }
+    stage_receipt(candidate, high_water, now)?;
+    Ok(true)
+}
+
+/// Make room for one more control record within `MAX_CONTROL_SENDS`.
+///
+/// §4 control-lane split: `Pending` and `DeliveryUnknown` control records
+/// are NEVER evicted — their terminal effect has not yet been folded into
+/// `ActiveSession`. Terminal control records (`Stored`/`Duplicate`/
+/// `Expired`) may be recycled oldest `(expires_at, message_id)` first.
+/// Returns whether a slot is available afterwards.
+fn ensure_control_slot(candidate: &mut Candidate) -> bool {
+    let control_count = candidate
         .state
         .sends
         .iter()
-        .any(|record| record.state == SendState::Pending && record.kind == SendKind::Receipt);
-    let debt_owed = active.receipt_debt_up_to > marker && !hcr_receipt_pending;
-    let control_owed = active.control_debt_up_to > marker && !any_receipt_pending;
-    if (debt_owed || control_owed)
-        && fresh
-        && mode_allows
-        && candidate.state.sends.len() < MAX_SENDS
-    {
-        stage_receipt(candidate, high_water, now)?;
-        return Ok(true);
+        .filter(|record| record.kind == SendKind::Receipt)
+        .count();
+    if control_count < MAX_CONTROL_SENDS {
+        return true;
     }
-    Ok(false)
+    let victim = candidate
+        .state
+        .sends
+        .iter()
+        .filter(|record| {
+            record.kind == SendKind::Receipt
+                && matches!(
+                    record.state,
+                    SendState::Stored | SendState::Duplicate | SendState::Expired
+                )
+        })
+        .min_by_key(|record| (record.expires_at, *record.message_id.as_bytes()))
+        .map(|record| record.message_id);
+    let Some(victim) = victim else {
+        return false;
+    };
+    candidate
+        .state
+        .sends
+        .retain(|record| record.message_id != victim);
+    true
 }
 
 /// D2a carry-over: prune terminal send records (`Stored`/`Duplicate`/

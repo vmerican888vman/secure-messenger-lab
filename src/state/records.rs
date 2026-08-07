@@ -16,7 +16,10 @@ use vodozemac::{Curve25519PublicKey, Ed25519PublicKey, Ed25519Signature};
 use zeroize::Zeroizing;
 
 use super::tlv::{self, ObjectReader, Reader};
-use super::{MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SESSION_PICKLE};
+use super::{
+    MAX_APPLICATION_OUTSTANDING, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET,
+    MAX_SESSION_PICKLE,
+};
 use crate::ids::{ConversationId, MessageId, Nonce, QueueId};
 use crate::{EncryptedPacket, LabError, Result};
 
@@ -282,12 +285,20 @@ pub(crate) enum Role {
 }
 
 /// Session mode from section 4: `1` = `Ready`, `2` = `ControlOnly`,
-/// `3` = `ReceiptLocked`, `4` = `RekeyRequired`.
+/// `4` = `RekeyRequired`.
+///
+/// **§4 control-lane split:** `ReceiptLocked` (value `3`) is RETIRED. It
+/// was the terminal state of the old combined 24-application-plus-8-
+/// control counter; once the lanes are separate there is no lawful
+/// transition from `ControlOnly` to 32 application sends, because
+/// `application_outstanding` is bounded at 24 by construction. Stored
+/// value `3` is therefore invalid on load. The discriminant is left as a
+/// gap rather than renumbered so no persisted value silently changes
+/// meaning.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SessionMode {
     Ready = 1,
     ControlOnly = 2,
-    ReceiptLocked = 3,
     RekeyRequired = 4,
 }
 
@@ -425,11 +436,42 @@ impl HighWaterReceipt {
 /// peer-signaled arm binds to the signaling packet's sequence, which
 /// under reordering legitimately sits above the contiguous water.
 ///
-/// **v13 note:** a field 22 (`control_signal_response_at`) was added in
-/// v12 to bound peer-signaled control responses and REVERTED in v13 — it
-/// deadlocked an honest, uncongested peer. The object declares 21
-/// fields. Bounding that arm is an OPEN §4 question; see the v13 note in
-/// `reviews/PROMPT-independent-phase2-facade-d2b.md`.
+/// **Wire-layout amendment (§4 control-lane split, authorised by the
+/// security architect):** fields 22 and 23. The old combined budget
+/// counted BOTH send kinds against one peer high water, so every control
+/// receipt spent application capacity and a peer that signalled
+/// congestion could consume our ability to send. The lanes are now
+/// separate.
+///
+/// Field 22, `unreceipted_application_send_seqs: Vec<u64>`, is the
+/// canonical strictly increasing, duplicate-free set of shared sequence
+/// numbers assigned to APPLICATION payloads not yet covered by
+/// `peer_contiguous_high_water`; `application_outstanding` is its
+/// length, bounded at 24. A scalar sent/acknowledged counter pair cannot
+/// replace it: the frozen shared high water does not say how many
+/// mixed-kind sends it covered once historical `SendRecord`s have been
+/// pruned, so the set is the authoritative ledger. The sequence space
+/// itself is NOT split — every Olm encryption, control included, still
+/// draws one `send_seq` from the single shared stream, and
+/// `HighWaterReceiptV1` still acknowledges the highest contiguous shared
+/// sequence.
+///
+/// Assigning an application send appends its sequence atomically with
+/// the ratchet advance and `SendRecord`. Assigning a receipt advances
+/// the shared sequence and does NOT touch the set. Accepting a valid
+/// advancing receipt removes every entry at or below the new high water,
+/// atomically, before any new application capacity is exposed. Send
+/// results, expiry, `DeliveryUnknown` consumption and record pruning
+/// never remove application budget.
+///
+/// Field 23, `control_send_not_before: u64`, is the durable one-per-
+/// second control cooldown boundary; staging a receipt sets it to
+/// `checked(now + 1)`. It is a refillable LOCAL rate bound, never a
+/// per-epoch cap and never conditioned on the peer acknowledging an
+/// earlier control response — that conditioning is exactly what
+/// deadlocked an honest peer in v12.
+///
+/// The object declares 23 fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -460,6 +502,14 @@ pub(crate) struct ActiveSession {
     /// congestion (local or peer-signaled) has armed to date; 0 = none.
     /// Monotone on the wire; resolved only by confirmed delivery.
     pub(crate) control_debt_up_to: u64,
+    /// Shared sequences of application payloads the peer's high water
+    /// does not yet cover (field 22). Its length IS
+    /// `application_outstanding`; bounded at
+    /// `MAX_APPLICATION_OUTSTANDING`.
+    pub(crate) unreceipted_application_send_seqs: Vec<u64>,
+    /// Durable control-send cooldown boundary (field 23); 0 = no
+    /// cooldown outstanding.
+    pub(crate) control_send_not_before: u64,
 }
 
 impl ActiveSession {
@@ -483,7 +533,7 @@ impl ActiveSession {
         let mode = match u8_value(object.field(15)?)? {
             1 => SessionMode::Ready,
             2 => SessionMode::ControlOnly,
-            3 => SessionMode::ReceiptLocked,
+
             4 => SessionMode::RekeyRequired,
             _ => return Err(LabError::Storage),
         };
@@ -493,6 +543,9 @@ impl ActiveSession {
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         let receipt_debt_up_to = u64_value(object.field(20)?)?;
         let control_debt_up_to = u64_value(object.field(21)?)?;
+        let unreceipted_application_send_seqs =
+            parse_u64_set(object.field(22)?, MAX_APPLICATION_OUTSTANDING)?;
+        let control_send_not_before = u64_value(object.field(23)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -512,6 +565,8 @@ impl ActiveSession {
             last_delivered_receipt_high_water,
             receipt_debt_up_to,
             control_debt_up_to,
+            unreceipted_application_send_seqs,
+            control_send_not_before,
         })
     }
 
@@ -535,6 +590,11 @@ impl ActiveSession {
             self.last_delivered_receipt_high_water.to_be_bytes();
         let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
         let control_debt_up_to = self.control_debt_up_to.to_be_bytes();
+        let application_seqs = encode_u64_set(
+            &self.unreceipted_application_send_seqs,
+            MAX_APPLICATION_OUTSTANDING,
+        )?;
+        let control_send_not_before = self.control_send_not_before.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -559,6 +619,8 @@ impl ActiveSession {
                 (19, &last_delivered_receipt_high_water),
                 (20, &receipt_debt_up_to),
                 (21, &control_debt_up_to),
+                (22, &application_seqs),
+                (23, &control_send_not_before),
             ],
         )?;
         Ok(Zeroizing::new(object))

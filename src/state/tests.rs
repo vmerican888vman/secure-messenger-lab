@@ -299,6 +299,12 @@ fn make_active_session(
 ) -> Result<ActiveSession, Box<dyn Error>> {
     let keys = session.session_keys();
     Ok(ActiveSession {
+        // §4 control-lane split: the fixture's application send records
+        // sit at sequences 2 and 3, both above the peer high water of 1,
+        // so the durable ledger must list exactly those — application
+        // outstanding 2, mode Ready.
+        unreceipted_application_send_seqs: vec![2, 3],
+        control_send_not_before: 0,
         role,
         session_pickle: Zeroizing::new(serde_json::to_vec(&session.pickle())?),
         identity_key: keys.identity_key,
@@ -1666,6 +1672,12 @@ fn set_water(
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.last_assigned_send_seq = last_assigned;
     active.peer_contiguous_high_water = high_water;
+    // §4 control-lane split: the budget now lives in the application
+    // ledger, not the shared sequence distance. These codec fixtures
+    // treat every uncovered sequence as an application send, so
+    // `application_outstanding == last_assigned - high_water` and the
+    // old outstanding-driven expectations carry over directly.
+    active.unreceipted_application_send_seqs = ((high_water + 1)..=last_assigned).collect();
     active.mode = mode;
     active.receipt = if high_water == 0 {
         None
@@ -1691,34 +1703,30 @@ fn high_water_may_not_exceed_last_assigned() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn outstanding_budget_and_mode_consistency() -> Result<(), Box<dyn Error>> {
-    // More than 32 outstanding is malformed: reject in every mode.
-    let mut fixture = populated_fixture()?;
-    set_water(&mut fixture, 33, 0, SessionMode::ReceiptLocked)?;
-    assert!(fixture.state.encode().is_err());
-
-    // Exactly 32: ReceiptLocked only among the BUDGET modes;
-    // RekeyRequired dominates and is accepted (covered explicitly by
-    // `rekey_required_dominates_budget_at_any_outstanding`).
-    for (mode, valid) in [
-        (SessionMode::Ready, false),
-        (SessionMode::ControlOnly, false),
-        (SessionMode::ReceiptLocked, true),
-        (SessionMode::RekeyRequired, true),
-    ] {
-        let mut fixture = populated_fixture()?;
-        set_water(&mut fixture, 32, 0, mode)?;
-        assert_eq!(
-            fixture.state.encode().is_ok(),
-            valid,
-            "outstanding 32, {mode:?}"
-        );
+    // §4 control-lane split: the budget is APPLICATION outstanding, the
+    // length of the durable ledger, bounded at 24. `ReceiptLocked` is
+    // retired, so there is no valid mode above 24 — the old 24..=31 band
+    // and the 32 terminal state are both malformed now.
+    for count in [25_u64, 32, 33] {
+        for mode in [
+            SessionMode::Ready,
+            SessionMode::ControlOnly,
+            SessionMode::RekeyRequired,
+        ] {
+            let mut fixture = populated_fixture()?;
+            set_water(&mut fixture, count, 0, mode)?;
+            assert!(
+                fixture.state.encode().is_err(),
+                "application outstanding {count}, {mode:?} accepted"
+            );
+        }
     }
 
-    // 24..=31: ControlOnly or ReceiptLocked; RekeyRequired dominates.
+    // Exactly 24: ControlOnly among the budget modes; RekeyRequired
+    // dominates and is accepted.
     for (mode, valid) in [
         (SessionMode::Ready, false),
         (SessionMode::ControlOnly, true),
-        (SessionMode::ReceiptLocked, true),
         (SessionMode::RekeyRequired, true),
     ] {
         let mut fixture = populated_fixture()?;
@@ -1726,21 +1734,23 @@ fn outstanding_budget_and_mode_consistency() -> Result<(), Box<dyn Error>> {
         assert_eq!(
             fixture.state.encode().is_ok(),
             valid,
-            "outstanding 24, {mode:?}"
+            "application outstanding 24, {mode:?}"
         );
     }
 
-    // 0..=23 outstanding: any mode, and each round-trips.
-    for mode in [
-        SessionMode::Ready,
-        SessionMode::ControlOnly,
-        SessionMode::ReceiptLocked,
-        SessionMode::RekeyRequired,
+    // Below 24: Ready among the budget modes; RekeyRequired dominates.
+    for (mode, valid) in [
+        (SessionMode::Ready, true),
+        (SessionMode::ControlOnly, false),
+        (SessionMode::RekeyRequired, true),
     ] {
         let mut fixture = populated_fixture()?;
-        set_water(&mut fixture, 3, 1, mode)?;
-        let encoded = fixture.state.encode()?;
-        ClientStateV1::decode(&encoded)?;
+        set_water(&mut fixture, 23, 0, mode)?;
+        assert_eq!(
+            fixture.state.encode().is_ok(),
+            valid,
+            "application outstanding 23, {mode:?}"
+        );
     }
     Ok(())
 }
@@ -2145,8 +2155,11 @@ fn delivery_unknown_with_full_arm_rejected() -> Result<(), Box<dyn Error>> {
 #[test]
 fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     let mut fixture = send_only_fixture()?;
-    // Clear the receive side so only the outbox is under test, and make
-    // room for 32 outstanding sequences (mode ReceiptLocked at exactly 32).
+    // Clear the receive side so only the outbox is under test. §4
+    // control-lane split: 32 APPLICATION records remain the outbox
+    // quota, but at most 24 of them may sit above the peer high water,
+    // so the water is set to 8 and the ledger holds sequences 9..=32
+    // (application outstanding 24, mode ControlOnly).
     // The dedup records are retired-epoch: current-epoch dedup is
     // receive-authoritative (review v3 finding 1) and this ratchet only
     // ever sent.
@@ -2155,7 +2168,7 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     for record in &mut fixture.state.dedup {
         record.epoch_id = digest(b"retired-epoch");
     }
-    set_water(&mut fixture, 32, 0, SessionMode::ReceiptLocked)?;
+    set_water(&mut fixture, 32, 8, SessionMode::ControlOnly)?;
     let active = fixture.state.active_session.as_mut().ok_or("no session")?;
     active.highest_contiguous_received_seq = 0;
     active.last_delivered_receipt_high_water = 0;
@@ -2355,8 +2368,11 @@ fn current_epoch_dedup_requires_receive_provenance() -> Result<(), Box<dyn Error
 /// every mode.
 #[test]
 fn rekey_required_dominates_budget_at_any_outstanding() -> Result<(), Box<dyn Error>> {
-    // (last_assigned, high_water): outstanding 0, 24, 31, 32.
-    for (last_assigned, high_water) in [(3, 3), (24, 0), (31, 0), (32, 0)] {
+    // §4 control-lane split: RekeyRequired dominates across the whole
+    // LAWFUL application range, which is now 0..=24 — above 24 is
+    // malformed in every mode, so the old 31/32 rows are gone.
+    // (last_assigned, high_water): application outstanding 0, 12, 24.
+    for (last_assigned, high_water) in [(3, 3), (12, 0), (24, 0)] {
         let mut fixture = populated_fixture()?;
         set_water(
             &mut fixture,
@@ -2367,9 +2383,14 @@ fn rekey_required_dominates_budget_at_any_outstanding() -> Result<(), Box<dyn Er
         let encoded = fixture.state.encode()?;
         ClientStateV1::decode(&encoded)?;
     }
-    let mut fixture = populated_fixture()?;
-    set_water(&mut fixture, 33, 0, SessionMode::RekeyRequired)?;
-    assert!(fixture.state.encode().is_err());
+    for over in [25_u64, 33] {
+        let mut fixture = populated_fixture()?;
+        set_water(&mut fixture, over, 0, SessionMode::RekeyRequired)?;
+        assert!(
+            fixture.state.encode().is_err(),
+            "application outstanding {over} accepted under RekeyRequired"
+        );
+    }
     Ok(())
 }
 
@@ -3079,6 +3100,31 @@ fn decode_with_spliced_send(kind: u8, hw: Option<u64>) -> Result<bool, Box<dyn E
 /// terminal records never carry it; invalid kind bytes reject.
 #[test]
 fn send_record_kind_arm_rules() -> Result<(), Box<dyn Error>> {
+    /// §4 control-lane split: retyping an application record as a
+    /// receipt must also drop its sequence from the application ledger —
+    /// control costs no application capacity, and the validator enforces
+    /// exactly that. Without this the fixture would be testing the
+    /// ledger rule rather than the high-water arm rules.
+    fn retype_send_as_receipt(fixture: &mut Fixture, index: usize) -> Result<(), Box<dyn Error>> {
+        let sequence = fixture
+            .state
+            .sends
+            .get(index)
+            .ok_or("no send record")?
+            .sequence;
+        fixture
+            .state
+            .sends
+            .get_mut(index)
+            .ok_or("no send record")?
+            .kind = SendKind::Receipt;
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active
+            .unreceipted_application_send_seqs
+            .retain(|listed| *listed != sequence);
+        Ok(())
+    }
+
     // Encode path (the fixture's sends[0] is Pending, sends[2] terminal
     // Stored; the received high water is 1).
     for (hw, valid) in [
@@ -3088,16 +3134,16 @@ fn send_record_kind_arm_rules() -> Result<(), Box<dyn Error>> {
         (None, false),
     ] {
         let mut fixture = populated_fixture()?;
+        retype_send_as_receipt(&mut fixture, 0)?;
         let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
-        record.kind = SendKind::Receipt;
         record.receipt_high_water = hw;
         assert_eq!(fixture.state.encode().is_ok(), valid, "receipt hw {hw:?}");
     }
     // A valid full-arm receipt round-trips byte-identically.
     let mut fixture = populated_fixture()?;
     {
+        retype_send_as_receipt(&mut fixture, 0)?;
         let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
-        record.kind = SendKind::Receipt;
         record.receipt_high_water = Some(1);
     }
     let encoded = fixture.state.encode()?;
@@ -3114,12 +3160,7 @@ fn send_record_kind_arm_rules() -> Result<(), Box<dyn Error>> {
     assert!(fixture.state.encode().is_err());
     // A terminal record may be receipt-kind with the water absent...
     let mut fixture = populated_fixture()?;
-    fixture
-        .state
-        .sends
-        .get_mut(2)
-        .ok_or("no terminal send")?
-        .kind = SendKind::Receipt;
+    retype_send_as_receipt(&mut fixture, 2)?;
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
     assert_eq!(&encoded[..], &decoded.encode()?[..]);

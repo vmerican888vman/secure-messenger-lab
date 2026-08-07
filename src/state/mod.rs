@@ -72,7 +72,17 @@ pub(crate) const MAX_KEYPAIR_JSON: usize = 512;
 pub(crate) const MAX_BODY: usize = 65_536;
 pub(crate) const MAX_PACKET: usize = 98_304;
 pub(crate) const MAX_INBOUND: usize = 32;
-pub(crate) const MAX_SENDS: usize = 32;
+/// §4 control-lane split: the send outbox holds up to 32 APPLICATION
+/// records plus 8 CONTROL (receipt-kind) records, 40 total. The quotas
+/// are independent, so control tombstones can never consume application
+/// slots.
+pub(crate) const MAX_SENDS: usize = 40;
+pub(crate) const MAX_APPLICATION_SENDS: usize = 32;
+pub(crate) const MAX_CONTROL_SENDS: usize = 8;
+/// §4 control-lane split: `application_outstanding` is the length of
+/// `ActiveSession::unreceipted_application_send_seqs`. 24 is
+/// `ControlOnly`; more is malformed.
+pub(crate) const MAX_APPLICATION_OUTSTANDING: usize = 24;
 pub(crate) const MAX_ACKS: usize = 32;
 pub(crate) const MAX_DEDUP: usize = 4_096;
 /// Section 3 requires the out-of-order received set to be bounded without

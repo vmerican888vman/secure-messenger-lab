@@ -42,12 +42,14 @@ use vodozemac::{
 use zeroize::Zeroizing;
 
 use super::records::{
-    ActiveSession, HighWaterReceipt, PeerBundle, RECEIPT_VERSION, Role, SendKind, SessionMode,
+    ActiveSession, HighWaterReceipt, PeerBundle, RECEIPT_VERSION, Role, SendKind, SendState,
+    SessionMode,
 };
 use super::tlv::canonical_json;
 use super::{
-    ClientStateV1, MAX_ACCOUNT_PICKLE, MAX_ACKS, MAX_BODY, MAX_DEDUP, MAX_INBOUND,
-    MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS, MAX_SESSION_PICKLE,
+    ClientStateV1, MAX_ACCOUNT_PICKLE, MAX_ACKS, MAX_APPLICATION_OUTSTANDING,
+    MAX_APPLICATION_SENDS, MAX_BODY, MAX_CONTROL_SENDS, MAX_DEDUP, MAX_INBOUND, MAX_KEYPAIR_JSON,
+    MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS, MAX_SESSION_PICKLE,
 };
 use crate::capability::{canonical, digest};
 use crate::ids::{MessageId, QueueId};
@@ -57,10 +59,12 @@ const PREKEY_ACTION: &[u8] = b"peer-prekey";
 const SEND_ACTION: &[u8] = b"send";
 const RECEIPT_ACTION: &[u8] = b"session-high-water/v1";
 
-/// Section 4 budget: 24 application advances, 8 reserved control
-/// advances, 32 absolute maximum; more is malformed and rejected on load.
-const MAX_OUTSTANDING: u64 = 32;
-const CONTROL_ONLY_THRESHOLD: u64 = 24;
+// Section 4 control-lane split: the application budget is 24 (the length
+// bound on `unreceipted_application_send_seqs`, imported as
+// `MAX_APPLICATION_OUTSTANDING`); control is bounded independently by its
+// own record quota and a local rate limit. The old combined
+// 32-outstanding ceiling and its `ReceiptLocked` terminal state are
+// retired.
 
 /// Canonical length-prefixed signing bytes for a peer bundle; identical
 /// construction to `peer_prekey_signing_bytes` in `src/client.rs`.
@@ -129,6 +133,32 @@ pub(super) fn validate(state: &ClientStateV1) -> Result<()> {
 fn check_structure(state: &ClientStateV1) -> Result<()> {
     check_sorted(&state.inbound, MAX_INBOUND, |record| record.message_id)?;
     check_sorted(&state.sends, MAX_SENDS, |record| record.message_id)?;
+    // §4 control-lane split: the lanes hold independent storage quotas,
+    // so control tombstones can never consume application slots, and at
+    // most one control send may be unresolved at a time.
+    let application_records = state
+        .sends
+        .iter()
+        .filter(|record| record.kind == SendKind::Application)
+        .count();
+    let control_records = state.sends.len() - application_records;
+    let unresolved_control = state
+        .sends
+        .iter()
+        .filter(|record| {
+            record.kind == SendKind::Receipt
+                && matches!(
+                    record.state,
+                    SendState::Pending | SendState::DeliveryUnknown
+                )
+        })
+        .count();
+    if application_records > MAX_APPLICATION_SENDS
+        || control_records > MAX_CONTROL_SENDS
+        || unresolved_control > 1
+    {
+        return Err(LabError::Storage);
+    }
     check_sorted(&state.acks, MAX_ACKS, |record| record.message_id)?;
     check_sorted(&state.dedup, MAX_DEDUP, |record| record.message_id)?;
     for send in &state.sends {
@@ -593,40 +623,95 @@ fn check_active_session(
     }
 
     check_high_water(active)?;
+    check_application_ledger(state, active)?;
     check_receipt(state, account, active, binding)?;
+    Ok(())
+}
+
+/// §4 control-lane split: the durable application ledger (field 22) must
+/// agree with the retained send records.
+///
+/// The ledger is authoritative and outlives its records — pruning a
+/// terminal `SendRecord` must never return application budget, which is
+/// exactly why the ledger exists — so a set entry need NOT have a
+/// retained record. The implications that DO hold:
+///
+/// - every retained APPLICATION record above the peer high water must
+///   appear in the set (its budget is still owed);
+/// - no RECEIPT-kind sequence may appear in the set (control costs no
+///   application capacity);
+/// - no retained record at or below the peer high water may appear (the
+///   receipt that covered it pruned the entry).
+fn check_application_ledger(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
+    for record in &state.sends {
+        if record.epoch_id != active.epoch_id {
+            continue;
+        }
+        let listed = active
+            .unreceipted_application_send_seqs
+            .contains(&record.sequence);
+        match record.kind {
+            SendKind::Application => {
+                if record.sequence > active.peer_contiguous_high_water && !listed {
+                    return Err(LabError::Storage);
+                }
+                if record.sequence <= active.peer_contiguous_high_water && listed {
+                    return Err(LabError::Storage);
+                }
+            }
+            SendKind::Receipt => {
+                if listed {
+                    return Err(LabError::Storage);
+                }
+            }
+        }
+    }
     Ok(())
 }
 
 /// Section 4 high-water invariants and mode consistency.
 ///
-/// Review v3 finding 2 (recorded amendment): the §4 budget matrix
-/// constrains the three BUDGET modes only — `Ready` below 24 outstanding,
-/// `ControlOnly` at 24-31, `ReceiptLocked` at 32, more than 32 malformed.
-/// `RekeyRequired` is orthogonal and DOMINATES the budget mode: an
-/// authenticated current-epoch gap failure moves the session to
-/// `RekeyRequired` at ANY outstanding count in 0..=32 (it exits only via
+/// §4 control-lane split: the budget matrix now constrains the two
+/// application modes only — `Ready` below 24 application outstanding,
+/// `ControlOnly` at exactly 24, more than 24 malformed. `ReceiptLocked`
+/// is retired (see `SessionMode`). `RekeyRequired` is orthogonal and
+/// DOMINATES: an authenticated current-epoch gap failure moves the
+/// session there at ANY application count in 0..=24 (it exits only via
 /// the §4 user-confirmed rebootstrap), so validation accepts
-/// `RekeyRequired` for every non-malformed outstanding count.
+/// `RekeyRequired` for every non-malformed count.
 fn check_high_water(active: &ActiveSession) -> Result<()> {
     if active.peer_contiguous_high_water > active.last_assigned_send_seq {
         return Err(LabError::Storage);
     }
-    let outstanding = active.last_assigned_send_seq - active.peer_contiguous_high_water;
-    if outstanding > MAX_OUTSTANDING {
+    // §4 control-lane split: the shared sequence distance is no longer a
+    // budget — control sends advance it freely — so it carries no bound
+    // of its own. The budget lives entirely in the application ledger.
+    let application_outstanding = active.unreceipted_application_send_seqs.len();
+    if application_outstanding > MAX_APPLICATION_OUTSTANDING {
         return Err(LabError::Storage);
     }
     if active.mode != SessionMode::RekeyRequired {
-        if outstanding == MAX_OUTSTANDING && active.mode != SessionMode::ReceiptLocked {
+        let expected = if application_outstanding == MAX_APPLICATION_OUTSTANDING {
+            SessionMode::ControlOnly
+        } else {
+            SessionMode::Ready
+        };
+        if active.mode != expected {
             return Err(LabError::Storage);
         }
-        if (CONTROL_ONLY_THRESHOLD..MAX_OUTSTANDING).contains(&outstanding)
-            && !matches!(
-                active.mode,
-                SessionMode::ControlOnly | SessionMode::ReceiptLocked
-            )
+    }
+    // Every unreceipted application sequence must be a real, uncovered,
+    // assigned sequence.
+    for &sequence in &active.unreceipted_application_send_seqs {
+        if sequence == 0
+            || sequence <= active.peer_contiguous_high_water
+            || sequence > active.last_assigned_send_seq
         {
             return Err(LabError::Storage);
         }
+    }
+    if active.control_send_not_before != 0 && active.last_assigned_send_seq == 0 {
+        return Err(LabError::Storage);
     }
     // Every out-of-order received sequence must sit strictly above the
     // implied contiguous high water; an element exactly at `hcr + 1` would
