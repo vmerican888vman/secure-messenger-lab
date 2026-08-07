@@ -133,6 +133,23 @@ pub(super) fn validate(state: &ClientStateV1) -> Result<()> {
 fn check_structure(state: &ClientStateV1) -> Result<()> {
     check_sorted(&state.inbound, MAX_INBOUND, |record| record.message_id)?;
     check_sorted(&state.sends, MAX_SENDS, |record| record.message_id)?;
+    // Codec v11 (Sol's P1): verify EVERY send record's §3 metadata
+    // commitment before ANY kind-dependent logic runs. The quota
+    // counting below and the application ledger both consume `kind`, and
+    // the frozen ordering is "verify before anything relies on kind".
+    //
+    // The previous placement — inside the per-record loop further down —
+    // happened to fail closed, because every path here is rejection-only
+    // inside one all-or-nothing `validate`. That is an argument about
+    // today's control flow, not the contract: it would silently stop
+    // holding the moment a kind-dependent branch below ever returned
+    // something other than an error. Hoisting it makes the property
+    // structural instead of incidental.
+    for send in &state.sends {
+        if send.metadata_commitment != send.compute_metadata_commitment()? {
+            return Err(LabError::Storage);
+        }
+    }
     // §4 control-lane split: the lanes hold independent storage quotas,
     // so control tombstones can never consume application slots, and at
     // most one control send may be unresolved at a time.
@@ -163,14 +180,6 @@ fn check_structure(state: &ClientStateV1) -> Result<()> {
     check_sorted(&state.dedup, MAX_DEDUP, |record| record.message_id)?;
     for send in &state.sends {
         if !send.arms_consistent() {
-            return Err(LabError::Storage);
-        }
-        // Codec v10 P1-1: recompute the §3 metadata commitment on the
-        // ENCODE path too, BEFORE anything relies on `kind` — the
-        // per-lane quotas and the application ledger both key on it.
-        // Decode checks this in `SendRecord::parse`; without the same
-        // check here, `encode` serialized a relabelled record happily.
-        if send.metadata_commitment != send.compute_metadata_commitment()? {
             return Err(LabError::Storage);
         }
         if let Some(packet) = &send.packet {

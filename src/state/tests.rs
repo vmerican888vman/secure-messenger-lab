@@ -3909,17 +3909,35 @@ fn control_debt_in_the_out_of_order_set_round_trips() -> Result<(), Box<dyn Erro
 /// construction, which is precisely why it is trusted across a rekey.
 #[test]
 fn duplicate_inner_message_digest_is_rejected() -> Result<(), Box<dyn Error>> {
-    fn with_twin_digest(twin_digest: [u8; 32]) -> Result<Fixture, Box<dyn Error>> {
+    /// The fixture's retired-epoch marker.
+    fn retired_epoch() -> [u8; 32] {
+        digest(b"retired-epoch")
+    }
+
+    /// Build a fixture whose RETIRED-epoch dedup record has a
+    /// retired-epoch twin carrying `twin_digest`.
+    ///
+    /// The source record is selected by EPOCH, not by position (codec
+    /// v11, Sol's P2). The fixture's current-epoch record has a random
+    /// message ID, so after the sort-by-ID a positional `.first()` was
+    /// usually the CURRENT record — meaning this test usually exercised
+    /// current+retired and a future retired-retired exemption could have
+    /// escaped it entirely.
+    fn with_retired_twin(twin_digest: [u8; 32]) -> Result<Fixture, Box<dyn Error>> {
         let mut fixture = populated_fixture()?;
-        let (message_id, queue_id, expires_at) = {
-            let first = fixture.state.dedup.first().ok_or("no dedup record")?;
-            (first.message_id, first.queue_id, first.expires_at)
-        };
-        let mut raw = *message_id.as_bytes();
+        let source = fixture
+            .state
+            .dedup
+            .iter()
+            .find(|record| record.epoch_id == retired_epoch())
+            .ok_or("fixture has no retired-epoch dedup record")?;
+        let (source_id, queue_id, expires_at) =
+            (source.message_id, source.queue_id, source.expires_at);
+        let mut raw = *source_id.as_bytes();
         raw[0] ^= 0xFF;
         fixture.state.dedup.push(DedupRecord {
             message_id: MessageId::from_slice(&raw).ok_or("bad twin id")?,
-            epoch_id: digest(b"retired-epoch"),
+            epoch_id: retired_epoch(),
             sequence: 4,
             queue_id,
             packet_digest: digest(b"a-different-packet"),
@@ -3931,29 +3949,47 @@ fn duplicate_inner_message_digest_is_rejected() -> Result<(), Box<dyn Error>> {
             .state
             .dedup
             .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+        // Both twins must genuinely be retired-epoch, or this proves
+        // nothing about the retired-retired direction.
+        assert_eq!(
+            fixture
+                .state
+                .dedup
+                .iter()
+                .filter(|record| record.epoch_id == retired_epoch())
+                .count(),
+            2,
+            "the twins are not both retired-epoch"
+        );
         Ok(fixture)
     }
 
-    // Accept arm first: an otherwise identical twin with its OWN
-    // identity must encode, proving the reject arm below isolates the
-    // digest rule rather than the extra record.
+    let shared = {
+        let fixture = populated_fixture()?;
+        fixture
+            .state
+            .dedup
+            .iter()
+            .find(|record| record.epoch_id == retired_epoch())
+            .ok_or("fixture has no retired-epoch dedup record")?
+            .message_digest
+    };
+
+    // Accept arm first: an otherwise identical retired twin with its OWN
+    // identity must encode, proving the reject arm isolates the digest
+    // rule rather than the extra record or the retired epoch.
     assert!(
-        with_twin_digest(digest(b"a-different-inner-message"))?
+        with_retired_twin(digest(b"a-different-inner-message"))?
             .state
             .encode()
             .is_ok(),
         "a distinct inner-message identity was rejected"
     );
 
-    // Reject arm: the same inner-message identity twice.
-    let shared = {
-        let fixture = populated_fixture()?;
-        let first = fixture.state.dedup.first().ok_or("no dedup record")?;
-        first.message_digest
-    };
+    // Reject arm: the same inner-message identity twice, both retired.
     assert!(
-        with_twin_digest(shared)?.state.encode().is_err(),
-        "two records shared one inner-message identity"
+        with_retired_twin(shared)?.state.encode().is_err(),
+        "two retired-epoch records shared one inner-message identity"
     );
     Ok(())
 }

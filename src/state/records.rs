@@ -808,11 +808,14 @@ impl SendRecord {
             metadata_commitment: tlv::fixed::<32>(object.field(12)?)?,
         };
         object.finish()?;
-        if !record.arms_consistent() {
+        // Codec v11 (Sol's P1): verify the commitment BEFORE
+        // `arms_consistent`, which is itself kind-dependent. The frozen
+        // ordering is "verify before anything relies on kind", and
+        // ordering it after merely happened to fail closed.
+        if record.metadata_commitment != record.compute_metadata_commitment()? {
             return Err(LabError::Storage);
         }
-        // Recompute BEFORE anything relies on `kind` (codec v10 P1-1).
-        if record.metadata_commitment != record.compute_metadata_commitment()? {
+        if !record.arms_consistent() {
             return Err(LabError::Storage);
         }
         Ok(record)
