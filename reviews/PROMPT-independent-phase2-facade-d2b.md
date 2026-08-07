@@ -1,5 +1,75 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v12)
+
+Version 11 (head `b3825fa30980c797dfad4de3d1a4729c132f3506`): Fable PASS
+(`reviews/REVIEW-fable-facade-d2b-v11.md`), Sol RETURN with two P1
+blockers (`reviews/REVIEW-sol-facade-d2b-v11.md`), both fixed in the head
+under review. **This round changes the codec** — two new fields — so it
+supersedes any earlier codec-leg pin.
+
+1. **Dedup keys on a variant-independent inner-message identity** (Sol's
+   P1-1). v11's canonical-encoding gate collapsed the JSON and
+   inner-framing alias classes but not the VARIANT alias: a
+   `PreKeyMessage` wraps a `Message`, an established session decrypts
+   both `OlmMessage` variants, and both consume the same inner message
+   key. So an accepted `PreKey` packet's inner message re-serialized as
+   `Normal` is a perfectly canonical packet with a different raw digest,
+   which slipped dedup and reached the ratchet. `DedupRecord` gains
+   **field 8, `message_digest`** — the digest of the inner `Message`'s
+   canonical bytes, computed by `client::inner_message_digest`, which
+   unwraps `PreKey` to its inner message. The bounds closure rejects on
+   it alongside the message ID and the raw digest. Field 5
+   (`packet_digest`) is unchanged and remains the envelope/ACK binding,
+   because it is what the sender signs — exactly the split Sol asked
+   for. The inner message fixes the ratchet key, chain index, ciphertext
+   and MAC, which is precisely what determines the consumed message key;
+   the `PreKey` session-key preamble establishes a session but does not
+   change that, so it is correctly outside the identity.
+2. **Peer-signaled control responses are bounded by reciprocity, not by
+   concurrency** (Sol's P1-2). `ActiveSession` gains **field 22,
+   `control_signal_response_at`** — our own `last_assigned_send_seq` as
+   of the last receipt issued in answer to a peer signal. The
+   peer-signaled arm fires only while `peer_contiguous_high_water >=
+   control_signal_response_at`. The reasoning: our outstanding falls
+   only when the PEER acknowledges our sends, so `Stored` is the wrong
+   completion signal — it means the relay took it, not that the peer
+   consumed it. Requiring the peer's reported water to cover the answer
+   we already sent makes the bound durable across `Stored`. An honest
+   congested peer receipts promptly and is never throttled; a peer that
+   never reciprocates extracts exactly ONE control receipt however many
+   signals it sends. The LOCAL congestion arm is deliberately NOT gated —
+   it answers our own congestion, cannot be driven by the peer, and is
+   the both-stuck backstop. Validation:
+   `control_signal_response_at <= last_assigned_send_seq`.
+
+Both fixes carry regression tests confirmed to FAIL against `b3825fa`
+(transplanted into a disposable worktree at that SHA, since the fixes are
+codec changes):
+
+- `prekey_normal_variant_alias_is_deduplicated` accepts the session's
+  establishing `PreKey` packet, rewraps its inner message as `Normal`,
+  and first asserts the alias is genuinely canonical (so v11's gate
+  cannot see it) and carries a different raw digest (so raw-digest dedup
+  cannot see it either) — then requires `DuplicateMessage` with no
+  generation commit, mode still `Ready`, and the receive water unmoved,
+  including after a reopen. Pre-fix it returned `Err(Crypto)`: past
+  dedup, into the ratchet.
+- `over_signaling_cannot_lock_the_victim` is rewritten to Sol's shape: 32
+  FULL delivery cycles, each driving the staged receipt to `Stored`
+  before the next signal — the completion that defeated the v11 guard. It
+  asserts the victim never leaves `Ready`, outstanding never reaches the
+  threshold, and, as the lifetime bound, that exactly ONE control receipt
+  was issued across all 32 cycles. Pre-fix the victim left `Ready` for
+  `ControlOnly` at cycle 25, en route to `ReceiptLocked` at 32.
+
+Note for reviewers: `invalid_enums_rejected` in `src/state/tests.rs` was
+adjusted because the dedup record's state enum is no longer its trailing
+byte (field 8 now follows it); the test indexes back past the new field
+rather than assuming the last byte.
+
+The v2–v11 histories follow unchanged.
+
 ## Remediation history (v11)
 
 Version 10 (head `dad8bcc5fbb2c3e2014190b1aef1a83345b13f08`): Fable PASS

@@ -178,6 +178,36 @@ impl EncryptedPacket {
     }
 }
 
+/// The variant-independent identity of an Olm message: the digest of the
+/// inner `Message`'s canonical bytes.
+///
+/// Review D2b v11 (Sol's P1-1). Canonical ENCODING is not a complete
+/// identity, because `OlmMessage` has two variants that carry the same
+/// inner `Message`. A `PreKeyMessage` wraps a `Message` alongside its
+/// session keys, and an established session decrypts BOTH variants —
+/// consuming the same inner message key either way. So an accepted
+/// `PreKey` packet's inner message can be canonically re-serialized as
+/// `Normal`, re-signed under a fresh envelope ID, and miss a dedup that
+/// keys on the raw packet digest, reaching the ratchet and gap-locking
+/// the session.
+///
+/// Digesting the inner `Message` alone is exactly the right identity for
+/// that failure: the inner message fixes the ratchet key, chain index,
+/// ciphertext and MAC, which together determine which message key a
+/// decrypt consumes. The session-key preamble a `PreKey` variant adds
+/// establishes a session but does not change which key the inner message
+/// consumes, so it must not be part of the identity.
+///
+/// The raw packet digest is NOT replaced — it remains the envelope and
+/// ACK binding, because it is what the sender signs.
+pub(crate) fn inner_message_digest(message: &OlmMessage) -> [u8; 32] {
+    let bytes = match message {
+        OlmMessage::Normal(normal) => normal.to_bytes(),
+        OlmMessage::PreKey(prekey) => prekey.message().to_bytes(),
+    };
+    digest(&bytes)
+}
+
 impl std::fmt::Debug for EncryptedPacket {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter

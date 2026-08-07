@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use zeroize::Zeroizing;
 
-use super::{PersistentClient, RegistrationOutcome};
+use super::{CONTROL_ONLY_THRESHOLD, PersistentClient, RegistrationOutcome};
 use crate::persistence::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtector};
 use crate::{LabError, PrivateStoreDir, StoreKind};
 
@@ -1384,6 +1384,7 @@ fn full_bound_of_expired_ack_intents_is_swept() -> std::result::Result<(), Box<d
             packet_digest,
             expires_at: NOW + 3_600,
             state: DedupState::Accepted,
+            message_digest: packet_digest,
         });
     }
     a.state
@@ -3619,9 +3620,15 @@ fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Er
     assert!(outcomes.iter().all(Result::is_ok));
     let queue_id = a.state.mailbox_queue_id;
 
-    // Wave 1 (20 packets): each arms on the forged signal; at most ONE
-    // victim receipt is ever pending.
-    for seq in 2..=21_u64 {
+    // 32 FULL delivery cycles (v11, Sol's second P1). Each cycle is a
+    // forged high signal followed by driving whatever receipt it stages
+    // all the way to `Stored`, which is what defeated the v11 bound: the
+    // `any_pending` guard only bounded CONCURRENT receipts, so completing
+    // the cycle freed the guard and the next signal armed another. The
+    // attacker never receipts A back, so A's outstanding never falls;
+    // pre-fix this walked A to `ReceiptLocked` at 32 outstanding and
+    // blocked its application sends.
+    for seq in 2..=33_u64 {
         let (message_id, packet, signature, expires_at) =
             forge_receipt_envelope(&mut b, &a, 0, seq, NOW, 32)?;
         let outcome =
@@ -3631,40 +3638,42 @@ fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Er
             pending_receipts(&a).len() <= 1,
             "more than one victim receipt pending at seq {seq}"
         );
-    }
-    assert_eq!(pending_receipts(&a).len(), 1);
-    assert_eq!(active_mode(&a)?, SessionMode::Ready);
-    assert!(outstanding(&a)? < 24);
-
-    // The victim's application sends are unaffected.
-    let _app = stage_app(&mut a, "victim app", NOW, NOW + 3_600, NOW)?;
-
-    // Deliver the in-flight receipt; the marker advances to its hw (2)
-    // but the debt water (21) is never lowered — newer debt stands
-    // (v9 finding 4), so wave 2 stages exactly one replacement.
-    let action = newest_receipt_action(&a)?;
-    a.record_send_result(&action, SendOutcome::Stored)?;
-    {
-        let active = a.state.active_session.as_ref().ok_or("no session")?;
-        assert_eq!(active.last_delivered_receipt_high_water, 2);
-        assert_eq!(active.control_debt_up_to, 21);
-    }
-
-    // Wave 2 (13 packets): after the delivery, at most one more stages.
-    for seq in 22..=34_u64 {
-        let (message_id, packet, signature, expires_at) =
-            forge_receipt_envelope(&mut b, &a, 0, seq, NOW, 32)?;
-        let outcome =
-            a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
-        assert_eq!(outcome, AcceptOutcome::ReceiptIdempotent);
+        // Complete the cycle: anything staged goes to Stored.
+        if !pending_receipts(&a).is_empty() {
+            let action = newest_receipt_action(&a)?;
+            a.record_send_result(&action, SendOutcome::Stored)?;
+        }
+        assert_eq!(
+            active_mode(&a)?,
+            SessionMode::Ready,
+            "the victim left Ready at seq {seq}"
+        );
         assert!(
-            pending_receipts(&a).len() <= 1,
-            "more than one victim receipt pending after delivery at seq {seq}"
+            outstanding(&a)? < CONTROL_ONLY_THRESHOLD,
+            "victim outstanding reached {} at seq {seq}",
+            outstanding(&a)?
         );
     }
-    assert_eq!(pending_receipts(&a).len(), 1);
+
+    // The lifetime bound: across all 32 cycles the attacker extracted
+    // exactly ONE control receipt. The peer-signaled arm stays shut until
+    // the peer's reported high water covers the answer we already sent,
+    // and this peer never receipts back.
+    let issued = a
+        .state
+        .sends
+        .iter()
+        .filter(|record| record.kind == crate::state::SendKind::Receipt)
+        .count();
+    assert_eq!(
+        issued, 1,
+        "the peer extracted {issued} control receipts, not the bounded one"
+    );
     assert_eq!(active_mode(&a)?, SessionMode::Ready);
-    assert!(outstanding(&a)? < 24);
+    assert!(outstanding(&a)? < CONTROL_ONLY_THRESHOLD);
+
+    // The victim's application sends are still unaffected at the end.
+    let _app = stage_app(&mut a, "victim app", NOW, NOW + 3_600, NOW)?;
     Ok(())
 }
 
@@ -4129,5 +4138,125 @@ fn reordered_congestion_signal_survives_a_delayed_receipt()
     );
     assert_eq!(active_mode(&b)?, SessionMode::Ready);
     b.stage_send("unwedged", NOW, NOW + 3_600, NOW)?;
+    Ok(())
+}
+
+// --- D2b v12 remediation tests (Sol's v11 P1-1 and P1-2) ---------------------
+
+/// Sol's v11 P1-1: the canonical PreKey/Normal VARIANT alias.
+///
+/// v11 made the packet ENCODING canonical, which collapsed the JSON and
+/// inner-framing alias classes. It did not collapse the variant alias:
+/// a `PreKeyMessage` wraps a `Message`, and an established session
+/// decrypts BOTH `OlmMessage` variants, consuming the same inner message
+/// key either way. So the inner `Message` of an already-accepted `PreKey`
+/// packet can be canonically serialized as `Normal` — a perfectly
+/// canonical packet with a DIFFERENT raw digest — re-signed under a fresh
+/// envelope ID, and slipped past a dedup that keys on the raw digest,
+/// reaching `decrypt` and committing `RekeyRequired`.
+///
+/// The dedup identity is now the variant-independent inner-message
+/// digest. This asserts the replay changes nothing: no generation
+/// commit, no ratchet touch, no receive-water move, no mode change.
+#[test]
+fn prekey_normal_variant_alias_is_deduplicated() -> std::result::Result<(), Box<dyn Error>> {
+    use vodozemac::olm::OlmMessage;
+
+    let (a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+
+    // m1 establishes the session, so it is a PreKey packet.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let packet = envelopes.first().ok_or("no m1 envelope")?.packet.clone();
+    let queue_a = a.state.mailbox_queue_id;
+
+    // Rewrap the SAME inner message as the Normal variant.
+    let original: OlmMessage = serde_json::from_slice(packet.as_bytes())?;
+    let inner = match &original {
+        OlmMessage::PreKey(prekey) => prekey.message().clone(),
+        OlmMessage::Normal(_) => return Err("m1 was not a PreKey packet".into()),
+    };
+    let alias = EncryptedPacket::from_untrusted(serde_json::to_vec(&OlmMessage::Normal(inner))?);
+
+    // The alias is CANONICAL — v11's encoding gate cannot see it — and it
+    // carries a different raw digest, which is why the raw digest alone
+    // could never have been the dedup identity.
+    assert!(
+        alias.parse_canonical().is_ok(),
+        "the variant alias is not canonical, so it does not test the gap v11 left"
+    );
+    assert_ne!(
+        alias.digest(),
+        packet.digest(),
+        "the variant alias did not change the raw digest"
+    );
+
+    let generation_before = a.store.generation()?;
+    let water_before = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .highest_contiguous_received_seq;
+    let message_id = MessageId::random();
+    let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+        queue_a,
+        message_id,
+        &alias.digest(),
+        NOW + 3_600,
+    ));
+    let outcome = a.accept_envelope(queue_a, message_id, alias, NOW + 3_600, signature, NOW);
+    assert!(
+        matches!(outcome, Err(LabError::DuplicateMessage)),
+        "the variant alias was not deduplicated: {outcome:?}"
+    );
+    assert_eq!(
+        a.store.generation()?,
+        generation_before,
+        "the alias committed"
+    );
+    assert_eq!(
+        active_mode(&a)?,
+        SessionMode::Ready,
+        "the alias reached the ratchet and gap-locked the session"
+    );
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq,
+        water_before,
+        "the alias moved the receive water"
+    );
+
+    // Durable across reopen: the identity is persisted, not in-memory.
+    drop(a);
+    let mut a = open_client(&a_dir)?;
+    let original_inner = match &original {
+        OlmMessage::PreKey(prekey) => prekey.message().clone(),
+        OlmMessage::Normal(_) => return Err("m1 was not a PreKey packet".into()),
+    };
+    let alias =
+        EncryptedPacket::from_untrusted(serde_json::to_vec(&OlmMessage::Normal(original_inner))?);
+    let generation_before = a.store.generation()?;
+    let message_id = MessageId::random();
+    let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+        queue_a,
+        message_id,
+        &alias.digest(),
+        NOW + 3_600,
+    ));
+    assert!(
+        matches!(
+            a.accept_envelope(queue_a, message_id, alias, NOW + 3_600, signature, NOW),
+            Err(LabError::DuplicateMessage)
+        ),
+        "the variant alias was not deduplicated after reopen"
+    );
+    assert_eq!(a.store.generation()?, generation_before);
+    assert_eq!(active_mode(&a)?, SessionMode::Ready);
     Ok(())
 }

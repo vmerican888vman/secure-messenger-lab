@@ -419,9 +419,33 @@ impl HighWaterReceipt {
 /// delivery: when the delivered marker (field 19) reaches it. A delayed
 /// `Stored` on an older receipt (`hw < control_debt_up_to`) therefore
 /// leaves newer debt standing instead of clearing it (v9 finding 4).
-/// Validation: `control_debt_up_to <= highest_contiguous_received_seq`
-/// (0 = none) — debt for water never received. The object declares 21
-/// fields.
+/// Validation (amended v11): the control-debt water must be a sequence
+/// actually RECEIVED — at or below `highest_contiguous_received_seq`, or
+/// present in `received_above_high_water` (0 = none) — because the
+/// peer-signaled arm binds to the signaling packet's sequence, which
+/// under reordering legitimately sits above the contiguous water.
+///
+/// **Wire-layout amendment (review D2b v11):** field 22,
+/// `control_signal_response_at: u64`, is our own `last_assigned_send_seq`
+/// as of the last receipt we issued in response to a PEER-SIGNALED
+/// congestion report; 0 = never responded. It exists to bound that
+/// response persistently. The v11 `any_receipt_pending` guard bounded
+/// only CONCURRENT responses: once a response reached `Stored` the next
+/// signal armed another, so an authenticated peer sending consecutive
+/// high signals could drive the victim one receipt per delivery cycle
+/// into `ReceiptLocked` at 32 outstanding, blocking its application
+/// sends. Our outstanding only falls when the PEER acknowledges our
+/// sends, so the durable bound is reciprocity: the peer-signaled arm
+/// fires only while `peer_contiguous_high_water >=
+/// control_signal_response_at`, i.e. only once the peer has actually
+/// consumed the previous response. An honest congested peer receipts
+/// promptly and is never throttled; a peer that never reciprocates gets
+/// exactly ONE control receipt however many signals it sends. The LOCAL
+/// congestion arm is deliberately NOT gated — it answers our own
+/// congestion and is the both-stuck backstop. Validation:
+/// `control_signal_response_at <= last_assigned_send_seq` — we cannot
+/// have responded at a sequence we never assigned. The object declares
+/// 22 fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -452,6 +476,10 @@ pub(crate) struct ActiveSession {
     /// congestion (local or peer-signaled) has armed to date; 0 = none.
     /// Monotone on the wire; resolved only by confirmed delivery.
     pub(crate) control_debt_up_to: u64,
+    /// Our own send sequence as of the last peer-signal-driven receipt
+    /// (field 22); 0 = never responded. Gates the peer-signaled arm on
+    /// the peer having acknowledged that response.
+    pub(crate) control_signal_response_at: u64,
 }
 
 impl ActiveSession {
@@ -485,6 +513,7 @@ impl ActiveSession {
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         let receipt_debt_up_to = u64_value(object.field(20)?)?;
         let control_debt_up_to = u64_value(object.field(21)?)?;
+        let control_signal_response_at = u64_value(object.field(22)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -504,6 +533,7 @@ impl ActiveSession {
             last_delivered_receipt_high_water,
             receipt_debt_up_to,
             control_debt_up_to,
+            control_signal_response_at,
         })
     }
 
@@ -527,6 +557,7 @@ impl ActiveSession {
             self.last_delivered_receipt_high_water.to_be_bytes();
         let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
         let control_debt_up_to = self.control_debt_up_to.to_be_bytes();
+        let control_signal_response_at = self.control_signal_response_at.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -551,6 +582,7 @@ impl ActiveSession {
                 (19, &last_delivered_receipt_high_water),
                 (20, &receipt_debt_up_to),
                 (21, &control_debt_up_to),
+                (22, &control_signal_response_at),
             ],
         )?;
         Ok(Zeroizing::new(object))
@@ -852,6 +884,22 @@ pub(crate) enum DedupState {
 
 /// Deduplication record (object type `0x0009`): epoch, sequence, queue,
 /// digest, expiry and exact terminal state.
+///
+/// **Wire-layout amendment (review D2b v11):** field 8,
+/// `message_digest: [u8; 32]`, is the digest of the INNER Olm
+/// `Message`'s canonical bytes, independent of which `OlmMessage`
+/// variant carried it. Field 5 (`packet_digest`) remains the raw packet
+/// digest and stays the envelope/ACK binding, because that is what the
+/// sender signs — but it cannot be the dedup identity on its own. v11
+/// made the packet ENCODING canonical, which collapsed the JSON and
+/// inner-framing alias classes, but not the VARIANT alias: the same
+/// inner `Message` is canonically representable both as a `PreKey`
+/// packet and as a `Normal` one, and an established session decrypts
+/// both, consuming the same message key. So a `PreKey` packet already
+/// accepted could be re-serialized as `Normal`, re-signed under a fresh
+/// envelope ID, miss the raw digest, and gap-lock the session. Field 8
+/// is the variant-independent identity that closes it. The object
+/// declares 8 fields.
 pub(crate) struct DedupRecord {
     pub(crate) message_id: MessageId,
     pub(crate) epoch_id: [u8; 32],
@@ -860,6 +908,9 @@ pub(crate) struct DedupRecord {
     pub(crate) packet_digest: [u8; 32],
     pub(crate) expires_at: u64,
     pub(crate) state: DedupState,
+    /// Digest of the inner Olm `Message` bytes, variant-independent
+    /// (field 8). The dedup identity; `packet_digest` is the binding.
+    pub(crate) message_digest: [u8; 32],
 }
 
 impl DedupRecord {
@@ -878,6 +929,7 @@ impl DedupRecord {
                 3 => DedupState::Expired,
                 _ => return Err(LabError::Storage),
             },
+            message_digest: tlv::fixed::<32>(object.field(8)?)?,
         };
         object.finish()?;
         Ok(record)
@@ -897,6 +949,7 @@ impl DedupRecord {
                 (5, &self.packet_digest),
                 (6, &expires_at),
                 (7, &state),
+                (8, &self.message_digest),
             ],
         )?;
         Ok(Zeroizing::new(object))

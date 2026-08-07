@@ -202,6 +202,7 @@ fn make_inbound_side(
         packet_digest,
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: packet_digest,
     };
     // The older record is retired-epoch (dedup retention across rekey,
     // §4): a different epoch means a different ratchet, so its sequence
@@ -214,6 +215,7 @@ fn make_inbound_side(
         packet_digest: digest(b"old-packet"),
         expires_at: NOW + 3_600,
         state: DedupState::Acked,
+        message_digest: digest(b"old-packet"),
     };
     let mut dedup = vec![inbound_dedup, old_dedup];
     dedup.sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
@@ -314,6 +316,7 @@ fn make_active_session(
         last_delivered_receipt_high_water: 1,
         receipt_debt_up_to: 0,
         control_debt_up_to: 0,
+        control_signal_response_at: 0,
     })
 }
 
@@ -520,6 +523,7 @@ fn minimal_fixture() -> Result<Fixture, Box<dyn Error>> {
         packet_digest: digest(b"old-packet"),
         expires_at: NOW + 3_600,
         state: DedupState::Expired,
+        message_digest: digest(b"old-packet"),
     };
     let state = assemble_state(
         &our_account,
@@ -860,6 +864,8 @@ fn nested_object_trailing_byte_rejected() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn invalid_enums_rejected() -> Result<(), Box<dyn Error>> {
+    /// A trailing fixed 32-byte field's block: 6-byte header + value.
+    const DIGEST_FIELD_BLOCK: usize = 6 + 32;
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
     let blocks = split_top(&encoded)?;
@@ -902,8 +908,11 @@ fn invalid_enums_rejected() -> Result<(), Box<dyn Error>> {
 
         let mut elements = split_array(blocks.get(18).ok_or("dedup")?.get(6..).ok_or("dedup")?)?;
         let record = elements.get_mut(0).ok_or("no dedup")?;
-        let last = record.len() - 1;
-        *record.get_mut(last).ok_or("dedup state")? = invalid;
+        // The state enum (field 7) is no longer the trailing byte: v11
+        // appended field 8, the 32-byte inner-message digest, whose
+        // block is a 6-byte header plus its value. Index back past it.
+        let state_byte = record.len() - 1 - DIGEST_FIELD_BLOCK;
+        *record.get_mut(state_byte).ok_or("dedup state")? = invalid;
         let bytes = splice_top(&encoded, 18, field_block(19, &join_array(&elements)?)?)?;
         assert!(
             ClientStateV1::decode(&bytes).is_err(),
@@ -1117,6 +1126,7 @@ fn unsorted_arrays_rejected_on_encode() -> Result<(), Box<dyn Error>> {
         packet_digest: fixture.state.dedup[0].packet_digest,
         expires_at: fixture.state.dedup[0].expires_at,
         state: fixture.state.dedup[0].state,
+        message_digest: fixture.state.dedup[0].message_digest,
     };
     fixture.state.dedup.push(duplicate);
     assert!(fixture.state.encode().is_err(), "equal dedup IDs accepted");
@@ -2301,6 +2311,7 @@ fn current_epoch_dedup_requires_receive_provenance() -> Result<(), Box<dyn Error
         packet_digest: digest(b"phantom"),
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: digest(b"phantom"),
     });
     fixture
         .state
@@ -2329,6 +2340,7 @@ fn current_epoch_dedup_requires_receive_provenance() -> Result<(), Box<dyn Error
         packet_digest: digest(b"contiguous"),
         expires_at: NOW + 3_600,
         state: DedupState::Acked,
+        message_digest: digest(b"contiguous"),
     });
     fixture
         .state
@@ -3163,6 +3175,7 @@ fn current_epoch_dedup_sequences_are_unique() -> Result<(), Box<dyn Error>> {
         packet_digest: digest(b"impostor"),
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: digest(b"impostor"),
     });
     fixture
         .state
@@ -3191,6 +3204,7 @@ fn current_epoch_dedup_sequences_are_unique() -> Result<(), Box<dyn Error>> {
         packet_digest: digest(b"impostor"),
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: digest(b"impostor"),
     });
     fixture
         .state
@@ -3214,6 +3228,7 @@ fn current_epoch_dedup_sequences_are_unique() -> Result<(), Box<dyn Error>> {
         packet_digest: digest(b"old"),
         expires_at: NOW + 3_600,
         state: DedupState::Expired,
+        message_digest: digest(b"old"),
     });
     fixture
         .state
@@ -3257,6 +3272,7 @@ fn inbound_and_ack_sequences_are_unique_per_epoch() -> Result<(), Box<dyn Error>
         packet_digest: digest(b"second-packet"),
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: digest(b"second-packet"),
     });
     fixture
         .state
@@ -3303,6 +3319,7 @@ fn inbound_and_ack_sequences_are_unique_per_epoch() -> Result<(), Box<dyn Error>
         packet_digest,
         expires_at: NOW + 3_600,
         state: DedupState::Accepted,
+        message_digest: packet_digest,
     });
     fixture
         .state

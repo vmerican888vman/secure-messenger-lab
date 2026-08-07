@@ -893,6 +893,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     last_delivered_receipt_high_water: 0,
                     receipt_debt_up_to: 0,
                     control_debt_up_to: 0,
+                    control_signal_response_at: 0,
                     conversation_id: candidate.state.conversation_id,
                 });
                 candidate.session = Some(session);
@@ -1107,6 +1108,14 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         // above the signature check leaks nothing (see
         // `EncryptedPacket::parse_canonical`).
         let olm_message = packet.parse_canonical()?;
+        // The variant-independent dedup identity (review D2b v11, Sol's
+        // P1-1). Computed here, from the already-parsed message, so both
+        // the bounds closure and the record writes see the same value.
+        let identity = PacketIdentity {
+            packet_digest,
+            message_digest: crate::client::inner_message_digest(&olm_message),
+        };
+        let message_digest = identity.message_digest;
         let artifact = self.mutate(
             |current| {
                 // Inbound lock (review D2b v8 P1-1): once the session is
@@ -1165,6 +1174,18 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     if record.packet_digest == packet_digest {
                         return Err(LabError::DuplicateMessage);
                     }
+                    // Review D2b v11 (Sol's P1-1): the raw digest alone
+                    // is not an identity. The SAME inner Olm message is
+                    // canonically representable as both a `PreKey` and a
+                    // `Normal` packet, and an established session
+                    // decrypts both, consuming the same message key — so
+                    // an accepted PreKey packet re-serialized as Normal
+                    // has a fresh raw digest and would reach the ratchet
+                    // and gap-lock the session. The inner-message digest
+                    // is variant-independent and closes it.
+                    if record.message_digest == message_digest {
+                        return Err(LabError::DuplicateMessage);
+                    }
                 }
                 // Session or pre-key establishment must be possible.
                 if current.state.active_session.is_none()
@@ -1181,7 +1202,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     queue_id,
                     message_id,
                     &olm_message,
-                    packet_digest,
+                    identity,
                     expires_at,
                     now,
                 )
@@ -2161,6 +2182,7 @@ fn ratchet_step(
             last_delivered_receipt_high_water: 0,
             receipt_debt_up_to: 0,
             control_debt_up_to: 0,
+            control_signal_response_at: 0,
             conversation_id: candidate.state.conversation_id,
         });
         candidate.session = Some(session);
@@ -2189,6 +2211,16 @@ fn ratchet_step(
     }
 }
 
+/// The two digests an accepted packet carries. The raw `packet_digest`
+/// is what the sender signs, so it stays the envelope and ACK binding;
+/// `message_digest` is the variant-independent inner-Olm-message
+/// identity and is what dedup keys on (review D2b v11, Sol's P1-1).
+#[derive(Clone, Copy)]
+struct PacketIdentity {
+    packet_digest: [u8; 32],
+    message_digest: [u8; 32],
+}
+
 /// Envelope fields carried through the accept record writes.
 struct EnvelopeContext {
     message_id: MessageId,
@@ -2197,6 +2229,8 @@ struct EnvelopeContext {
     queue_id: QueueId,
     packet_digest: [u8; 32],
     expires_at: u64,
+    /// Variant-independent inner-message identity (review D2b v11).
+    message_digest: [u8; 32],
 }
 
 /// The receipt arm of accept: verify, apply §4 acceptance, record dedup.
@@ -2258,7 +2292,7 @@ fn accept_envelope_operation(
     queue_id: QueueId,
     message_id: MessageId,
     olm_message: &OlmMessage,
-    packet_digest: [u8; 32],
+    identity: PacketIdentity,
     expires_at: u64,
     now: u64,
 ) -> Result<AcceptArtifact> {
@@ -2329,8 +2363,9 @@ fn accept_envelope_operation(
         epoch_id,
         send_seq,
         queue_id,
-        packet_digest,
+        packet_digest: identity.packet_digest,
         expires_at,
+        message_digest: identity.message_digest,
     };
     let outcome = match parsed.kind {
         payload::KIND_APPLICATION => {
@@ -2340,7 +2375,7 @@ fn accept_envelope_operation(
                 epoch_id,
                 sender_sequence: send_seq,
                 queue_id,
-                packet_digest,
+                packet_digest: identity.packet_digest,
                 expires_at,
                 accepted_at: now,
                 body,
@@ -2455,6 +2490,7 @@ fn accept_staging_tail(
     signal_seq: u64,
     now: u64,
 ) -> Result<()> {
+    let staged_for_signal;
     {
         let active = candidate
             .state
@@ -2476,11 +2512,29 @@ fn accept_staging_tail(
         // the sequence that carried a truthful congestion report, and
         // arming to the lagging HCR loses the signal permanently once a
         // delayed older receipt advances the marker past it.
-        if issuer_outstanding >= CONTROL_ONLY_THRESHOLD {
+        //
+        // The arm is also RECIPROCITY-GATED (v11, Sol's second P1). The
+        // `any_receipt_pending` guard below bounds only CONCURRENT
+        // responses: once one reached `Stored` the next signal armed
+        // another, and since our own outstanding falls only when the
+        // PEER acknowledges our sends, an authenticated peer streaming
+        // consecutive high signals could walk us one receipt per
+        // delivery cycle into `ReceiptLocked` at 32 outstanding and
+        // block our application sends. So we answer a signal only once
+        // the peer has actually consumed our previous answer — its
+        // reported high water must cover the sequence that answer
+        // occupied. An honest congested peer receipts promptly and is
+        // never throttled; a peer that never reciprocates gets exactly
+        // ONE control receipt no matter how many signals it sends.
+        let reciprocated = active.peer_contiguous_high_water >= active.control_signal_response_at;
+        let peer_signal = issuer_outstanding >= CONTROL_ONLY_THRESHOLD && reciprocated;
+        if peer_signal {
             active.control_debt_up_to = active.control_debt_up_to.max(signal_seq);
         }
         // The local arm answers OUR congestion, so it owes a receipt for
-        // what we have contiguously received: HCR is the right water.
+        // what we have contiguously received: HCR is the right water. It
+        // is deliberately NOT reciprocity-gated — it is the both-stuck
+        // backstop, and it cannot be driven by the peer.
         if congested_at_entry
             || active.last_assigned_send_seq - active.peer_contiguous_high_water
                 >= CONTROL_ONLY_THRESHOLD
@@ -2489,13 +2543,23 @@ fn accept_staging_tail(
                 .control_debt_up_to
                 .max(active.highest_contiguous_received_seq);
         }
+        staged_for_signal = peer_signal;
     }
-    maybe_stage_owed_receipt(candidate, now)?;
+    let staged = maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
         .active_session
         .as_mut()
         .ok_or(LabError::MissingSession)?;
+    // Spend the allowance only when a receipt actually went out for this
+    // signal: the marker is the sequence that answer occupies, and the
+    // next peer-signaled arm waits for the peer's water to cover it.
+    // Marking on ANY staged receipt (not only a control-armed one) is
+    // deliberate — if a receipt went out this pass, the peer got the
+    // answer its signal was asking for.
+    if staged && staged_for_signal {
+        active.control_signal_response_at = active.last_assigned_send_seq;
+    }
     recompute_mode(active);
     Ok(())
 }
@@ -2538,6 +2602,7 @@ fn push_dedup(candidate: &mut Candidate, context: &EnvelopeContext) {
         packet_digest: context.packet_digest,
         expires_at: context.expires_at,
         state: DedupState::Accepted,
+        message_digest: context.message_digest,
     });
     candidate
         .state
