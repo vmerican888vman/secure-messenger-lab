@@ -281,9 +281,9 @@ use crate::persistence::{ClientStateStore, ProtectionLevel, StateKeyProtector};
 use crate::private_store_dir::PrivateStoreDir;
 use crate::state::{
     AckIntent, AckState, ActiveSession, ClientStateV1, DedupRecord, DedupState, HighWaterReceipt,
-    InboundRecord, MAX_ACKS, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET, MAX_SENDS,
-    PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendKind, SendRecord,
-    SendState, SessionMode,
+    InboundRecord, MAX_ACKS, MAX_BODY, MAX_DEDUP, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET,
+    MAX_SENDS, PeerBinding, PeerBundle, PendingPreKey, RegistrationRecord, Role, SendKind,
+    SendRecord, SendState, SessionMode,
 };
 use crate::{EncryptedPacket, LabError, MailboxRegistration, Result};
 
@@ -893,7 +893,6 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     last_delivered_receipt_high_water: 0,
                     receipt_debt_up_to: 0,
                     control_debt_up_to: 0,
-                    control_signal_response_at: 0,
                     conversation_id: candidate.state.conversation_id,
                 });
                 candidate.session = Some(session);
@@ -1186,6 +1185,21 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     if record.message_digest == message_digest {
                         return Err(LabError::DuplicateMessage);
                     }
+                }
+                // Dedup capacity, BEFORE decrypt (review D2b v12, Sol's
+                // P1-2). An accepted packet unconditionally appends a
+                // dedup record, and the codec refuses record 4,097 only
+                // at serialization — after the ratchet has already
+                // advanced on the candidate. The design's rule is
+                // explicit: "While no record is eligible, new inbound
+                // processing blocks before decrypt rather than weakening
+                // replay protection." So refuse here when the set is
+                // full and nothing is reclaimable, exactly as the ACK
+                // bound does in `consume_inbound`.
+                if current.state.dedup.len() >= MAX_DEDUP
+                    && reclaimable_dedup_count(&current.state, now) == 0
+                {
+                    return Err(LabError::Storage);
                 }
                 // Session or pre-key establishment must be possible.
                 if current.state.active_session.is_none()
@@ -2182,7 +2196,6 @@ fn ratchet_step(
             last_delivered_receipt_high_water: 0,
             receipt_debt_up_to: 0,
             control_debt_up_to: 0,
-            control_signal_response_at: 0,
             conversation_id: candidate.state.conversation_id,
         });
         candidate.session = Some(session);
@@ -2305,6 +2318,15 @@ fn accept_envelope_operation(
     sweep_expired_sends(candidate, now)?;
     prune_terminal_sends(candidate, now);
     sweep_expired_acks(candidate, now)?;
+    // Reclaim eligible dedup records before the ratchet runs (review
+    // D2b v12, Sol's P1-2), so a full-but-drainable set does not block
+    // legitimate inbound traffic. The bounds step already refused the
+    // full-and-nothing-eligible case; this is the drain that makes the
+    // refusal temporary rather than permanent.
+    reclaim_dedup(candidate, now);
+    if candidate.state.dedup.len() >= MAX_DEDUP {
+        return Err(LabError::Storage);
+    }
     // Congestion sample for the control-debt arm (review D2b v6, codec
     // field 21), taken at accept ENTRY before the ratchet step: a
     // receipt that drains its own sender's budget inside THIS accept
@@ -2490,7 +2512,6 @@ fn accept_staging_tail(
     signal_seq: u64,
     now: u64,
 ) -> Result<()> {
-    let staged_for_signal;
     {
         let active = candidate
             .state
@@ -2513,21 +2534,29 @@ fn accept_staging_tail(
         // arming to the lagging HCR loses the signal permanently once a
         // delayed older receipt advances the marker past it.
         //
-        // The arm is also RECIPROCITY-GATED (v11, Sol's second P1). The
+        // OPEN, and deliberately so as of v13 (Sol's v12 P1-1). This arm
+        // is UNBOUNDED over a session's lifetime: the
         // `any_receipt_pending` guard below bounds only CONCURRENT
-        // responses: once one reached `Stored` the next signal armed
-        // another, and since our own outstanding falls only when the
-        // PEER acknowledges our sends, an authenticated peer streaming
-        // consecutive high signals could walk us one receipt per
-        // delivery cycle into `ReceiptLocked` at 32 outstanding and
-        // block our application sends. So we answer a signal only once
-        // the peer has actually consumed our previous answer — its
-        // reported high water must cover the sequence that answer
-        // occupied. An honest congested peer receipts promptly and is
-        // never throttled; a peer that never reciprocates gets exactly
-        // ONE control receipt no matter how many signals it sends.
-        let reciprocated = active.peer_contiguous_high_water >= active.control_signal_response_at;
-        let peer_signal = issuer_outstanding >= CONTROL_ONLY_THRESHOLD && reciprocated;
+        // responses, so a peer streaming high signals extracts roughly
+        // one receipt per delivery cycle, and because receipts share the
+        // application send counter that walks our own outstanding toward
+        // `ReceiptLocked`.
+        //
+        // The v12 reciprocity gate that tried to bound it — answer a
+        // signal only once `peer_contiguous_high_water` covers our last
+        // answer — was REVERTED here: it deadlocks an honest peer. An
+        // UNCONGESTED peer has no reason to counter-receipt, and
+        // receipt-only acceptance creates no receipt debt by design (the
+        // v5 quiescence property), so the gate can latch shut forever
+        // against a peer that has done nothing wrong. Gating on our OWN
+        // congestion instead does not work either: above the threshold
+        // the ungated LOCAL arm takes over and continues the escalation.
+        //
+        // Bounding this needs a §4 decision about whether control
+        // receipts may share the application send budget, not another
+        // local guard. See the v13 note in
+        // `reviews/PROMPT-independent-phase2-facade-d2b.md`.
+        let peer_signal = issuer_outstanding >= CONTROL_ONLY_THRESHOLD;
         if peer_signal {
             active.control_debt_up_to = active.control_debt_up_to.max(signal_seq);
         }
@@ -2543,23 +2572,13 @@ fn accept_staging_tail(
                 .control_debt_up_to
                 .max(active.highest_contiguous_received_seq);
         }
-        staged_for_signal = peer_signal;
     }
-    let staged = maybe_stage_owed_receipt(candidate, now)?;
+    maybe_stage_owed_receipt(candidate, now)?;
     let active = candidate
         .state
         .active_session
         .as_mut()
         .ok_or(LabError::MissingSession)?;
-    // Spend the allowance only when a receipt actually went out for this
-    // signal: the marker is the sequence that answer occupies, and the
-    // next peer-signaled arm waits for the peer's water to cover it.
-    // Marking on ANY staged receipt (not only a control-armed one) is
-    // deliberate — if a receipt went out this pass, the peer got the
-    // answer its signal was asking for.
-    if staged && staged_for_signal {
-        active.control_signal_response_at = active.last_assigned_send_seq;
-    }
     recompute_mode(active);
     Ok(())
 }
@@ -2590,6 +2609,66 @@ fn track_sender_sequence(active: &mut ActiveSession, send_seq: u64) -> Result<()
         active.received_above_high_water.sort_unstable();
     }
     Ok(())
+}
+
+/// Whether a dedup record may be reclaimed (review D2b v12, Sol's P1-2).
+///
+/// The frozen rule (`docs/persistence-spike-design.md`, "Bounded
+/// capacity and backpressure"): a record with no pending body/ACK
+/// reference becomes eligible by exactly one of two paths — (a) at least
+/// seven days after the observed `Deleted`/`AlreadyDeleted`, which is
+/// what `DedupState::Acked` records, and after message expiry; or (b)
+/// when the ACK became terminal solely because message retention
+/// expired, which is what `DedupState::Expired` records, at least seven
+/// days after that signed expiry. Both reduce to the same test because
+/// the state itself records which path was taken. `Accepted` is never
+/// reclaimable — that envelope is still live.
+///
+/// Why reclaiming does not weaken replay protection: the only party who
+/// can re-present a reclaimed packet is one holding our mailbox SEND
+/// capability, because the outer envelope must carry a fresh valid
+/// signature over `(queue, message_id, packet_digest, expires_at)`. That
+/// party is the peer, and per §4 a peer-authenticated gap failure is
+/// designed behaviour — it can already drive the session to
+/// `RekeyRequired` at will with a fresh message past the chain gap,
+/// without any replay. So reclamation grants no capability the peer
+/// lacks. A relay, which holds no send capability, cannot re-present
+/// anything.
+fn dedup_reclaimable(
+    inbound: &[InboundRecord],
+    acks: &[AckIntent],
+    record: &DedupRecord,
+    now: u64,
+) -> bool {
+    record.state != DedupState::Accepted
+        && record.expires_at.saturating_add(TOMBSTONE_TTL_SECONDS) <= now
+        && !inbound
+            .iter()
+            .any(|pending| pending.message_id == record.message_id)
+        && !acks.iter().any(|ack| ack.message_id == record.message_id)
+}
+
+/// How many dedup records are reclaimable right now, without mutating.
+/// Used by the pre-decrypt bounds check, which runs on the authoritative
+/// state before any candidate exists.
+fn reclaimable_dedup_count(state: &ClientStateV1, now: u64) -> usize {
+    state
+        .dedup
+        .iter()
+        .filter(|record| dedup_reclaimable(&state.inbound, &state.acks, record, now))
+        .count()
+}
+
+/// Drop every reclaimable dedup record, freeing capacity for new inbound
+/// work. `retain` preserves order, so the sorted-by-message-ID invariant
+/// survives.
+fn reclaim_dedup(candidate: &mut Candidate, now: u64) {
+    let state = &mut candidate.state;
+    let inbound = &state.inbound;
+    let acks = &state.acks;
+    state
+        .dedup
+        .retain(|record| !dedup_reclaimable(inbound, acks, record, now));
 }
 
 /// Insert a dedup record (`Accepted`), keeping the array sorted.

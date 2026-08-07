@@ -1,5 +1,94 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## v13 — ONE FIX, ONE OPEN DESIGN QUESTION. DO NOT DISPATCH A REVIEW YET.
+
+Version 12 (head `5dbcca7`): Fable PASS, Sol RETURN with two P1s. **Only
+one of them is fixed here, deliberately.** This head is not a candidate
+for a PASS and should not be sent to reviewers until the open question
+below is decided.
+
+### Fixed: dedup capacity backpressure and reclamation (Sol's v12 P1-2)
+
+Accepted packets appended a dedup record unconditionally; the codec
+refused record 4,097 only at serialization, after the ratchet had already
+advanced on the candidate; and ACK completion only marked a record
+`Acked`, never removing it. So at 4,096 records inbound closed
+permanently. This violated the frozen rule in
+`docs/persistence-spike-design.md`. Now:
+
+- `dedup_reclaimable` implements the documented two-path eligibility.
+  Both paths reduce to the same test because `DedupState` records which
+  path was taken: `Acked` is path (a) (observed `Deleted`/
+  `AlreadyDeleted`), `Expired` is path (b) (ACK terminal solely because
+  retention expired), each requiring seven days past the signed message
+  expiry and no pending inbound/ACK reference. `Accepted` is never
+  reclaimable.
+- `reclaim_dedup` runs in the accept mutator alongside the existing
+  sweeps, before the ratchet step.
+- The bounds closure refuses before decrypt when the set is full and
+  nothing is eligible, mirroring the existing ACK-bound precedent — the
+  design's "blocks before decrypt rather than weakening replay
+  protection".
+
+Reclaiming does not weaken replay protection: re-presenting a reclaimed
+packet requires a fresh valid signature under our mailbox SEND
+capability, so only the peer can do it — and per §4 a peer-authenticated
+gap failure is designed behaviour that the peer can trigger at will with
+a fresh message past the chain gap, with no replay at all. A relay holds
+no send capability and cannot re-present anything.
+
+Regression: `full_dedup_set_blocks_before_decrypt_then_drains`. Its
+drain half fails at the parent. Its refusal half asserts the outcome and
+does not by itself distinguish pre-decrypt refusal from the parent's
+post-decrypt encode failure — stated in the test docs rather than
+overclaimed.
+
+### OPEN: bounding the peer-signaled control arm (Sol's v12 P1-1)
+
+**The v12 reciprocity gate is REVERTED, and field 22 with it** (the
+session object is back to 21 fields). Sol's repro is correct and the
+mechanism was wrong: an UNCONGESTED peer has no reason to counter-receipt
+and receipt-only acceptance creates no receipt debt by design (the v5
+quiescence property), so a gate keyed on the peer acknowledging our
+answer can latch shut forever against a peer that has done nothing wrong.
+An honest-peer deadlock is worse than the bounded DoS it replaced, so the
+tree is back to v11 behaviour on this arm — which still carries Sol's v11
+P1-2. `over_signaling_cannot_lock_the_victim` is retained as the
+acceptance criterion and marked `#[ignore]` with that reason. It must
+pass on its own terms; it must not be weakened.
+
+**Why this needs a §4 decision rather than another local guard.** The
+root cause is that `outstanding = last_assigned_send_seq -
+peer_contiguous_high_water` counts ALL sends, so every control receipt we
+emit spends application budget. That makes any peer-driven receipt
+emission an amplification lever. Every local bound fails for a structural
+reason:
+
+- Gating on the peer acknowledging our answer → deadlocks an honest,
+  uncongested peer (v12, reproduced by Sol).
+- Gating on our own congestion → above the threshold the ungated LOCAL
+  arm takes over and continues the escalation to `ReceiptLocked`, so the
+  bound is bypassed in two stages rather than one.
+- Bounding concurrent responses only → v11, defeated by completing the
+  delivery cycle.
+
+Three rounds have now failed on this arm for the same underlying reason.
+The candidate directions, all of which change frozen §4 text:
+
+1. **Control receipts stop sharing the application budget** — exclude
+   receipt-kind sends from `outstanding`, or give them a separate
+   reclaimable lane. This removes the lever entirely and is the direction
+   this note recommends.
+2. **Cap peer-signal responses per epoch** with rebootstrap as the reset,
+   accepting that a peer can burn the cap and then lose the signal.
+3. **Drop the peer-signal arm**, keeping only the local arm and accepting
+   the one-directional stall it was introduced to fix.
+
+Whoever owns the §4 decision should pick before any further
+implementation. The implementer changed hands at v11 (Kimi wrote v1–v10,
+Opus v11+); the arm has been returned in v6, v7, v8, v9, v10, v11 and
+v12, which is a design signal, not an implementation one.
+
 ## Remediation history (v12)
 
 Version 11 (head `b3825fa30980c797dfad4de3d1a4729c132f3506`): Fable PASS

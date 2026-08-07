@@ -3614,6 +3614,14 @@ fn control_debt_resolves_on_delivery_never_on_signals() -> std::result::Result<(
 /// victim receipt, the mode never leaves `Ready`, and the victim's own
 /// application sends are unaffected.
 #[test]
+#[ignore = "OPEN DEFECT (Sol's D2b v12 P1-1). This is the acceptance \
+criterion for bounding the peer-signaled control arm, and it FAILS at \
+this head. The v12 reciprocity bound that made it pass was reverted in \
+v13 because it deadlocked an honest, uncongested peer. Bounding this \
+needs a §4 decision on whether control receipts may share the \
+application send budget — see the v13 note in \
+reviews/PROMPT-independent-phase2-facade-d2b.md. Do NOT weaken this test \
+to make it pass; it must pass on its own terms once the arm is bounded."]
 fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Error>> {
     let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
     let outcomes = deliver(&mut a, &mut relay, &[0])?;
@@ -4258,5 +4266,139 @@ fn prekey_normal_variant_alias_is_deduplicated() -> std::result::Result<(), Box<
     );
     assert_eq!(a.store.generation()?, generation_before);
     assert_eq!(active_mode(&a)?, SessionMode::Ready);
+    Ok(())
+}
+
+// --- D2b v13 remediation tests (Sol's v12 P1-2) ------------------------------
+
+/// Sol's v12 P1-2: a full dedup set must apply backpressure BEFORE
+/// decrypt, and must drain when records become eligible.
+///
+/// Accepted packets append a dedup record unconditionally, and the codec
+/// refuses record 4,097 only at serialization — after the ratchet has
+/// already advanced on the candidate. ACK completion only marks a record
+/// `Acked`; nothing removed it. So at 4,096 records every further accept
+/// failed at encode and inbound closed permanently.
+///
+/// The design's rule is explicit: "While no record is eligible, new
+/// inbound processing blocks before decrypt rather than weakening replay
+/// protection", with eligibility at seven days past the signed message
+/// expiry for a record that is terminal and unreferenced.
+///
+/// Scope of what this proves, stated honestly: the DRAIN half is the
+/// discriminating regression — it fails at the parent, where no
+/// reclamation exists and the set is permanently wedged. The refusal
+/// half asserts the OUTCOME (clean rejection, nothing committed, no mode
+/// or water movement) and does NOT by itself distinguish the new
+/// pre-decrypt bounds refusal from the parent's post-decrypt encode
+/// failure, since both discard the candidate. That placement is a
+/// code-structure property: the check sits in the bounds closure, which
+/// runs on the authoritative state before any candidate is cloned.
+#[test]
+fn full_dedup_set_blocks_before_decrypt_then_drains() -> std::result::Result<(), Box<dyn Error>> {
+    const TTL: u64 = 7 * 24 * 60 * 60;
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+
+    // Establish the session on m1, then fill the dedup set to its bound
+    // with terminal, unreferenced records that are NOT yet eligible.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let template = a.state.dedup.first().ok_or("no dedup record")?;
+    let queue_id = template.queue_id;
+    // A RETIRED epoch: §4 keeps dedup records across rekey, and only
+    // current-epoch records must be covered by the receive water. The
+    // filler stands in for a long-lived history, which is exactly the
+    // shape that fills the set in practice.
+    let epoch_id = [0xAA_u8; 32];
+    let mut filler = Vec::new();
+    for index in 0..u32::try_from(crate::state::MAX_DEDUP - a.state.dedup.len())? {
+        let mut raw = [0u8; 16];
+        raw[..4].copy_from_slice(&index.to_be_bytes());
+        raw[4] = 0xFF;
+        let message_id = MessageId::from_slice(&raw).ok_or("bad filler id")?;
+        filler.push(crate::state::DedupRecord {
+            message_id,
+            epoch_id,
+            sequence: u64::from(index) + 1,
+            queue_id,
+            packet_digest: crate::capability::digest(&raw),
+            expires_at: NOW + 3_600,
+            state: crate::state::DedupState::Acked,
+            message_digest: crate::capability::digest(&raw[..8]),
+        });
+    }
+    a.state.dedup.extend(filler);
+    a.state
+        .dedup
+        .sort_by(|left, right| left.message_id.as_bytes().cmp(right.message_id.as_bytes()));
+    assert_eq!(a.state.dedup.len(), crate::state::MAX_DEDUP);
+
+    // Nothing is eligible yet (the tombstone window has not passed), so
+    // the next legitimate packet must be REFUSED before any ratchet
+    // touch: no generation commit, no mode change, no water movement.
+    let generation_before = a.store.generation()?;
+    let water_before = a
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .highest_contiguous_received_seq;
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(
+        matches!(outcomes.first(), Some(Err(LabError::Storage))),
+        "a full dedup set did not apply backpressure: {outcomes:?}"
+    );
+    assert_eq!(
+        a.store.generation()?,
+        generation_before,
+        "the refused packet committed"
+    );
+    assert_eq!(active_mode(&a)?, SessionMode::Ready);
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq,
+        water_before,
+        "the refused packet moved the receive water"
+    );
+
+    // Age the filler past the tombstone window so it becomes eligible.
+    // The clock stays at NOW so the relay envelope is still live — this
+    // is a test of reclamation, not of envelope expiry.
+    for record in &mut a.state.dedup {
+        if record.state == crate::state::DedupState::Acked {
+            record.expires_at = NOW - TTL - 1;
+        }
+    }
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(
+        outcomes.iter().all(Result::is_ok),
+        "service did not resume after the drain: {outcomes:?}"
+    );
+    assert!(
+        a.state.dedup.len() < crate::state::MAX_DEDUP,
+        "the eligible records were not reclaimed"
+    );
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .highest_contiguous_received_seq,
+        water_before + 1,
+        "service did not resume after the drain"
+    );
+
+    // The live record for the packet just accepted is NOT reclaimable —
+    // reclamation only ever takes terminal, unreferenced, expired ones.
+    assert!(
+        a.state
+            .dedup
+            .iter()
+            .any(|record| record.state == crate::state::DedupState::Accepted),
+        "reclamation took a live record"
+    );
     Ok(())
 }

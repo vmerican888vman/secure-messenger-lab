@@ -425,27 +425,11 @@ impl HighWaterReceipt {
 /// peer-signaled arm binds to the signaling packet's sequence, which
 /// under reordering legitimately sits above the contiguous water.
 ///
-/// **Wire-layout amendment (review D2b v11):** field 22,
-/// `control_signal_response_at: u64`, is our own `last_assigned_send_seq`
-/// as of the last receipt we issued in response to a PEER-SIGNALED
-/// congestion report; 0 = never responded. It exists to bound that
-/// response persistently. The v11 `any_receipt_pending` guard bounded
-/// only CONCURRENT responses: once a response reached `Stored` the next
-/// signal armed another, so an authenticated peer sending consecutive
-/// high signals could drive the victim one receipt per delivery cycle
-/// into `ReceiptLocked` at 32 outstanding, blocking its application
-/// sends. Our outstanding only falls when the PEER acknowledges our
-/// sends, so the durable bound is reciprocity: the peer-signaled arm
-/// fires only while `peer_contiguous_high_water >=
-/// control_signal_response_at`, i.e. only once the peer has actually
-/// consumed the previous response. An honest congested peer receipts
-/// promptly and is never throttled; a peer that never reciprocates gets
-/// exactly ONE control receipt however many signals it sends. The LOCAL
-/// congestion arm is deliberately NOT gated — it answers our own
-/// congestion and is the both-stuck backstop. Validation:
-/// `control_signal_response_at <= last_assigned_send_seq` — we cannot
-/// have responded at a sequence we never assigned. The object declares
-/// 22 fields.
+/// **v13 note:** a field 22 (`control_signal_response_at`) was added in
+/// v12 to bound peer-signaled control responses and REVERTED in v13 — it
+/// deadlocked an honest, uncongested peer. The object declares 21
+/// fields. Bounding that arm is an OPEN §4 question; see the v13 note in
+/// `reviews/PROMPT-independent-phase2-facade-d2b.md`.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -476,10 +460,6 @@ pub(crate) struct ActiveSession {
     /// congestion (local or peer-signaled) has armed to date; 0 = none.
     /// Monotone on the wire; resolved only by confirmed delivery.
     pub(crate) control_debt_up_to: u64,
-    /// Our own send sequence as of the last peer-signal-driven receipt
-    /// (field 22); 0 = never responded. Gates the peer-signaled arm on
-    /// the peer having acknowledged that response.
-    pub(crate) control_signal_response_at: u64,
 }
 
 impl ActiveSession {
@@ -513,7 +493,6 @@ impl ActiveSession {
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         let receipt_debt_up_to = u64_value(object.field(20)?)?;
         let control_debt_up_to = u64_value(object.field(21)?)?;
-        let control_signal_response_at = u64_value(object.field(22)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -533,7 +512,6 @@ impl ActiveSession {
             last_delivered_receipt_high_water,
             receipt_debt_up_to,
             control_debt_up_to,
-            control_signal_response_at,
         })
     }
 
@@ -557,7 +535,6 @@ impl ActiveSession {
             self.last_delivered_receipt_high_water.to_be_bytes();
         let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
         let control_debt_up_to = self.control_debt_up_to.to_be_bytes();
-        let control_signal_response_at = self.control_signal_response_at.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -582,7 +559,6 @@ impl ActiveSession {
                 (19, &last_delivered_receipt_high_water),
                 (20, &receipt_debt_up_to),
                 (21, &control_debt_up_to),
-                (22, &control_signal_response_at),
             ],
         )?;
         Ok(Zeroizing::new(object))

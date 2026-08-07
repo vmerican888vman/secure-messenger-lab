@@ -672,12 +672,6 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     {
         return Err(LabError::Storage);
     }
-    // Review D2b v11 (field 22): the peer-signal response marker records
-    // one of OUR OWN send sequences, so it can never exceed the highest
-    // sequence we ever assigned (0 = never responded).
-    if active.control_signal_response_at > active.last_assigned_send_seq {
-        return Err(LabError::Storage);
-    }
     Ok(())
 }
 

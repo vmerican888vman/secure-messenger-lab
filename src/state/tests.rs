@@ -316,7 +316,6 @@ fn make_active_session(
         last_delivered_receipt_high_water: 1,
         receipt_debt_up_to: 0,
         control_debt_up_to: 0,
-        control_signal_response_at: 0,
     })
 }
 
