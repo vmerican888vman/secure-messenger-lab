@@ -653,10 +653,23 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     {
         return Err(LabError::Storage);
     }
-    // Review D2b v9 (field 21, retyped): the control-debt water may not
-    // exceed the contiguous received high water — no congestion can have
-    // been armed for water never received (0 = none).
-    if active.control_debt_up_to > active.highest_contiguous_received_seq {
+    // Review D2b v9/v10 (field 21, retyped): the control-debt water must
+    // be a sequence we have genuinely RECEIVED — no congestion can be
+    // armed for water never received (0 = none). Since v10 (Sol's P1-2)
+    // the peer-signaled arm binds the debt to the SIGNALING PACKET's
+    // sender sequence, which under reordering legitimately sits above
+    // the contiguous water while it waits in the bounded out-of-order
+    // set. So the admissible positions are exactly the two that mean
+    // "received": at or below the contiguous high water, or present in
+    // `received_above_high_water`. This mirrors the `receipt_debt_up_to`
+    // rule above. Anything else is a water for a packet that was never
+    // accepted, and is malformed.
+    if active.control_debt_up_to != 0
+        && active.control_debt_up_to > active.highest_contiguous_received_seq
+        && !active
+            .received_above_high_water
+            .contains(&active.control_debt_up_to)
+    {
         return Err(LabError::Storage);
     }
     Ok(())

@@ -1089,6 +1089,24 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         now: u64,
     ) -> Result<AcceptOutcome> {
         let packet_digest = packet.digest();
+        // The `MAX_PACKET` bound is re-checked here, ahead of the
+        // canonical parse below, so an oversized packet is still
+        // rejected before anything parses it — the in-transaction bounds
+        // check (which stays, and is the authoritative one) would
+        // otherwise now run after the parse.
+        if packet.as_bytes().len() > MAX_PACKET {
+            return Err(LabError::InvalidPayload);
+        }
+        // (a0) Canonical Olm encoding, BEFORE the transaction (review
+        // D2b v10, Sol's P1-1). The raw-byte digest computed above is
+        // the dedup identity, so admitting two byte-different encodings
+        // of the SAME Olm message would let an already-accepted packet
+        // re-enter under a fresh digest and gap-lock the session. This
+        // gate makes the encoding unique, so the raw digest is the
+        // semantic identity. It touches no session state, so hoisting it
+        // above the signature check leaks nothing (see
+        // `EncryptedPacket::parse_canonical`).
+        let olm_message = packet.parse_canonical()?;
         let artifact = self.mutate(
             |current| {
                 // Inbound lock (review D2b v8 P1-1): once the session is
@@ -1162,7 +1180,7 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     candidate,
                     queue_id,
                     message_id,
-                    &packet,
+                    &olm_message,
                     packet_digest,
                     expires_at,
                     now,
@@ -2239,7 +2257,7 @@ fn accept_envelope_operation(
     candidate: &mut Candidate,
     queue_id: QueueId,
     message_id: MessageId,
-    packet: &EncryptedPacket,
+    olm_message: &OlmMessage,
     packet_digest: [u8; 32],
     expires_at: u64,
     now: u64,
@@ -2267,10 +2285,11 @@ fn accept_envelope_operation(
             active.last_assigned_send_seq - active.peer_contiguous_high_water
                 >= CONTROL_ONLY_THRESHOLD
         });
-    // (d) Decode the Olm message and establish or advance the ratchet.
-    let olm_message: OlmMessage =
-        serde_json::from_slice(packet.as_bytes()).map_err(|_| LabError::Encoding)?;
-    let plaintext = match ratchet_step(candidate, &olm_message, now)? {
+    // (d) Establish or advance the ratchet. The Olm message was decoded
+    // and canonicality-checked by the caller before the transaction
+    // opened (review D2b v10, Sol's P1-1), so no non-canonical encoding
+    // can reach here.
+    let plaintext = match ratchet_step(candidate, olm_message, now)? {
         RatchetStep::Plaintext(plaintext) => plaintext,
         RatchetStep::GapFailure => return Ok(AcceptArtifact::GapFailure),
     };
@@ -2350,15 +2369,17 @@ fn accept_envelope_operation(
     // moves a high water and stages; every other stager recomputes from
     // values it just set itself.
     //
-    // Control debt (review D2b v6/v7, codec field 21): the flag arms on
+    // Control debt (review D2b v6/v7, codec field 21): the water arms on
     // EITHER congestion source — the local sample (acceptor's own
-    // outstanding at accept ENTRY or END) or the peer signal (the
-    // just-accepted payload's `issuer_outstanding` at or above the
-    // threshold). See `accept_staging_tail`.
+    // outstanding at accept ENTRY or END, arming to HCR) or the peer
+    // signal (the just-accepted payload's `issuer_outstanding` at or
+    // above the threshold, arming to THIS packet's sender sequence per
+    // v10 / Sol's P1-2). See `accept_staging_tail`.
     accept_staging_tail(
         candidate,
         congested_at_entry,
         parsed.issuer_outstanding,
+        send_seq,
         now,
     )?;
     Ok(AcceptArtifact::Outcome(outcome))
@@ -2389,19 +2410,38 @@ fn accept_envelope_operation(
 /// just-accepted payload's `issuer_outstanding` at or above the
 /// threshold) are applied BEFORE the owed-staging attempt, so debt
 /// armed by THIS accept flushes in the SAME pass (v8 P1-3b). Arming
-/// RAISES the water to the current HCR via `max`; nothing on the wire
-/// ever lowers or clears it (v9 finding 2: reordered truthful low
-/// signals cannot erase a later arm, and no signal-freshness versioning
-/// is needed — the water is monotone and resolution is a
-/// water-versus-water comparison). Resolution happens only through
-/// confirmed delivery: debt stands while `control_debt_up_to` exceeds
-/// the delivered marker (v9 finding 4: a delayed `Stored` on an older
-/// receipt leaves newer debt standing). The peer signal remains
-/// informational only: a stale out-of-order payload can over-arm, which
-/// costs at most one idempotent receipt (bounded by the any-pending
-/// guard, v8 P1-4, and one-staged-per-pass) — over-arming is harmless;
-/// under-arming is the dangerous direction and cannot come from a
-/// truthful signal. The LOCAL sample stays as the backstop for the
+/// RAISES the water via `max`; nothing on the wire ever lowers or clears
+/// it (v9 finding 2: reordered truthful low signals cannot erase a later
+/// arm, and no signal-freshness versioning is needed — the water is
+/// monotone and resolution is a water-versus-water comparison).
+/// Resolution happens only through confirmed delivery: debt stands while
+/// `control_debt_up_to` exceeds the delivered marker (v9 finding 4: a
+/// delayed `Stored` on an older receipt leaves newer debt standing).
+///
+/// The two arms raise the water to DIFFERENT values, and this is the
+/// v10 correction (Sol's P1-2). The LOCAL arm answers our own
+/// congestion, so the receipt we owe is one covering what we have
+/// actually received contiguously: it raises to HCR. The PEER-SIGNALED
+/// arm answers the PEER's congestion as of the sequence that carried the
+/// signal, so it raises to that packet's `send_seq` — NOT to HCR. Under
+/// reordering those differ: a truthful `issuer_outstanding >= 24` riding
+/// sequence 25 that arrives while HCR is still 1 must record debt at 25,
+/// because only a receipt covering 25 drains the peer. Arming to HCR
+/// instead recorded a prematurely LOW water (1); a delayed older receipt
+/// then advanced the delivered marker past it, the debt read as
+/// resolved, and when the missing packets later drained HCR to 25 no
+/// receipt was owed — leaving the peer permanently `ControlOnly` at 24
+/// outstanding. The signaling sequence is either already contiguous or
+/// sitting in the bounded out-of-order set (`track_sender_sequence` ran
+/// first and rejected duplicates), so the debt water is always a
+/// sequence we have genuinely received; `check_session_waters` permits
+/// exactly that pair of positions.
+///
+/// The peer signal remains informational: a stale out-of-order payload
+/// can over-arm, which costs at most one idempotent receipt (bounded by
+/// the any-pending guard, v8 P1-4, and one-staged-per-pass) —
+/// over-arming is harmless; under-arming is the dangerous direction and
+/// is what P1-2 was. The LOCAL sample stays as the backstop for the
 /// both-stuck corner (the peer locked with all its receipts expired
 /// undelivered, so no signal is on the wire: the other side eventually
 /// congests locally and raises its water at its next accept). The
@@ -2412,6 +2452,7 @@ fn accept_staging_tail(
     candidate: &mut Candidate,
     congested_at_entry: bool,
     issuer_outstanding: u64,
+    signal_seq: u64,
     now: u64,
 ) -> Result<()> {
     {
@@ -2423,16 +2464,24 @@ fn accept_staging_tail(
         recompute_mode(active);
         // Arm FIRST (v8 P1-3b, v9 water model): the staging attempt
         // below sees the debt this accept raised, so newly armed debt
-        // flushes in this same pass. Arming on either source (local
-        // entry/end congestion, peer signal) RAISES the control-debt
-        // water to the current HCR via `max` — it is NEVER cleared or
-        // lowered by anything on the wire (v9 finding 2: reordered
-        // truthful low signals cannot erase a later arm, and no
-        // signal-freshness versioning is needed — the water is monotone
-        // and resolution is a water-versus-water comparison, not a
-        // recency contest).
-        if issuer_outstanding >= CONTROL_ONLY_THRESHOLD
-            || congested_at_entry
+        // flushes in this same pass. Arming RAISES the control-debt
+        // water via `max` — it is NEVER cleared or lowered by anything
+        // on the wire (v9 finding 2: reordered truthful low signals
+        // cannot erase a later arm; the water is monotone and
+        // resolution is a water-versus-water comparison, not a recency
+        // contest).
+        //
+        // The peer-signaled arm binds to the SIGNALING PACKET's sequence
+        // (v10, Sol's P1-2): under reordering, HCR can lag far behind
+        // the sequence that carried a truthful congestion report, and
+        // arming to the lagging HCR loses the signal permanently once a
+        // delayed older receipt advances the marker past it.
+        if issuer_outstanding >= CONTROL_ONLY_THRESHOLD {
+            active.control_debt_up_to = active.control_debt_up_to.max(signal_seq);
+        }
+        // The local arm answers OUR congestion, so it owes a receipt for
+        // what we have contiguously received: HCR is the right water.
+        if congested_at_entry
             || active.last_assigned_send_seq - active.peer_contiguous_high_water
                 >= CONTROL_ONLY_THRESHOLD
         {

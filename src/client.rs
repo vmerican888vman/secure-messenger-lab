@@ -128,6 +128,54 @@ impl EncryptedPacket {
     pub fn digest(&self) -> [u8; 32] {
         digest(&self.0)
     }
+
+    /// Parse the packet as an Olm message, rejecting any encoding that is
+    /// not the exact canonical one.
+    ///
+    /// Review D2b v10 (Sol's P1-1). `digest` hashes the RAW bytes, and
+    /// that raw digest is the dedup identity as well as what the sender
+    /// signs over in the outer envelope. But `OlmMessage`'s deserializer
+    /// is permissive: it ignores unknown JSON fields, accepts any field
+    /// order and any whitespace, and `base64_decode` accepts padding
+    /// variants — and the inner Olm binary decoder likewise accepts
+    /// non-canonical framings. So the same decrypted message has many
+    /// byte encodings, each with a different digest. Without this gate a
+    /// previously accepted packet could be re-encapsulated under a fresh
+    /// message ID and a fresh valid signature, slip past global digest
+    /// dedup on its new digest, and reach ratchet `decrypt` — where it
+    /// returns `MissingMessageKey` and durably commits `RekeyRequired`,
+    /// closing the conversation.
+    ///
+    /// Requiring byte-exact canonical form collapses that whole aliasing
+    /// class at the boundary: one Olm message has exactly one acceptable
+    /// encoding, so the raw digest IS the semantic identity and dedup
+    /// needs no second digest (and the persisted state layout is
+    /// untouched). Re-serializing the DECODED value and comparing bytes
+    /// is the check — it rejects ignored fields, reordering, whitespace,
+    /// base64 padding variants, and non-canonical inner framing in one
+    /// step. Legitimate traffic is unaffected: senders produce packets
+    /// with exactly this `serde_json::to_vec(&OlmMessage)` encoding
+    /// (`OlmClient::encrypt`), so a genuine packet round-trips
+    /// byte-identically.
+    ///
+    /// This is a pure function of the packet bytes — it reads no session
+    /// state — so running it before the envelope-signature check gives an
+    /// unauthenticated sender no oracle over our state.
+    ///
+    /// # Errors
+    ///
+    /// [`LabError::Encoding`] if the bytes are not a decodable Olm
+    /// message, [`LabError::InvalidPayload`] if they decode but are not
+    /// the canonical encoding of what they decode to.
+    pub(crate) fn parse_canonical(&self) -> Result<OlmMessage> {
+        let message: OlmMessage =
+            serde_json::from_slice(&self.0).map_err(|_| LabError::Encoding)?;
+        let canonical_bytes = serde_json::to_vec(&message).map_err(|_| LabError::Encoding)?;
+        if canonical_bytes != self.0 {
+            return Err(LabError::InvalidPayload);
+        }
+        Ok(message)
+    }
 }
 
 impl std::fmt::Debug for EncryptedPacket {

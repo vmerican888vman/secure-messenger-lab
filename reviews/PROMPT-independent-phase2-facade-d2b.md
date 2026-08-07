@@ -1,5 +1,78 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v11)
+
+Version 10 (head `dad8bcc5fbb2c3e2014190b1aef1a83345b13f08`): Fable PASS
+(`reviews/REVIEW-fable-facade-d2b-v10.md`), Sol RETURN with two P1
+blockers (`reviews/REVIEW-sol-facade-d2b-v10.md`), both fixed in the head
+under review. Note for this round: the implementer changed hands at v11 —
+Kimi K3 wrote v1–v10, this remediation is Opus's. The review contract is
+unchanged.
+
+1. **Canonical Olm encoding is enforced at the boundary** (Sol's P1-1).
+   `EncryptedPacket::digest` hashes RAW bytes and that raw digest is both
+   the dedup identity and what the sender signs, but the `OlmMessage`
+   deserializer is permissive — ignored unknown fields, any field order,
+   any whitespace, base64 padding variants, non-canonical inner framing.
+   The same message therefore had many encodings, each with a different
+   digest, so an accepted packet could be re-encapsulated under a fresh
+   ID and a fresh valid signature, miss dedup on its new digest, and
+   reach the ratchet. `EncryptedPacket::parse_canonical` now decodes the
+   packet and requires it to be byte-identical to the re-serialization of
+   what it decoded to; `accept_envelope` calls it BEFORE the transaction
+   opens, so no alias reaches dedup or the ratchet. Of the two closures
+   Sol offered, this is the first: making the encoding unique means the
+   raw digest IS the semantic identity, so no second dedup digest is
+   needed and the persisted `ClientStateV1` layout is untouched. The
+   check is a pure function of the packet bytes and reads no session
+   state, so running it ahead of the signature check gives an
+   unauthenticated sender no oracle. The `MAX_PACKET` bound is re-checked
+   ahead of it so oversized input is still rejected before any parse; the
+   in-transaction bounds check remains authoritative.
+2. **Peer-signaled control debt binds to the signaling sequence** (Sol's
+   P1-2). `accept_staging_tail` took a single arm that raised the debt to
+   HCR. It is now split: the LOCAL arm still raises to HCR (it answers
+   our own congestion, so it owes a receipt for what we contiguously
+   received), while the PEER-SIGNALED arm raises to the accepted
+   payload's `send_seq`. Under reordering those differ, and that gap was
+   the bug. `check_session_waters` correspondingly permits a debt water
+   that sits in `received_above_high_water`, mirroring the existing
+   `receipt_debt_up_to` rule — the admissible positions are exactly the
+   two that mean "received".
+
+Both fixes carry regression tests that were confirmed to FAIL against
+`dad8bcc` and pass at this head:
+
+- `json_aliased_packet_replay_is_rejected_before_dedup` builds three
+  genuine aliases of an accepted packet (reordered keys, added
+  whitespace, an ignored extra field), proves each decodes to the same
+  `OlmMessage` and carries a different digest, then requires each to be
+  rejected as `InvalidPayload` with no generation commit, the mode still
+  `Ready`, and the receive water unmoved. Pre-fix the first alias
+  returned `Err(Crypto)` — i.e. it had already passed dedup and reached
+  ratchet `decrypt`, which is the bypass. (The test demonstrates the
+  bypass reaching the ratchet; whether a given alias then produces a
+  durable `RekeyRequired` or a plain crypto error depends on its chain
+  position. The gate closes the class either way.)
+- `reordered_congestion_signal_survives_a_delayed_receipt` drives the
+  real façade over the real relay: B fills §4's budget to exactly 24
+  outstanding (the highest sequence that can carry a truthful signal,
+  since ControlOnly then blocks further applications), A accepts sequence
+  1 and then the signaling sequence 24 out of order, the debt must record
+  24 (pre-fix: 1), a delivered older receipt at water 1 must NOT resolve
+  it, the missing packets drain HCR to 24, and the still-standing debt
+  must converge to a receipt covering 24 — after which B's high water
+  reaches 24, its outstanding falls below the threshold, it returns to
+  `Ready`, and it can stage applications again.
+
+Convergence is a bounded loop rather than a single shot, and the test
+asserts it as one: the any-pending guard (v8 P1-4) stages at most one
+receipt at a time and receipts stage at the CURRENT high water, so a
+receipt staged mid-drain covers only the water of that moment and the
+next mutator stages at the drained water.
+
+The v2–v10 histories follow unchanged.
+
 ## Remediation history (v10)
 
 Version 9 (head `7eab05bb0cd887e49b9cbff7f4a4dd2b2047b9a2`): Fable PASS, Sol

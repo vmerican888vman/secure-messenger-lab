@@ -3813,3 +3813,321 @@ fn expired_control_receipt_re_stages_on_receipt_only_traffic()
     assert_eq!(receipts[0].expires_at, past + TTL);
     Ok(())
 }
+
+// --- D2b v11 remediation tests (Sol's v10 P1-1 and P1-2) ---------------------
+
+/// Sol's v10 P1-1: JSON aliases must not bypass global packet dedup.
+///
+/// `EncryptedPacket::digest` hashes the RAW bytes, but the `OlmMessage`
+/// deserializer is permissive — it ignores unknown fields and accepts any
+/// field order and any whitespace. So an already-accepted packet can be
+/// re-encoded to a byte-different alias that decrypts to the SAME message
+/// but carries a DIFFERENT digest. Pre-fix each alias slipped past the
+/// global digest dedup on its new digest and reached ratchet `decrypt`,
+/// which returned `MissingMessageKey` and durably committed
+/// `RekeyRequired` — closing the conversation for good.
+///
+/// Every alias below is first proven to be a genuine alias (it decodes to
+/// exactly the canonical packet's `OlmMessage`), then proven to be
+/// rejected before dedup and before any ratchet touch: no generation
+/// commit, mode still `Ready`, receive water unmoved. The canonical
+/// encoding itself still rejects as a plain duplicate.
+#[test]
+fn json_aliased_packet_replay_is_rejected_before_dedup() -> std::result::Result<(), Box<dyn Error>>
+{
+    let (_a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+
+    // A accepts m1; its digest is durably in the dedup picture.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let packet = envelopes.first().ok_or("no m1 envelope")?.packet.clone();
+    let queue_a = a.state.mailbox_queue_id;
+
+    let canonical = packet.as_bytes().to_vec();
+    let value: serde_json::Value = serde_json::from_slice(&canonical)?;
+    let object = value.as_object().ok_or("packet is not a JSON object")?;
+
+    // Three encodings of the same Olm message, none byte-equal to the
+    // canonical one: key-sorted (serde_json's Value map is a BTreeMap, so
+    // this reorders "type"/"body"), pretty-printed (whitespace), and one
+    // carrying an extra field the deserializer ignores.
+    let mut with_unknown = object.clone();
+    with_unknown.insert("unknown".to_owned(), serde_json::Value::from(1));
+    let aliases: Vec<(&str, Vec<u8>)> = vec![
+        ("reordered keys", serde_json::to_vec(&value)?),
+        ("added whitespace", serde_json::to_vec_pretty(&value)?),
+        (
+            "ignored extra field",
+            serde_json::to_vec(&serde_json::Value::Object(with_unknown))?,
+        ),
+    ];
+
+    for (label, bytes) in aliases {
+        assert_ne!(bytes, canonical, "{label} is not actually a re-encoding");
+        // It really is an alias: same decoded Olm message, different digest.
+        let decoded: vodozemac::olm::OlmMessage = serde_json::from_slice(&bytes)?;
+        let original: vodozemac::olm::OlmMessage = serde_json::from_slice(&canonical)?;
+        assert_eq!(
+            decoded.to_parts(),
+            original.to_parts(),
+            "{label} does not decode to the same Olm message"
+        );
+        let alias = EncryptedPacket::from_untrusted(bytes);
+        assert_ne!(
+            alias.digest(),
+            packet.digest(),
+            "{label} did not change the digest, so it cannot test the bypass"
+        );
+
+        // Re-encapsulated under a fresh message ID and a fresh VALID
+        // signature over the alias's own digest — the exact shape that
+        // slipped through pre-fix.
+        let generation_before = a.store.generation()?;
+        let message_id = MessageId::random();
+        let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+            queue_a,
+            message_id,
+            &alias.digest(),
+            NOW + 3_600,
+        ));
+        let outcome = a.accept_envelope(queue_a, message_id, alias, NOW + 3_600, signature, NOW);
+        assert!(
+            matches!(outcome, Err(LabError::InvalidPayload)),
+            "{label} was not rejected as non-canonical: {outcome:?}"
+        );
+        assert_eq!(
+            a.store.generation()?,
+            generation_before,
+            "{label} committed"
+        );
+        assert_eq!(
+            active_mode(&a)?,
+            SessionMode::Ready,
+            "{label} reached the ratchet and gap-locked the session"
+        );
+        assert_eq!(
+            a.state
+                .active_session
+                .as_ref()
+                .ok_or("no session")?
+                .highest_contiguous_received_seq,
+            1,
+            "{label} moved the receive water"
+        );
+    }
+
+    // The canonical encoding is unaffected: it still rejects as a plain
+    // duplicate, on the digest it legitimately matches.
+    let message_id = MessageId::random();
+    let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+        queue_a,
+        message_id,
+        &packet.digest(),
+        NOW + 3_600,
+    ));
+    assert!(matches!(
+        a.accept_envelope(queue_a, message_id, packet, NOW + 3_600, signature, NOW),
+        Err(LabError::DuplicateMessage)
+    ));
+    Ok(())
+}
+
+/// Sol's v10 P1-2: a truthful congestion signal that arrives out of order
+/// must not be lost.
+///
+/// The peer's signal rides a specific sender sequence. Pre-fix the arm
+/// raised the control-debt water to the acceptor's contiguous high water
+/// instead, so a signal riding sequence 25 that arrived while HCR was
+/// still 1 recorded debt at 1. A delayed older receipt then advanced the
+/// delivered marker to 1, the debt read as resolved, and when the missing
+/// packets later drained HCR to 25 no receipt was owed at all — leaving
+/// the peer wedged in `ControlOnly` at 24+ outstanding forever.
+///
+/// This drives the real façade over the real relay end to end: reordered
+/// arrival, the delayed receipt that advances the marker, the drain, and
+/// then the receipt that must cover HCR — and asserts the peer actually
+/// recovers below the threshold.
+/// Stage and store `count` applications from B to A's mailbox, one per
+/// sender sequence, failing with the index that broke.
+fn stage_applications_to_the_budget(
+    b: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    count: u64,
+) -> std::result::Result<(), Box<dyn Error>> {
+    for index in 1..=count {
+        let staged = b
+            .stage_send(&format!("m{index}"), NOW, NOW + 3_600, NOW)
+            .map_err(|error| format!("stage {index}: {error:?}"))?;
+        let action = match staged {
+            super::StageSendOutcome::Staged(action) => action,
+            super::StageSendOutcome::ReceiptFlushedRetry => {
+                return Err(format!("stage {index} flushed a receipt").into());
+            }
+        };
+        relay
+            .enqueue(&action.request, NOW)
+            .map_err(|error| format!("enqueue {index}: {error:?}"))?;
+        b.record_send_result(&action, SendOutcome::Stored)
+            .map_err(|error| format!("result {index}: {error:?}"))?;
+    }
+    Ok(())
+}
+
+/// Drive owed control receipts to `Stored` until the debt water is
+/// covered by the delivered marker, asserting the loop terminates and
+/// that exactly one receipt is owed on each pass.
+///
+/// Delivery alone does not re-stage; the owed receipt flushes at the next
+/// clock-taking mutator, which is the documented retry path (control
+/// priority means it outranks the application). Receipts stage at the
+/// CURRENT high water, so one staged mid-drain covers only the water of
+/// that moment — convergence is a bounded loop, not a single shot.
+fn converge_control_debt(
+    a: &mut PersistentClient<TestProtector>,
+    relay: &mut Relay,
+    max_rounds: usize,
+) -> std::result::Result<(), Box<dyn Error>> {
+    let mut rounds = 0;
+    loop {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        if active.control_debt_up_to <= active.last_delivered_receipt_high_water {
+            return Ok(());
+        }
+        if pending_receipts(a).is_empty() {
+            a.stage_send("retry trigger", NOW, NOW + 3_600, NOW)?;
+        }
+        let receipts = pending_receipts(a);
+        assert_eq!(
+            receipts.len(),
+            1,
+            "debt stands at round {rounds} but no receipt is owed"
+        );
+        let action = a
+            .pending_send_actions()?
+            .into_iter()
+            .find(|action| action.request.message_id == receipts[0].message_id)
+            .ok_or("no receipt action")?;
+        relay.enqueue(&action.request, NOW)?;
+        a.record_send_result(&action, SendOutcome::Stored)?;
+        rounds += 1;
+        assert!(rounds <= max_rounds, "the control debt never converged");
+    }
+}
+
+#[test]
+fn reordered_congestion_signal_survives_a_delayed_receipt()
+-> std::result::Result<(), Box<dyn Error>> {
+    let mut relay = Relay::open_in_memory()?;
+    let a_dir = TempDir::new()?;
+    let b_dir = TempDir::new()?;
+    let mut a = create_client(&a_dir)?;
+    let mut b = create_client(&b_dir)?;
+    register_on_relay(&mut a, &mut relay)?;
+    register_on_relay(&mut b, &mut relay)?;
+    connect(&mut a, &mut b, ConversationId::random())?;
+
+    // B sends applications until §4's budget locks it. Nothing is
+    // receipted, so B's outstanding climbs with its sequence and the 24th
+    // payload truthfully reports 24 — exactly the threshold — after which
+    // B is `ControlOnly` and can stage no more applications. So sequence
+    // 24 is the highest-numbered packet that can carry a truthful signal.
+    stage_applications_to_the_budget(&mut b, &mut relay, 24)?;
+    assert_eq!(outstanding(&b)?, 24);
+    assert_eq!(active_mode(&b)?, SessionMode::ControlOnly);
+
+    // A receives sequence 1, then the SIGNALLING packet at sequence 24,
+    // out of order: 24 waits in the bounded out-of-order set and the
+    // contiguous water is still 1.
+    let outcomes = deliver(&mut a, &mut relay, &[0, 23])?;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.highest_contiguous_received_seq, 1);
+        assert!(active.received_above_high_water.contains(&24));
+        // The fix: debt is bound to the SIGNALLING sequence, not the
+        // lagging contiguous water. Pre-fix this was 1.
+        assert_eq!(
+            active.control_debt_up_to, 24,
+            "the debt was armed to the contiguous water, losing the signal"
+        );
+    }
+
+    // The arm flushed one receipt in the same pass, covering the water it
+    // could actually report (1). Drive it to Stored: the delivered marker
+    // advances to 1 — the step that pre-fix silently retired the debt.
+    let receipts = pending_receipts(&a);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].high_water, Some(1));
+    let action = a
+        .pending_send_actions()?
+        .into_iter()
+        .find(|action| action.request.message_id == receipts[0].message_id)
+        .ok_or("no receipt action")?;
+    relay.enqueue(&action.request, NOW)?;
+    a.record_send_result(&action, SendOutcome::Stored)?;
+    assert_eq!(delivered_marker(&a)?, 1);
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .control_debt_up_to,
+        24,
+        "a delivery below the debt water resolved it"
+    );
+
+    // The missing packets 2..=23 arrive and drain the water to 24.
+    let order: Vec<usize> = (1..23).collect();
+    let outcomes = deliver(&mut a, &mut relay, &order)?;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.highest_contiguous_received_seq, 24);
+        assert!(active.received_above_high_water.is_empty());
+    }
+
+    // The debt still stands and is still owed, and converges. Pre-fix
+    // nothing was owed here at all: the loop exited on its first pass
+    // with the marker far below 24 — the wedge.
+    converge_control_debt(&mut a, &mut relay, 4)?;
+    assert!(
+        delivered_marker(&a)? >= 24,
+        "the debt resolved without ever delivering a receipt covering the signalling sequence"
+    );
+
+    // B applies every receipt A produced: its high water reaches 24,
+    // outstanding falls to 0, the ControlOnly lock lifts, and it can send
+    // applications again.
+    let fetch = b.fetch_request(NOW + 300, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    assert!(!envelopes.is_empty(), "no receipt envelopes for B");
+    for envelope in &envelopes {
+        b.accept_envelope(
+            envelope.queue_id,
+            envelope.message_id,
+            envelope.packet.clone(),
+            envelope.expires_at,
+            envelope.sender_signature,
+            NOW,
+        )?;
+    }
+    assert_eq!(
+        b.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .peer_contiguous_high_water,
+        24,
+        "the covering receipt never reached B"
+    );
+    assert!(
+        outstanding(&b)? < 24,
+        "B did not recover below the threshold: {} outstanding",
+        outstanding(&b)?
+    );
+    assert_eq!(active_mode(&b)?, SessionMode::Ready);
+    b.stage_send("unwedged", NOW, NOW + 3_600, NOW)?;
+    Ok(())
+}
