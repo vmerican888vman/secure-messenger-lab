@@ -145,7 +145,24 @@ fn check_structure(state: &ClientStateV1) -> Result<()> {
     // holding the moment a kind-dependent branch below ever returned
     // something other than an error. Hoisting it makes the property
     // structural instead of incidental.
+    //
+    // The two `check_sorted` calls above DO consume `message_id`, which
+    // is itself a committed field — but they are order-and-bound checks
+    // on immutable identity, not kind-dependent logic, and their
+    // position ahead of this loop is what keeps the hashing bounded. If
+    // the contract is ever restated as "before anything relies on ANY
+    // committed field", those two lines are what needs revisiting.
     for send in &state.sends {
+        // Bound BEFORE hashing, mirroring decode's bound-before-consume
+        // discipline: the commitment hashes the full retained packet, so
+        // the length check has to precede it rather than sit further
+        // down the function.
+        if let Some(packet) = &send.packet {
+            let length = packet.as_bytes().len();
+            if length == 0 || length > MAX_PACKET {
+                return Err(LabError::Storage);
+            }
+        }
         if send.metadata_commitment != send.compute_metadata_commitment()? {
             return Err(LabError::Storage);
         }

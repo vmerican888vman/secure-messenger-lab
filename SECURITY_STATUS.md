@@ -44,6 +44,12 @@ unaudited, and unsuitable for sensitive or production messaging.
       companion rejection, strictly non-blocking lifecycle lock; the platform-key lifecycle manager
       drives create/recovery/reset with exact-state CAS and tested failure arms.
 
+- [x] The `ClientStateV1` TLV codec and its semantic validation carry an independent DUAL PASS at
+      `8fab295` (both reviewers, exact SHA). Scope is `src/state/` only; it broadens to no other leg,
+      and per `docs/phase3-post-quantum-decision.md` it does not transfer to the MLS replacement.
+- [x] The persistence façade leg D2b (inbound path, receipts, ACKs) carries an independent DUAL PASS
+      at `a33d2ba`, on the same terms.
+
 ## Blocking any app or public-security claim
 
 - [ ] Independently reviewed protocol and complete formal threat model.
