@@ -3102,55 +3102,181 @@ fn control_debt_up_to_never_exceeds_received() -> Result<(), Box<dyn Error>> {
 
 // --- review D2b v4: SendRecord kind/receipt_high_water arms -------------------
 
-/// Decode a genuine populated encoding whose first send element is
-/// replaced by a hand-crafted object carrying the given kind byte and
-/// high-water field; returns true when the splice decodes.
-fn decode_with_spliced_send(kind: u8, hw: Option<u64>) -> Result<bool, Box<dyn Error>> {
+/// Byte offset of a field's value inside an encoded object:
+/// `object_type:u16, field_count:u16, [id:u16, len:u32, value]*`.
+///
+/// Same walker `retired_session_mode_discriminant_is_rejected` carries
+/// locally, hoisted so the send-record wire splices below can share it.
+fn object_field_offset(object: &[u8], wanted: u16) -> Result<usize, Box<dyn Error>> {
+    let mut cursor = 4;
+    loop {
+        let id = u16::from_be_bytes(
+            object
+                .get(cursor..cursor + 2)
+                .ok_or("field id")?
+                .try_into()?,
+        );
+        let length = usize::try_from(u32::from_be_bytes(
+            object
+                .get(cursor + 2..cursor + 6)
+                .ok_or("field len")?
+                .try_into()?,
+        ))?;
+        if id == wanted {
+            return Ok(cursor + 6);
+        }
+        cursor += 6 + length;
+    }
+}
+
+/// Absolute `(start, end)` span of the FIRST send record's object bytes
+/// inside a framed state encoding: the sends array is the top-level field
+/// at index 16, its value `count:u32` then `len:u32, object` per element.
+fn first_send_object_span(encoded: &[u8]) -> Result<(usize, usize), Box<dyn Error>> {
+    let (start, _) = field_value_span(encoded, 16)?;
+    let length = usize::try_from(u32::from_be_bytes(
+        encoded
+            .get(start + 4..start + 8)
+            .ok_or("element length truncated")?
+            .try_into()?,
+    ))?;
+    let object_start = start + 8;
+    Ok((object_start, object_start + length))
+}
+
+/// Wire-level companion to `send_record_relabelling_is_rejected`: an
+/// INVALID `SendKind` byte must be rejected on decode, pinned against a
+/// genuine encoding.
+///
+/// This restores the coverage the dead `decode_with_spliced_send` helper
+/// used to provide — its hand-built 11-field objects could never decode
+/// under the current 12-field layout, so it proved nothing and was
+/// removed. Shaped on `retired_session_mode_discriminant_is_rejected`:
+/// walk the nested object TLV to the field-10 byte, self-anchor on the
+/// expected value BEFORE splicing, and prove the live values still
+/// decode so a wrong offset fails loudly.
+#[test]
+fn invalid_send_kind_byte_is_rejected() -> Result<(), Box<dyn Error>> {
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
-    let blocks = split_top(&encoded)?;
-    let mut elements = split_array(blocks.get(16).ok_or("sends")?.get(6..).ok_or("sends")?)?;
-    let record = fixture.state.sends.first().ok_or("no pending send")?;
-    let object = owned_object(
-        records::SEND_TYPE,
-        &[
-            (1, record.message_id.as_bytes().to_vec()),
-            (2, vec![record.state as u8]),
-            (3, record.epoch_id.to_vec()),
-            (4, record.sequence.to_be_bytes().to_vec()),
-            (
-                5,
-                record
-                    .queue_id
-                    .map_or_else(Vec::new, |id| id.as_bytes().to_vec()),
-            ),
-            (
-                6,
-                record
-                    .packet
-                    .as_ref()
-                    .map_or_else(Vec::new, |packet| packet.as_bytes().to_vec()),
-            ),
-            (7, record.expires_at.to_be_bytes().to_vec()),
-            (
-                8,
-                record
-                    .send_signature
-                    .map_or_else(Vec::new, |sig| sig.to_bytes().to_vec()),
-            ),
-            (9, Vec::new()),
-            (10, vec![kind]),
-            (
-                11,
-                hw.map_or_else(Vec::new, |high_water| high_water.to_be_bytes().to_vec()),
-            ),
-        ],
-    )?;
-    let mut element = u32::try_from(object.len())?.to_be_bytes().to_vec();
-    element.extend_from_slice(&object);
-    *elements.get_mut(0).ok_or("no element")? = element;
-    let bytes = splice_top(&encoded, 16, field_block(17, &join_array(&elements)?)?)?;
-    Ok(ClientStateV1::decode(&bytes).is_ok())
+    let (object_start, object_end) = first_send_object_span(&encoded)?;
+    let object = encoded.get(object_start..object_end).ok_or("send record")?;
+    // Field 10 of a send record is the kind enum.
+    let kind_offset = object_start + object_field_offset(object, 10)?;
+    assert_eq!(
+        encoded.get(kind_offset).copied(),
+        Some(SendKind::Application as u8),
+        "the located byte is not the first send record's kind"
+    );
+
+    // Every invalid discriminant rejects on decode...
+    for value in [0_u8, 3, 5, 255] {
+        let mut mutated = encoded.to_vec();
+        *mutated.get_mut(kind_offset).ok_or("kind byte")? = value;
+        assert!(
+            ClientStateV1::decode(&mutated).is_err(),
+            "stored send kind {value} was accepted"
+        );
+    }
+    // ...while the live APPLICATION byte decodes, so a wrong offset fails
+    // loudly.
+    assert!(
+        ClientStateV1::decode(&encoded).is_ok(),
+        "the genuine encoding was rejected, so the splice is hitting the wrong byte"
+    );
+
+    // The live RECEIPT byte also decodes. A bare byte flip can never
+    // decode — field 11 and the field-12 commitment both key on `kind` —
+    // so the record is re-sealed as a coherent receipt exactly as in
+    // `send_record_relabelling_is_rejected`, then the kind byte is
+    // located on the wire and self-anchored the same way.
+    let mut fixture = populated_fixture()?;
+    let sequence = fixture.state.sends[0].sequence;
+    {
+        let record = &mut fixture.state.sends[0];
+        record.kind = SendKind::Receipt;
+        record.receipt_high_water = Some(1);
+        record.metadata_commitment = record.compute_metadata_commitment()?;
+    }
+    fixture
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no session")?
+        .unreceipted_application_send_seqs
+        .retain(|listed| *listed != sequence);
+    let encoded = fixture.state.encode()?;
+    let (object_start, object_end) = first_send_object_span(&encoded)?;
+    let object = encoded.get(object_start..object_end).ok_or("send record")?;
+    let kind_offset = object_start + object_field_offset(object, 10)?;
+    assert_eq!(
+        encoded.get(kind_offset).copied(),
+        Some(SendKind::Receipt as u8),
+        "the located byte is not the re-sealed receipt's kind"
+    );
+    assert!(
+        ClientStateV1::decode(&encoded).is_ok(),
+        "a live receipt kind was rejected, so the walk is hitting the wrong byte"
+    );
+    Ok(())
+}
+
+/// Codec v10 P1-1, pinned at BOTH layers: a send record whose stored
+/// field-12 commitment does not match its metadata must be rejected by
+/// `SendRecord::parse` AND by full-state decode.
+///
+/// `SendRecord::parse` recomputes the commitment, but decode also runs
+/// full validation, which recomputes it again (`check_structure`) — so
+/// deleting the parse check alone leaves the suite green. This test
+/// parses the spliced record object directly (pinning the parse layer)
+/// and decodes the spliced state (pinning the end-to-end behaviour), so
+/// each layer is individually covered.
+#[test]
+fn send_record_commitment_mismatch_is_rejected_on_decode() -> Result<(), Box<dyn Error>> {
+    let fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let (object_start, object_end) = first_send_object_span(&encoded)?;
+    let object = encoded.get(object_start..object_end).ok_or("send record")?;
+    // Field 12 of a send record is the 32-byte metadata commitment.
+    let commitment_offset = object_start + object_field_offset(object, 12)?;
+    let expected = fixture.state.sends[0].metadata_commitment;
+    assert_eq!(
+        encoded.get(commitment_offset..commitment_offset + 32),
+        Some(&expected[..]),
+        "the located bytes are not the first send record's commitment"
+    );
+
+    let mut mutated = encoded.to_vec();
+    let byte = mutated
+        .get_mut(commitment_offset)
+        .ok_or("commitment byte")?;
+    *byte ^= 0xFF;
+
+    // Parse layer: the spliced RECORD object alone must fail to parse,
+    // while the genuine object parses — so a wrong offset fails loudly.
+    let (object_start, object_end) = first_send_object_span(&mutated)?;
+    let object = mutated.get(object_start..object_end).ok_or("send record")?;
+    assert!(
+        SendRecord::parse(object).is_err(),
+        "a record with a tampered commitment parsed"
+    );
+    let (object_start, object_end) = first_send_object_span(&encoded)?;
+    let object = encoded.get(object_start..object_end).ok_or("send record")?;
+    assert!(
+        SendRecord::parse(object).is_ok(),
+        "the genuine record was rejected, so the splice is hitting the wrong bytes"
+    );
+
+    // End-to-end layer: the spliced STATE must fail to decode.
+    assert!(
+        ClientStateV1::decode(&mutated).is_err(),
+        "a state with a tampered commitment decoded"
+    );
+    assert!(
+        ClientStateV1::decode(&encoded).is_ok(),
+        "the genuine encoding was rejected, so the splice is hitting the wrong bytes"
+    );
+    Ok(())
 }
 
 /// Codec v10 P1-1: relabelling a send record must be REJECTED, and the

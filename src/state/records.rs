@@ -733,13 +733,16 @@ impl SendState {
 /// **Wire-layout amendment (review D2b v4):** fields 10 (`kind: u8`) and
 /// 11 (`receipt_high_water: u64`) were added so the expiry sweep and the
 /// owed-receipt rule can identify receipt sends without decrypting. Field
-/// 10 is present on every record (both arms). Field 11 carries content
-/// only on a full-arm receipt record (exactly 8 bytes, value >= 1); it is
-/// zero-length (absent) on application and terminal records. Invalid
-/// kind, `hw = 0` on a receipt, nonzero hw on an application record, or
-/// an hw field on a terminal record all reject; a full-arm receipt's hw
-/// must additionally not exceed the session's
-/// `highest_contiguous_received_seq` (semantic validation).
+/// 10 is present on every record (both arms).
+///
+/// **Amended for codec v10 P1-1:** field 11 carries content on a RECEIPT
+/// record in EVERY state (exactly 8 bytes, value >= 1) and is zero-length
+/// (absent) on APPLICATION records in every state — a receipt retains its
+/// high water through terminalization as historical origin evidence, so
+/// its staging-time kind stays checkable. An invalid kind byte, `hw = 0`
+/// on a receipt, or any hw content on an application record all reject;
+/// a receipt's hw must additionally not exceed the session's
+/// `highest_contiguous_received_seq` on BOTH arms (semantic validation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SendKind {
     Application = 1,
