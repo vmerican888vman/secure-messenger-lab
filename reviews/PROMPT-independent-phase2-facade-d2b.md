@@ -1,5 +1,30 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v10)
+
+Version 9 (head `7eab05bb0cd887e49b9cbff7f4a4dd2b2047b9a2`): Fable PASS, Sol
+RETURN with four P1 blockers (verdict in
+`reviews/REVIEW-sol-facade-d2b-v9.md`), all fixed in the head under review:
+
+1. **Global digest dedup before any ratchet touch** — a retired-epoch packet
+   re-encapsulated with a fresh outer ID/signature is rejected across ALL
+   retained dedup records, so it can never gap-lock the session. Provenance
+   analysis in the module docs: remaining gap-error producers are genuine
+   current-chain packets (RekeyRequired correct per §4) or never-accepted
+   foreign packets (MAC-fail, not gap-fail).
+2+4. **Control debt is now a high-water, not a flag** (field 21 retyped
+   `control_debt_armed: u8` → `control_debt_up_to: u64`). Arming raises it to
+   `max(current, HCR)`; NOTHING on the wire ever clears it; it resolves only
+   when the delivered marker reaches it. Reordered low signals cannot erase
+   an arm (finding 2), and a delayed `Stored` on an older receipt leaves
+   newer debt standing (finding 4). The v9 signal-based clear rule is
+   deleted as the bug it was.
+3. **`accept_envelope` sweeps send expiry and prunes before the staging
+   tail**, so an expired in-flight control receipt no longer blocks
+   receipt-only recovery traffic (Sol's repro is the regression test).
+
+The v2–v9 histories follow unchanged.
+
 ## Remediation history (v9)
 
 Version 8 (head `a3d96c35c10c655ddfa0e10c1d0d5e38644b762a`): Fable PASS, Sol

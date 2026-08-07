@@ -406,17 +406,21 @@ impl HighWaterReceipt {
 /// received set — nothing can have been consumed before it was
 /// received.
 ///
-/// **Wire-layout amendment (review D2b v6):** field 21,
-/// `control_debt_armed: u8` (a flag: validation accepts only 0 or 1).
-/// Arms at the end of any successful `accept_envelope` (any payload
-/// kind) whose acceptor is congested — outstanding
-/// (`last_assigned_send_seq - peer_contiguous_high_water`) at or above
-/// the `ControlOnly` threshold (24). While armed AND the contiguous
-/// received high water exceeds the delivered marker, the owed rule
-/// stages a receipt even with no application debt: receipts consume the
-/// shared send counter, so one-directional traffic otherwise gives the
-/// receiver's own sends no drain path (the v6 deadlock). Staging clears
-/// the flag. Validation: values above 1 reject. The object declares 21
+/// **Wire-layout amendments (reviews D2b v6/v9):** field 21. v6 added
+/// `control_debt_armed: u8`; **v9 retypes it in place** (same wire
+/// position, codec still pre-PASS) to **`control_debt_up_to: u64`** —
+/// control debt as a monotone high water, not a flag. Arming (local
+/// congestion or a peer-signaled congestion payload, thresholds
+/// unchanged) sets it to `max(current, current HCR)`; it is NEVER
+/// cleared or lowered by anything on the wire, so reordered truthful
+/// low signals cannot erase a later arm and no signal-freshness
+/// versioning is needed (the water only rises; resolution is a
+/// water-versus-water comparison). Debt resolves only through confirmed
+/// delivery: when the delivered marker (field 19) reaches it. A delayed
+/// `Stored` on an older receipt (`hw < control_debt_up_to`) therefore
+/// leaves newer debt standing instead of clearing it (v9 finding 4).
+/// Validation: `control_debt_up_to <= highest_contiguous_received_seq`
+/// (0 = none) — debt for water never received. The object declares 21
 /// fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
@@ -444,9 +448,10 @@ pub(crate) struct ActiveSession {
     /// Highest consumed application sender sequence; 0 = nothing
     /// consumed (field 20). Never exceeds the received water coverage.
     pub(crate) receipt_debt_up_to: u64,
-    /// Armed control-debt flag; 0 or 1 (field 21). Arms at a congested
-    /// acceptor's accept end; cleared when a receipt stages.
-    pub(crate) control_debt_armed: u8,
+    /// Control-debt high water (field 21): the highest received water
+    /// congestion (local or peer-signaled) has armed to date; 0 = none.
+    /// Monotone on the wire; resolved only by confirmed delivery.
+    pub(crate) control_debt_up_to: u64,
 }
 
 impl ActiveSession {
@@ -479,7 +484,7 @@ impl ActiveSession {
         let conversation_id = conversation_id(object.field(18)?)?;
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
         let receipt_debt_up_to = u64_value(object.field(20)?)?;
-        let control_debt_armed = u8_value(object.field(21)?)?;
+        let control_debt_up_to = u64_value(object.field(21)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -498,7 +503,7 @@ impl ActiveSession {
             conversation_id,
             last_delivered_receipt_high_water,
             receipt_debt_up_to,
-            control_debt_armed,
+            control_debt_up_to,
         })
     }
 
@@ -521,7 +526,7 @@ impl ActiveSession {
         let last_delivered_receipt_high_water =
             self.last_delivered_receipt_high_water.to_be_bytes();
         let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
-        let control_debt_armed = [self.control_debt_armed];
+        let control_debt_up_to = self.control_debt_up_to.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -545,7 +550,7 @@ impl ActiveSession {
                 (18, self.conversation_id.as_bytes()),
                 (19, &last_delivered_receipt_high_water),
                 (20, &receipt_debt_up_to),
-                (21, &control_debt_armed),
+                (21, &control_debt_up_to),
             ],
         )?;
         Ok(Zeroizing::new(object))

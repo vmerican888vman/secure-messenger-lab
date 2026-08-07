@@ -653,9 +653,10 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     {
         return Err(LabError::Storage);
     }
-    // Review D2b v6 (field 21): the control-debt flag is a bit, nothing
-    // wider.
-    if active.control_debt_armed > 1 {
+    // Review D2b v9 (field 21, retyped): the control-debt water may not
+    // exceed the contiguous received high water — no congestion can have
+    // been armed for water never received (0 = none).
+    if active.control_debt_up_to > active.highest_contiguous_received_seq {
         return Err(LabError::Storage);
     }
     Ok(())

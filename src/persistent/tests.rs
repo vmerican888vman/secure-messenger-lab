@@ -1849,10 +1849,10 @@ fn drive_receipt_to_b_and_assert_unlock(
     }
     // B armed its control debt back at the ping accept (its outstanding
     // was 24) and never delivered anything since; A's receipt reports
-    // fresh water (HCR 33) and B's entry congestion sample (24) re-arms
-    // in the same pass even as A's recovery signal (9 < 24) clears —
-    // locally congested means locally armed. Exactly one counter-receipt
-    // reports HCR 33 (the v6 drain path), bounded by the in-flight rule.
+    // fresh water (HCR 33) and B's entry congestion RAISES the debt
+    // water to 33 (v9 water model: signals only raise, never lower).
+    // Exactly one counter-receipt reports HCR 33 (the v6 drain path),
+    // bounded by the in-flight rule.
     let b_receipts = pending_receipts(b);
     assert_eq!(b_receipts.len(), 1, "the armed control debt did not stage");
     assert_eq!(b_receipts[0].high_water, Some(33));
@@ -1861,9 +1861,9 @@ fn drive_receipt_to_b_and_assert_unlock(
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
-        "local congestion should re-arm after the low-signal clear"
+            .control_debt_up_to,
+        33,
+        "local congestion should raise the debt water to the HCR"
     );
     // The unlock proof: B can stage application traffic again.
     b.stage_send("unlocked", past_window, past_window + 3_600, past_window)?;
@@ -2957,8 +2957,8 @@ fn receipt_locked_recovers_and_armed_control_debt_stages() -> std::result::Resul
     {
         let active = a.state.active_session.as_ref().ok_or("no session")?;
         assert_eq!(
-            active.control_debt_armed, 1,
-            "the congested accept did not arm"
+            active.control_debt_up_to, 2,
+            "the congested accept did not raise the debt water"
         );
         assert_eq!(active.receipt_debt_up_to, 0);
         assert_eq!(active.last_delivered_receipt_high_water, 0);
@@ -2995,8 +2995,8 @@ fn receipt_locked_recovers_and_armed_control_debt_stages() -> std::result::Resul
     {
         let active = a.state.active_session.as_ref().ok_or("no session")?;
         assert_eq!(
-            active.control_debt_armed, 1,
-            "local entry congestion (32) should re-arm past the low signal"
+            active.control_debt_up_to, 3,
+            "local entry congestion (32) should raise the debt water to the HCR"
         );
         assert_eq!(active.last_delivered_receipt_high_water, 0);
     }
@@ -3040,8 +3040,8 @@ fn congestion_signal_and_local_arm_are_independent() -> std::result::Result<(), 
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
+            .control_debt_up_to,
+        2,
         "the local arm did not fire past a silent (0) peer signal"
     );
 
@@ -3065,8 +3065,8 @@ fn congestion_signal_and_local_arm_are_independent() -> std::result::Result<(), 
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
+            .control_debt_up_to,
+        2,
         "the peer signal did not arm an uncongested acceptor"
     );
     Ok(())
@@ -3413,8 +3413,9 @@ fn control_debt_re_stages_after_unknown_expiry_and_reopen()
     assert_eq!(receipts[0].high_water, Some(2));
     assert_eq!(receipts[0].sequence, 25);
 
-    // DeliveryUnknown does NOT clear the debt: consuming the record
-    // re-stages the receipt in the same pass (v7 would have lost it).
+    // DeliveryUnknown does NOT clear the debt water (v9: signals and
+    // failures never lower it): consuming the record re-stages the
+    // receipt in the same pass.
     let action = newest_receipt_action(&a)?;
     a.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
     assert_eq!(
@@ -3422,9 +3423,9 @@ fn control_debt_re_stages_after_unknown_expiry_and_reopen()
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
-        "DeliveryUnknown cleared the armed debt"
+            .control_debt_up_to,
+        2,
+        "DeliveryUnknown lowered the debt water"
     );
     a.consume_delivery_unknown(action.request.message_id, NOW)?;
     let receipts = pending_receipts(&a);
@@ -3447,7 +3448,7 @@ fn control_debt_re_stages_after_unknown_expiry_and_reopen()
     assert_eq!(receipts[0].sequence, 27);
     assert_eq!(receipts[0].expires_at, past + TTL);
 
-    // Crash between stage and outcome: the flag is durable, and the
+    // Crash between stage and outcome: the water is durable, and the
     // debt still re-stages after reopen.
     drop(a);
     let mut a = open_client(&a_dir)?;
@@ -3456,9 +3457,9 @@ fn control_debt_re_stages_after_unknown_expiry_and_reopen()
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
-        "the armed debt did not survive reopen"
+            .control_debt_up_to,
+        2,
+        "the debt water did not survive reopen"
     );
     let action = newest_receipt_action(&a)?;
     a.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
@@ -3467,26 +3468,30 @@ fn control_debt_re_stages_after_unknown_expiry_and_reopen()
     assert_eq!(receipts.len(), 1, "the debt did not re-stage after reopen");
     assert_eq!(receipts[0].sequence, 28);
 
-    // Confirmed delivery finally clears it.
+    // Confirmed delivery RESOLVES the debt: the marker reaches the
+    // water (2), which itself is never lowered (v9).
     let action = newest_receipt_action(&a)?;
     a.record_send_result(&action, SendOutcome::Stored)?;
     {
         let active = a.state.active_session.as_ref().ok_or("no session")?;
-        assert_eq!(
-            active.control_debt_armed, 0,
-            "Stored did not clear the debt"
-        );
         assert_eq!(active.last_delivered_receipt_high_water, 2);
+        assert_eq!(
+            active.control_debt_up_to, 2,
+            "delivery must never lower the debt water"
+        );
     }
+    // Resolved: nothing further stages on the next mutator.
+    let action = newest_receipt_action(&a);
+    assert!(action.is_err(), "a receipt staged past resolution");
     Ok(())
 }
 
-/// P1-2a/P1-2b clear semantics: confirmed delivery (`Stored`) clears
-/// the armed debt, and a fresh low-signal payload clears a signal-armed
-/// debt when the acceptor is not itself congested.
+/// V9 water-model lifecycle (dissolving findings 2 and 4): delivery
+/// RESOLVES debt when the marker reaches the water; signals never
+/// clear it; and a delayed `Stored` on an OLDER receipt leaves newer
+/// debt standing until a delivery reaches the water.
 #[test]
-fn control_debt_clears_on_delivery_and_recovery_signal() -> std::result::Result<(), Box<dyn Error>>
-{
+fn control_debt_resolves_on_delivery_never_on_signals() -> std::result::Result<(), Box<dyn Error>> {
     let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
     let outcomes = deliver(&mut a, &mut relay, &[0])?;
     assert!(outcomes.iter().all(Result::is_ok));
@@ -3499,37 +3504,38 @@ fn control_debt_clears_on_delivery_and_recovery_signal() -> std::result::Result<
     assert!(outcomes.iter().all(Result::is_ok));
     let receipts = pending_receipts(&a);
     assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].high_water, Some(2));
 
-    // Confirmed delivery clears (P1-2a).
+    // Confirmed delivery RESOLVES the debt (marker reaches water 2);
+    // the water itself is never lowered.
     let action = newest_receipt_action(&a)?;
     a.record_send_result(&action, SendOutcome::Stored)?;
-    assert_eq!(
-        a.state
-            .active_session
-            .as_ref()
-            .ok_or("no session")?
-            .control_debt_armed,
-        0,
-        "Stored did not clear the armed debt"
-    );
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_delivered_receipt_high_water, 2);
+        assert_eq!(
+            active.control_debt_up_to, 2,
+            "delivery must never lower the debt water"
+        );
+    }
 
     // A peer receipt covering all 25 sends drains A; the entry sample
-    // (25) still counts as local congestion, so the arm-first tail
-    // flushes one fresh receipt for the new water (hw 3) in the same
-    // pass. A's outstanding is 1 afterwards — that receipt's own
-    // advance.
+    // (25) re-arms the water to the new HCR (3) and one fresh receipt
+    // flushes in the same pass.
     let b_signal = outstanding(&b)?;
     let (message_id, packet, signature, expires_at) =
         forge_receipt_envelope(&mut b, &a, 25, 3, NOW, b_signal)?;
     let queue_id = a.state.mailbox_queue_id;
     let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, NOW)?;
     assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
-    assert_eq!(outstanding(&a)?, 1);
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.control_debt_up_to, 3);
+    }
+    assert_eq!(pending_receipts(&a).len(), 1);
 
-    // A SIGNALING packet (issuer_outstanding 24) maintains the arm; the
-    // in-flight hw-3 receipt blocks any replacement regardless. Then a
-    // fresh LOW-signal packet supersedes and the flag clears (P1-2b) —
-    // with nothing congested locally to re-arm.
+    // A SIGNALING packet (issuer_outstanding 24) raises the water to
+    // the new HCR (4); the in-flight hw-3 receipt blocks replacement.
     let conversation_id = a.state.conversation_id;
     let (app_id, app_packet, app_sig) = {
         let session = b.session.as_mut().ok_or("no b session")?;
@@ -3542,17 +3548,13 @@ fn control_debt_clears_on_delivery_and_recovery_signal() -> std::result::Result<
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        1,
-        "the signal did not arm"
+            .control_debt_up_to,
+        4,
+        "the signal did not raise the debt water"
     );
-    let receipts = pending_receipts(&a);
-    assert_eq!(receipts.len(), 1);
-    assert_eq!(
-        receipts[0].high_water,
-        Some(3),
-        "an hw-4 replacement staged past the in-flight hw-3 receipt"
-    );
+
+    // INVERTED v9 rule (finding 2 immunity): a reordered truthful LOW
+    // signal NEVER clears or lowers the debt water.
     let (app_id, app_packet, app_sig) = {
         let session = b.session.as_mut().ok_or("no b session")?;
         raw_peer_envelope(session, &a, conversation_id, 5, 0)?
@@ -3564,14 +3566,42 @@ fn control_debt_clears_on_delivery_and_recovery_signal() -> std::result::Result<
             .active_session
             .as_ref()
             .ok_or("no session")?
-            .control_debt_armed,
-        0,
-        "the fresh low signal did not clear the debt"
+            .control_debt_up_to,
+        4,
+        "a low signal lowered the debt water"
     );
+
+    // Finding 4 shape: a delayed `Stored` on the OLDER receipt (hw 3 <
+    // water 4) leaves the newer debt standing — the next mutator
+    // re-stages (any pending inbound consume drives it).
+    let action = newest_receipt_action(&a)?;
+    a.record_send_result(&action, SendOutcome::Stored)?;
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_delivered_receipt_high_water, 3);
+    }
+    let inbound = a.pending_inbound()?;
+    let message_id = inbound.first().ok_or("no inbound")?.message_id;
+    a.consume_inbound(message_id, NOW + 300, NOW)?;
+    let receipts = pending_receipts(&a);
     assert_eq!(
-        pending_receipts(&a).len(),
+        receipts.len(),
         1,
-        "a replacement staged after the low-signal clear"
+        "the older delivery wrongly resolved the newer debt"
+    );
+    assert_eq!(receipts[0].high_water, Some(5));
+
+    // A delivery at or above the water finally resolves it.
+    let action = newest_receipt_action(&a)?;
+    a.record_send_result(&action, SendOutcome::Stored)?;
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_delivered_receipt_high_water, 5);
+        assert_eq!(active.control_debt_up_to, 4);
+    }
+    assert!(
+        pending_receipts(&a).is_empty(),
+        "a receipt staged past resolution"
     );
     Ok(())
 }
@@ -3609,17 +3639,16 @@ fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Er
     // The victim's application sends are unaffected.
     let _app = stage_app(&mut a, "victim app", NOW, NOW + 3_600, NOW)?;
 
-    // Deliver the in-flight receipt; the flag clears (P1-2a).
+    // Deliver the in-flight receipt; the marker advances to its hw (2)
+    // but the debt water (21) is never lowered — newer debt stands
+    // (v9 finding 4), so wave 2 stages exactly one replacement.
     let action = newest_receipt_action(&a)?;
     a.record_send_result(&action, SendOutcome::Stored)?;
-    assert_eq!(
-        a.state
-            .active_session
-            .as_ref()
-            .ok_or("no session")?
-            .control_debt_armed,
-        0
-    );
+    {
+        let active = a.state.active_session.as_ref().ok_or("no session")?;
+        assert_eq!(active.last_delivered_receipt_high_water, 2);
+        assert_eq!(active.control_debt_up_to, 21);
+    }
 
     // Wave 2 (13 packets): after the delivery, at most one more stages.
     for seq in 22..=34_u64 {
@@ -3636,5 +3665,151 @@ fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Er
     assert_eq!(pending_receipts(&a).len(), 1);
     assert_eq!(active_mode(&a)?, SessionMode::Ready);
     assert!(outstanding(&a)? < 24);
+    Ok(())
+}
+
+// --- D2b v9 remediation tests ------------------------------------------------
+
+/// Finding 1: a packet whose ciphertext was already accepted cannot be
+/// re-encapsulated under a fresh outer ID/signature — the dedup bounds
+/// match the packet digest across ALL epochs before any ratchet touch,
+/// so the replay never reaches decrypt (no gap error, no
+/// `RekeyRequired`, no generation commit), and the retention is durable
+/// across reopen.
+#[test]
+fn cross_epoch_digest_replay_rejected_before_ratchet() -> std::result::Result<(), Box<dyn Error>> {
+    let (a_dir, _b_dir, mut a, _b, mut relay) = conversation_fixture()?;
+
+    // A accepts m1; its ciphertext and digest are durably in the dedup
+    // picture. Recover the exact packet from the relay.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let fetch = a.fetch_request(NOW + 60, NOW)?;
+    let envelopes = relay.fetch(&fetch.request, NOW)?;
+    let packet = envelopes.first().ok_or("no m1 envelope")?.packet.clone();
+    let queue_a = a.state.mailbox_queue_id;
+
+    // Re-encapsulate the SAME ciphertext under a fresh outer ID and
+    // signature, at two apparent ages: fresh-looking and older. Both
+    // must reject at dedup without a commit or a ratchet touch.
+    for apparent_expiry in [NOW + 3_600, NOW + 60] {
+        let generation_before = a.store.generation()?;
+        let message_id = MessageId::random();
+        let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+            queue_a,
+            message_id,
+            &packet.digest(),
+            apparent_expiry,
+        ));
+        let outcome = a.accept_envelope(
+            queue_a,
+            message_id,
+            packet.clone(),
+            apparent_expiry,
+            signature,
+            NOW,
+        );
+        assert!(
+            matches!(outcome, Err(LabError::DuplicateMessage)),
+            "the replayed digest was not rejected"
+        );
+        assert_eq!(
+            a.store.generation()?,
+            generation_before,
+            "the replay committed"
+        );
+        assert_eq!(
+            active_mode(&a)?,
+            SessionMode::Ready,
+            "the replay touched the ratchet"
+        );
+        assert_eq!(
+            a.state
+                .active_session
+                .as_ref()
+                .ok_or("no session")?
+                .highest_contiguous_received_seq,
+            1,
+            "the replay moved the receive water"
+        );
+    }
+
+    // Durable retention: after a drop/reopen the same replay still
+    // rejects at the bounds with no commit.
+    drop(a);
+    let mut a = open_client(&a_dir)?;
+    let generation_before = a.store.generation()?;
+    let message_id = MessageId::random();
+    let signature = a.keypairs.send.sign(&super::send_signing_bytes(
+        queue_a,
+        message_id,
+        &packet.digest(),
+        NOW + 3_600,
+    ));
+    let outcome = a.accept_envelope(queue_a, message_id, packet, NOW + 3_600, signature, NOW);
+    assert!(
+        matches!(outcome, Err(LabError::DuplicateMessage)),
+        "the replayed digest was not rejected after reopen"
+    );
+    assert_eq!(a.store.generation()?, generation_before);
+    assert_eq!(active_mode(&a)?, SessionMode::Ready);
+    Ok(())
+}
+
+/// Finding 3: the accept's `now` sweeps expired sends before the
+/// staging tail — an expired Pending control receipt is swept AND
+/// replaced in the same receipt-only accept pass (pre-fix it squatted
+/// in the any-pending guard forever).
+#[test]
+fn expired_control_receipt_re_stages_on_receipt_only_traffic()
+-> std::result::Result<(), Box<dyn Error>> {
+    const TTL: u64 = 7 * 24 * 60 * 60;
+    let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
+
+    // A accepts m1, then m2 with its counter fabricated to 24
+    // outstanding: the arm-first tail raises the debt water (2) and
+    // flushes one control receipt (hw 2, seq 25) in the same pass.
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    {
+        let active = a.state.active_session.as_mut().ok_or("no session")?;
+        active.last_assigned_send_seq = 24;
+        active.mode = SessionMode::ControlOnly;
+    }
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let receipts = pending_receipts(&a);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].high_water, Some(2));
+    assert_eq!(receipts[0].sequence, 25);
+
+    // The receipt expires undelivered (the relay purges it). A receipt-
+    // only packet then arrives: the accept sweeps the corpse to Expired
+    // AND stages the fresh replacement in the same pass.
+    let past = NOW + TTL + 1;
+    let b_signal = outstanding(&b)?;
+    let (message_id, packet, signature, expires_at) =
+        forge_receipt_envelope(&mut b, &a, 2, 3, past, b_signal)?;
+    let queue_id = a.state.mailbox_queue_id;
+    let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, past)?;
+    assert_eq!(outcome, AcceptOutcome::ReceiptApplied);
+    assert!(
+        a.state
+            .sends
+            .iter()
+            .any(|record| record.state == crate::state::SendState::Expired
+                && record.kind == crate::state::SendKind::Receipt
+                && record.sequence == 25),
+        "the expired receipt was not swept"
+    );
+    let receipts = pending_receipts(&a);
+    assert_eq!(
+        receipts.len(),
+        1,
+        "the swept receipt was not replaced in the same pass"
+    );
+    assert_eq!(receipts[0].high_water, Some(3));
+    assert_eq!(receipts[0].sequence, 26);
+    assert_eq!(receipts[0].expires_at, past + TTL);
     Ok(())
 }
