@@ -1285,7 +1285,16 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     ///
     /// Returns whether a receipt staged. Idempotent and safe to call on
     /// a timer: with nothing owed, nothing eligible, or the cooldown
-    /// still closed it stages nothing.
+    /// still closed it stages nothing AND commits nothing.
+    ///
+    /// **Caller liveness obligation (review D2b v14, Fable).** Control
+    /// allows at most one UNRESOLVED send, and `DeliveryUnknown` counts
+    /// as unresolved. So a `DeliveryUnknown` control record blocks the
+    /// whole control lane until the caller clears it — no amount of
+    /// `flush_control` will free it before its 7-day envelope TTL.
+    /// Draining `delivery_unknowns()` through `consume_delivery_unknown`
+    /// is therefore a LIVENESS requirement, not bookkeeping: a caller
+    /// that ignores it can leave a congested peer unanswered for a week.
     ///
     /// # Errors
     ///
@@ -1293,6 +1302,13 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     /// or on commit failure.
     pub fn flush_control(&mut self, now: u64) -> Result<bool> {
         self.ensure_ready()?;
+        // Do not commit a no-op tick (review D2b v14, Fable): a bare
+        // timer call would otherwise bump the generation, rewrite the
+        // whole encrypted snapshot, and turn a transient commit failure
+        // into `ReconcileRequired` on a perfectly healthy client.
+        if !self.control_work_pending(now) {
+            return Ok(false);
+        }
         let mut staged = false;
         self.mutate(
             |_current| Ok(()),
@@ -1308,6 +1324,44 @@ impl<P: StateKeyProtector> PersistentClient<P> {
             },
         )?;
         Ok(staged)
+    }
+
+    /// Consume one accepted inbound record: remove it, create the ACK
+    /// intent, and stage the coalesced receipt when the lane allows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LabError::MessageNotFound`] for an unknown or already
+    /// Whether a `flush_control` pass could change anything: an expiry
+    /// sweep is due, a terminal record is prunable, or a receipt is
+    /// owed and currently eligible.
+    fn control_work_pending(&self, now: u64) -> bool {
+        let sweepable = self.state.sends.iter().any(|record| {
+            (matches!(
+                record.state,
+                SendState::Pending | SendState::DeliveryUnknown
+            ) && record.expires_at <= now)
+                || (matches!(
+                    record.state,
+                    SendState::Stored | SendState::Duplicate | SendState::Expired
+                ) && record.expires_at.saturating_add(TOMBSTONE_TTL_SECONDS) <= now)
+        }) || self
+            .state
+            .acks
+            .iter()
+            .any(|ack| ack.state == AckState::Pending && ack.valid_until <= now);
+        if sweepable {
+            return true;
+        }
+        let Some(active) = self.state.active_session.as_ref() else {
+            return false;
+        };
+        if active.mode == SessionMode::RekeyRequired || now < active.control_send_not_before {
+            return false;
+        }
+        let marker = active.last_delivered_receipt_high_water;
+        let owed = active.receipt_debt_up_to > marker || active.control_debt_up_to > marker;
+        owed && active.highest_contiguous_received_seq > marker
     }
 
     /// Consume one accepted inbound record: remove it, create the ACK
@@ -2696,15 +2750,29 @@ fn track_sender_sequence(active: &mut ActiveSession, send_seq: u64) -> Result<()
 /// Whether a dedup record may be reclaimed (review D2b v12, Sol's P1-2).
 ///
 /// The frozen rule (`docs/persistence-spike-design.md`, "Bounded
-/// capacity and backpressure"): a record with no pending body/ACK
-/// reference becomes eligible by exactly one of two paths — (a) at least
-/// seven days after the observed `Deleted`/`AlreadyDeleted`, which is
-/// what `DedupState::Acked` records, and after message expiry; or (b)
-/// when the ACK became terminal solely because message retention
-/// expired, which is what `DedupState::Expired` records, at least seven
-/// days after that signed expiry. Both reduce to the same test because
-/// the state itself records which path was taken. `Accepted` is never
-/// reclaimable — that envelope is still live.
+/// capacity and backpressure"): a record with **no pending body/ACK
+/// reference** becomes eligible at least seven days after the signed
+/// message expiry. The rule's two paths — (a) after the observed
+/// `Deleted`/`AlreadyDeleted`, which is what `DedupState::Acked`
+/// records, and (b) when the ACK became terminal solely because
+/// retention expired, which is what `Expired` records — are the two ways
+/// an APPLICATION record sheds its ACK reference.
+///
+/// **Review D2b v14 (Fable):** keying eligibility on those two STATES
+/// rather than on the reference itself made receipt records immortal.
+/// A receipt produces no inbound record, so `consume_inbound` never runs
+/// for it, so it never acquires an ACK intent, so it can never leave
+/// `Accepted` — and every accepted peer receipt permanently consumed one
+/// of the 4,096 slots until inbound closed for the life of the profile,
+/// with no rebootstrap path out. The test is therefore the REFERENCE,
+/// not the state: an application record is referenced by its inbound
+/// record until consumed and by its ACK intent until that ACK is
+/// terminal, so this is exactly as strict for applications as the
+/// two-path rule was, while letting control records age out.
+///
+/// An `Accepted` record still cannot be reclaimed while its envelope is
+/// live: it is referenced, or it is inside the seven-day window, or
+/// both.
 ///
 /// Why reclaiming does not weaken replay protection: the only party who
 /// can re-present a reclaimed packet is one holding our mailbox SEND
@@ -2722,8 +2790,7 @@ fn dedup_reclaimable(
     record: &DedupRecord,
     now: u64,
 ) -> bool {
-    record.state != DedupState::Accepted
-        && record.expires_at.saturating_add(TOMBSTONE_TTL_SECONDS) <= now
+    record.expires_at.saturating_add(TOMBSTONE_TTL_SECONDS) <= now
         && !inbound
             .iter()
             .any(|pending| pending.message_id == record.message_id)

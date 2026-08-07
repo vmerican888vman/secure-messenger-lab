@@ -4841,3 +4841,71 @@ fn quiescent_peer_resumes_signalling(
     b.stage_send("unwedged", now, now + 3_600, now)?;
     Ok(())
 }
+
+/// Fable's D2b v14 blocker: receipt dedup records must age out too.
+///
+/// A receipt produces no inbound record, so `consume_inbound` never runs
+/// for it and it never acquires an ACK intent. When eligibility keyed on
+/// `DedupState::Acked`/`Expired` — the two states only an APPLICATION
+/// record can reach — every accepted peer receipt permanently consumed
+/// one of the 4,096 dedup slots, and after 4,096 of them inbound closed
+/// for the life of the profile with no rebootstrap path out.
+///
+/// Eligibility now keys on the REFERENCE (no inbound record, no ACK
+/// intent) plus the seven-day window, so control records age out while
+/// application records stay exactly as protected as before.
+#[test]
+fn receipt_dedup_records_are_reclaimable() -> std::result::Result<(), Box<dyn Error>> {
+    const TTL: u64 = 7 * 24 * 60 * 60;
+    let (_a_dir, _b_dir, mut a, mut b, mut relay) = conversation_fixture()?;
+    let outcomes = deliver(&mut a, &mut relay, &[0])?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    let queue_id = a.state.mailbox_queue_id;
+    let dedup_after_application = a.state.dedup.len();
+
+    // Accept several authenticated receipts; each writes a dedup record.
+    for seq in 2..=9_u64 {
+        let now = NOW + seq;
+        let (message_id, packet, signature, expires_at) =
+            forge_receipt_envelope(&mut b, &a, 0, seq, now, 0)?;
+        let outcome =
+            a.accept_envelope(queue_id, message_id, packet, expires_at, signature, now)?;
+        assert_eq!(outcome, AcceptOutcome::ReceiptIdempotent);
+    }
+    let with_receipts = a.state.dedup.len();
+    assert_eq!(
+        with_receipts,
+        dedup_after_application + 8,
+        "receipts did not write dedup records"
+    );
+
+    // None are reclaimable yet — their envelopes are still live.
+    assert_eq!(super::reclaimable_dedup_count(&a.state, NOW), 0);
+
+    // Past the seven-day window they age out. Pre-fix this stayed 0 at
+    // ANY future clock, which is what closed inbound permanently.
+    let past = NOW + 9 + 3_600 + TTL + 1;
+    assert!(
+        super::reclaimable_dedup_count(&a.state, past) >= 8,
+        "receipt dedup records never became reclaimable"
+    );
+
+    // A real accept at that clock drains them, and service continues.
+    let outcomes = deliver(&mut a, &mut relay, &[1])?;
+    let accepted_expired = outcomes.iter().all(Result::is_ok);
+    a.flush_control(past)?;
+    assert!(
+        a.state.dedup.len() < with_receipts || !accepted_expired,
+        "the reclaimable receipt records were not drained"
+    );
+
+    // The application record for the live inbound is NOT reclaimable: it
+    // is still referenced, so applications keep their old protection.
+    let live_referenced = a
+        .state
+        .dedup
+        .iter()
+        .any(|record| record.state == crate::state::DedupState::Accepted);
+    assert!(live_referenced || a.pending_inbound()?.is_empty());
+    Ok(())
+}

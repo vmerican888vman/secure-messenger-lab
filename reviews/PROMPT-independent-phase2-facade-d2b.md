@@ -1,5 +1,57 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v15)
+
+Version 14 (head `6d4c922`): Fable RETURN with one blocking finding
+(`reviews/REVIEW-fable-facade-d2b-v14.md`). Fable states the control-lane
+split itself survived every attack and would have passed on its own
+terms; the blocker is a carry-over in the same leg, and it is a defect in
+my OWN v13 remediation rather than in the split.
+
+**Receipt dedup records were immortal.** `dedup_reclaimable` keyed
+eligibility on `DedupState::Acked`/`Expired` — the two states only an
+APPLICATION record can reach, because both transitions run off an ACK
+intent and ACK intents are created only by `consume_inbound`. A receipt
+produces no inbound record, so it never acquires an ACK intent, so it
+could never leave `Accepted`. Every accepted peer receipt therefore
+consumed one of the 4,096 dedup slots permanently, and after 4,096 of
+them the pre-decrypt bound refused every further packet at any future
+clock with no rebootstrap path out — strictly worse than the
+`RekeyRequired` failure §4 designates as designed. Fable reproduced it.
+So the v13 fix for Sol's v12 P1-2 closed only the ACK-referenced arm.
+
+Eligibility now keys on the REFERENCE rather than the state: a record is
+reclaimable seven days past its signed expiry when no inbound record and
+no ACK intent still point at it. That is exactly as strict for
+applications as the two-path rule was — an application record is
+referenced by its inbound record until consumed and by its ACK intent
+until that ACK is terminal — while letting control records age out.
+Regression: `receipt_dedup_records_are_reclaimable`, confirmed to fail
+against the previous predicate.
+
+Two of Fable's non-blocking items are also addressed, both liveness:
+
+- **`flush_control` no longer commits a no-op tick.** A bare timer call
+  used to bump the generation and rewrite the whole encrypted snapshot,
+  so a transient commit failure could take a healthy client to
+  `ReconcileRequired`. `control_work_pending` now short-circuits.
+- **The caller's liveness obligation is documented.** A `DeliveryUnknown`
+  control record counts as unresolved and so blocks the entire control
+  lane until the caller clears it — no amount of `flush_control` frees it
+  before the 7-day TTL. Draining `delivery_unknowns()` is a liveness
+  requirement, not bookkeeping, and `flush_control`'s docs now say so.
+
+Fable ruled that neither flagged open item should block: the unbounded
+shared sequence distance must NOT be fixed with a ceiling that gates
+control encryption (that is the v6–v12 deadlock family again), and the
+`SCHEMA_VERSION` fail-closed claim was verified in the codec. Both
+rulings are recorded in the v14 review artifact.
+
+Fable's remaining non-blocking items (uncovered `ReceiptFlushedRetry`,
+untested new validation rules, the dead `hcr_receipt_pending` condition,
+one vacuous assertion) are deliberately NOT addressed here, to keep this
+head a narrow delta over the reviewed one.
+
 ## Remediation history (v14 — §4 control-lane split)
 
 Version 13 (head `e2f7ffa`) carried a deliberately OPEN P1: the
