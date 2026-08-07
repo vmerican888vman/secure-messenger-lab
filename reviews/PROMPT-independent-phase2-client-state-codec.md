@@ -18,12 +18,102 @@ the frozen design that is not documented as a deviation.
   safety, complete-consumption and trailing-byte rejection, bounded canonical-JSON verification.
 - `src/state/records.rs` — object types 0x0002–0x0009 and all nested record layouts.
 - `src/state/mod.rs` — top-level framing (magic `SMSLCSV1`, object type 0x0001, nineteen fields),
-  the §3 bounds table, `ClientStateV1::decode`/`encode`.
+  the §3 bounds table and the SPLIT send quotas, `ClientStateV1::decode`/`encode`.
 - `src/state/validate.rs` — the §3 post-unpickle semantic validation and the §4 high-water/mode
   invariants it cites.
-- `src/state/tests.rs` — 49 tests, including fixtures built from real vodozemac operations.
+- `src/state/tests.rs` — 87 tests, including fixtures built from real vodozemac operations.
 
-## Remediation history
+## Remediation history (v9 — RE-PINNED after façade drift)
+
+**Read this first: the previously circulated codec head `11a32aa` is
+dead.** It was pinned for review and never dispatched, and `src/state/`
+has since moved under it by ten commits and ~840 lines while the façade
+leg D2b was remediated. Reviewing `11a32aa` would have certified a layout
+that no longer exists. This brief is re-pinned to the current head, which
+carries a **dual PASS on façade D2b** (`a33d2ba`) — so the codec is now
+being reviewed against the shape its only consumer actually uses.
+
+Nothing in the v7/v8 remediation below was reverted; the entries still
+stand. What follows is the accumulated delta you must review IN ADDITION.
+
+### Layout changes since `11a32aa`
+
+- **`ActiveSession` 21 → 23 fields.** Field 22
+  `unreceipted_application_send_seqs: Vec<u64>` (canonical strictly
+  increasing, duplicate-free, bounded 24) and field 23
+  `control_send_not_before: u64`. These implement the §4 control-lane
+  split authorised by the security architect: the application budget is
+  now the LENGTH of field 22, not the shared sequence distance. A field
+  22 was briefly added and reverted at v12/v13 for a different purpose
+  (`control_signal_response_at`) — the current field 22 is unrelated to
+  that and the wire position was reused deliberately while the codec is
+  pre-PASS.
+- **`DedupRecord` 7 → 8 fields.** Field 8 `message_digest: [u8; 32]` is
+  the digest of the INNER Olm `Message`'s canonical bytes,
+  variant-independent, and is now the dedup identity. Field 5
+  `packet_digest` is unchanged and remains the envelope/ACK binding.
+- **`SessionMode::ReceiptLocked` (discriminant 3) is RETIRED.** The
+  discriminant is left as a numbering gap so no persisted value silently
+  changes meaning; stored value 3 must be rejected on load. Modes are
+  `Ready` below 24 application outstanding, `ControlOnly` at exactly 24,
+  more malformed, `RekeyRequired` orthogonal and dominant across 0..=24.
+- **Send quotas split:** `MAX_SENDS` 32 → 40, with independent
+  `MAX_APPLICATION_SENDS` = 32 and `MAX_CONTROL_SENDS` = 8, plus at most
+  one UNRESOLVED (`Pending` or `DeliveryUnknown`) control record.
+
+### Validation changes since `11a32aa`
+
+- `check_high_water` now keys the budget on the application ledger, not
+  the shared sequence distance. **The old `outstanding > MAX_OUTSTANDING`
+  malformed-state check is GONE** — nothing now bounds how far
+  `last_assigned_send_seq` may run ahead of `peer_contiguous_high_water`
+  in a persisted state. Both independent reviewers of the façade leg
+  ruled this non-blocking THERE, and both warned specifically against
+  re-adding any bound that gates control encryption (that reintroduces a
+  deadlock family that cost seven review rounds). **A load-time-only
+  ceiling is still open for you to rule on as a CODEC question**, which
+  is the right place for it.
+- New `check_application_ledger`: every retained application record above
+  the peer high water must appear in the ledger; no receipt-kind sequence
+  may appear; no record at or below the high water may appear; and a
+  ledger entry need NOT retain a record, because pruning is precisely why
+  the durable ledger exists.
+- Ledger entries must be nonzero and satisfy
+  `peer_contiguous_high_water < seq <= last_assigned_send_seq`.
+- `control_debt_up_to` may now sit ABOVE the contiguous received water
+  when it is present in `received_above_high_water` — the peer-signalled
+  arm binds debt to the signalling packet's sequence, which under
+  reordering legitimately leads the contiguous water.
+- `control_send_not_before <= last_assigned_send_seq` is required only in
+  the weak sense that a nonzero cooldown implies at least one assigned
+  sequence.
+- Per-kind send quotas and the one-unresolved-control rule are enforced
+  structurally.
+
+### What I most want attacked
+
+1. **Is the ledger a sound authority?** It outlives its records by
+   design. Construct a persisted state that validation ACCEPTS but whose
+   ledger misrepresents real capacity in a way the façade would act on.
+2. **The retired discriminant.** Confirm stored `SessionMode` byte 3 is
+   rejected, and that no other value aliases a live mode.
+3. **The removed ceiling.** Rule on whether a load-time-only bound on the
+   shared sequence distance belongs in the codec, given the explicit
+   warning against anything that gates control encryption at runtime.
+4. **Field 22's reuse.** The wire position previously held a different
+   `u64` field that was added and reverted. The codec is pre-PASS so no
+   persisted state should exist, but say whether the reuse is safe to
+   leave undocumented in the frozen text.
+5. **`SCHEMA_VERSION` is still 1** across three layout changes. Both
+   façade reviewers called this non-blocking-but-migration-debt. It is
+   squarely a codec decision — rule on it.
+6. **Carried P3 from an earlier façade round:** the ACCEPT direction of
+   the relaxed `control_debt_up_to` rule (a debt water sitting in the
+   out-of-order set decodes cleanly) is currently proven only via
+   persistent-layer commits. A companion splice case in `src/state/tests.rs`
+   would pin it directly. Say whether that gap should block.
+
+## Remediation history (v8)
 
 **v7 split verdict:** one reviewer PASSed `89027ea`
 (`reviews/REVIEW-codec-v7-pass.md`); the other RETURNed it
