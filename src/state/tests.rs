@@ -312,6 +312,7 @@ fn make_active_session(
         received_above_high_water: vec![3],
         conversation_id,
         last_delivered_receipt_high_water: 1,
+        receipt_debt_up_to: 0,
     })
 }
 
@@ -2913,6 +2914,52 @@ fn field_19_round_trips_byte_identically() -> Result<(), Box<dyn Error>> {
     let decoded = ClientStateV1::decode(&encoded)?;
     let reencoded = decoded.encode()?;
     assert_eq!(&encoded[..], &reencoded[..]);
+    Ok(())
+}
+
+// --- review D2b v5: field 20 (receipt debt) ----------------------------------
+
+/// Field 20 (`receipt_debt_up_to`) is the highest CONSUMED application
+/// sequence: 0 always validates; a nonzero debt must be covered by the
+/// contiguous received water or sit in the out-of-order set — nothing
+/// can have been consumed before it was received.
+#[test]
+fn receipt_debt_never_exceeds_received_coverage() -> Result<(), Box<dyn Error>> {
+    // The populated fixture has HCR 1 and the out-of-order set {3}:
+    // debt 0 (exempt), 1 (covered by the water) and 3 (in the gap set)
+    // validate; 2 and 4 (uncovered) reject.
+    for (debt, valid) in [(0_u64, true), (1, true), (3, true), (2, false), (4, false)] {
+        let mut fixture = populated_fixture()?;
+        fixture
+            .state
+            .active_session
+            .as_mut()
+            .ok_or("no session")?
+            .receipt_debt_up_to = debt;
+        assert_eq!(fixture.state.encode().is_ok(), valid, "debt {debt}");
+    }
+
+    // Decode path: splice a session object whose field 20 is uncovered
+    // into the genuine encoding.
+    let mut fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active.receipt_debt_up_to = 2;
+    let session_bytes = active.encode()?;
+    let bytes = splice_top(&encoded, 14, field_block(15, &session_bytes)?)?;
+    assert!(ClientStateV1::decode(&bytes).is_err());
+
+    // A state carrying a covered debt round-trips byte-identically.
+    let mut fixture = populated_fixture()?;
+    fixture
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no session")?
+        .receipt_debt_up_to = 3;
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
     Ok(())
 }
 

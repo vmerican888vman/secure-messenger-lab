@@ -641,6 +641,18 @@ fn check_high_water(active: &ActiveSession) -> Result<()> {
     if active.last_delivered_receipt_high_water > active.highest_contiguous_received_seq {
         return Err(LabError::Storage);
     }
+    // Review D2b v5 (field 20): the receipt debt is the highest CONSUMED
+    // application sequence — nothing can have been consumed before it
+    // was received, so the debt must be covered by the contiguous water
+    // or sit in the out-of-order received set (0 = nothing consumed).
+    if active.receipt_debt_up_to != 0
+        && active.receipt_debt_up_to > active.highest_contiguous_received_seq
+        && !active
+            .received_above_high_water
+            .contains(&active.receipt_debt_up_to)
+    {
+        return Err(LabError::Storage);
+    }
     Ok(())
 }
 

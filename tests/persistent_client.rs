@@ -659,7 +659,7 @@ fn persistent_client_is_neither_sync_nor_clone() {
 
 // --- D2a: outbound send path ------------------------------------------------
 
-use secure_messenger_lab::{DurableAction, LabError, SendOutcome};
+use secure_messenger_lab::{DurableAction, LabError, SendOutcome, StageSendOutcome};
 use vodozemac::olm::{OlmMessage, SessionConfig};
 
 fn send_signing_bytes(
@@ -703,13 +703,31 @@ fn assert_same_request(
     );
 }
 
+/// Stage an application body, requiring the `Staged` outcome (a
+/// `ReceiptFlushedRetry` here means the test setup drifted into receipt
+/// debt, which these D2a send-path tests never create).
+fn stage_app(
+    client: &mut PersistentClient<TestProtector>,
+    body: &str,
+    sent_at: u64,
+    expires_at: u64,
+    now: u64,
+) -> Result<DurableAction<secure_messenger_lab::SendRequest>, Box<dyn Error>> {
+    match client.stage_send(body, sent_at, expires_at, now)? {
+        StageSendOutcome::Staged(action) => Ok(action),
+        StageSendOutcome::ReceiptFlushedRetry => {
+            Err("stage_send flushed a receipt instead of staging".into())
+        }
+    }
+}
+
 #[test]
 fn send_round_trip_and_crash_recovery() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let (mut client, mut peer) = send_ready_client(&temp)?;
     let identity = client.public_identity()?;
 
-    let action = client.stage_send("hello d2a", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "hello d2a", NOW, NOW + 3_600, NOW)?;
     assert_eq!(action.request.queue_id, peer.queue_id);
     // The exact request verifies against the peer's send capability.
     peer.send_keypair
@@ -767,8 +785,8 @@ fn send_round_trip_and_crash_recovery() -> Result<(), Box<dyn Error>> {
 fn send_token_discipline() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let (mut client, _peer) = send_ready_client(&temp)?;
-    let action_a = client.stage_send("first", NOW, NOW + 3_600, NOW)?;
-    let action_b = client.stage_send("second", NOW, NOW + 3_600, NOW)?;
+    let action_a = stage_app(&mut client, "first", NOW, NOW + 3_600, NOW)?;
+    let action_b = stage_app(&mut client, "second", NOW, NOW + 3_600, NOW)?;
 
     // Token matches nothing.
     let wrong_token = DurableAction {
@@ -840,7 +858,7 @@ fn send_expiry_sweep() -> Result<(), Box<dyn Error>> {
     client.stage_send("short-lived", NOW, NOW + 10, NOW)?;
     // The next send-path mutator at a later clock sweeps the expired
     // record to Expired.
-    let action = client.stage_send("current", NOW + 20, NOW + 3_600, NOW + 20)?;
+    let action = stage_app(&mut client, "current", NOW + 20, NOW + 3_600, NOW + 20)?;
     let pending = client.pending_send_actions()?;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending.first().ok_or("no pending")?.token, action.token);
@@ -857,7 +875,7 @@ fn send_expiry_sweep() -> Result<(), Box<dyn Error>> {
 fn delivery_unknown_flow() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let (mut client, _peer) = send_ready_client(&temp)?;
-    let action = client.stage_send("uncertain", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "uncertain", NOW, NOW + 3_600, NOW)?;
     client.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
 
     let unknowns = client.delivery_unknowns()?;
@@ -874,7 +892,7 @@ fn delivery_unknown_flow() -> Result<(), Box<dyn Error>> {
             .consume_delivery_unknown(secure_messenger_lab::MessageId::random(), NOW)
             .is_err()
     );
-    let pending = client.stage_send("still pending", NOW, NOW + 3_600, NOW)?;
+    let pending = stage_app(&mut client, "still pending", NOW, NOW + 3_600, NOW)?;
     assert!(
         client
             .consume_delivery_unknown(pending.request.message_id, NOW)
@@ -900,7 +918,7 @@ fn send_crash_discipline_between_every_mutator() -> Result<(), Box<dyn Error>> {
     drop(client);
 
     let mut client = open_client(&temp)?;
-    let action = client.stage_send("durable", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "durable", NOW, NOW + 3_600, NOW)?;
     drop(client);
 
     let mut client = open_client(&temp)?;
@@ -916,7 +934,7 @@ fn send_crash_discipline_between_every_mutator() -> Result<(), Box<dyn Error>> {
     // (foreign action from a different client).
     let temp2 = TempDir::new()?;
     let (mut foreign, _foreign_peer) = send_ready_client(&temp2)?;
-    let foreign_action = foreign.stage_send("not yours", NOW, NOW + 3_600, NOW)?;
+    let foreign_action = stage_app(&mut foreign, "not yours", NOW, NOW + 3_600, NOW)?;
     assert!(
         client
             .record_send_result(&foreign_action, SendOutcome::Stored)
@@ -929,7 +947,7 @@ fn send_crash_discipline_between_every_mutator() -> Result<(), Box<dyn Error>> {
 fn send_reconcile_required_on_commit_failure() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let (mut client, _peer) = send_ready_client(&temp)?;
-    let action = client.stage_send("committed", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "committed", NOW, NOW + 3_600, NOW)?;
 
     let connection = Connection::open(database_path(&temp))?;
     let nonce: Vec<u8> =
@@ -1002,7 +1020,7 @@ fn escape_inflated_body_rejected_as_invalid_payload() -> Result<(), Box<dyn Erro
         Err(LabError::InvalidPayload)
     ));
     // The rejection assigned nothing: the next send still gets sequence 1.
-    let action = client.stage_send("clean", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "clean", NOW, NOW + 3_600, NOW)?;
     let olm_message: OlmMessage = serde_json::from_slice(action.request.packet.as_bytes())?;
     let OlmMessage::PreKey(pre_key) = olm_message else {
         return Err("first staged packet must be a pre-key message".into());
@@ -1046,7 +1064,7 @@ fn public_signature_types_are_exported() {
 fn send_result_requires_message_id_binding() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let (mut client, _peer) = send_ready_client(&temp)?;
-    let action = client.stage_send("bound", NOW, NOW + 3_600, NOW)?;
+    let action = stage_app(&mut client, "bound", NOW, NOW + 3_600, NOW)?;
 
     // Foreign message ID in the request, correct token.
     let mut foreign = action.clone();

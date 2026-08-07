@@ -1,5 +1,34 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v6)
+
+Version 5 (head `e3849849b0bac34ed66d4eee2a5b6b5fd3723f3c`) was RETURNED by
+Sol with four P1 interleaving blockers (verdict in
+`reviews/REVIEW-sol-facade-d2b-v5.md`). The head under review replaces the
+v5 quiescence mechanism with an explicit debt model and fixes all four:
+
+- **Debt model (codec field 20 `receipt_debt_up_to`):** the highest consumed
+  APPLICATION sequence; set only by `consume_inbound`, never by receipts —
+  quiescence by construction, no marker-bump heuristics. Owed ⇔ debt >
+  marker AND HCR > marker AND no in-flight receipt covering HCR. The marker
+  (field 19) still advances only on Stored/Duplicate.
+- **P1-1 reordered receipts:** a receipt whose high water regresses or
+  repeats is a content no-op (`ReceiptIdempotent`) whose sequence/dedup
+  progress COMMITS; only the update is rejected. Future high water still
+  hard-errors. Sequence tracking can no longer wedge.
+- **P1-2:** `stage_send` recomputes the mode from the new outstanding
+  immediately after owed staging, before the application decision.
+- **P1-3:** `stage_send` now returns `StageSendOutcome`
+  (`Staged(action)` / `ReceiptFlushedRetry`) — when the application cannot
+  be admitted after owed staging, the receipt-bearing candidate COMMITS and
+  the caller gets an explicit retry outcome (public signature change,
+  exported).
+- **P1-4:** falls out of the debt model — a gap-filling receipt drains HCR
+  past pre-existing consumed debt and the owed rule stages in the same
+  pass; receipt-only exchanges still stage nothing.
+
+The v2–v5 histories follow unchanged.
+
 ## Remediation history (v5)
 
 Version 4 (head `844f6b1229a1a9ed275138725cf94bc08b008d4c`) was RETURNED by

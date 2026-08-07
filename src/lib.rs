@@ -35,6 +35,7 @@ pub use persistence::{KeyStatus, ProfileBinding, ProtectionLevel, StateKeyProtec
 pub use persistent::{
     AcceptOutcome, AckOutcomeView, DeliveryUnknownView, DurableAction, InboundView,
     PersistentClient, PublicIdentity, RedactedContactOffer, RegistrationOutcome, SendOutcome,
+    StageSendOutcome,
 };
 pub use private_store_dir::{MainDatabase, PrivateStoreDir, StoreKind};
 pub use relay::{AckOutcome, EnqueueOutcome, Relay, StoredEnvelope};

@@ -387,10 +387,24 @@ impl HighWaterReceipt {
 /// added it as `last_staged_...`; v4 renamed it in place (same wire
 /// position, codec still pre-PASS) because the marker now advances only
 /// when a receipt send reaches a delivered terminal state, never at
-/// staging. A receipt is owed while `highest_contiguous_received_seq`
-/// exceeds it. Validation requires the marker never to exceed
+/// staging. Validation requires the marker never to exceed
 /// `highest_contiguous_received_seq` — no receipt can have reported a
-/// high water never reached. The object declares 19 fields.
+/// high water never reached.
+///
+/// **Wire-layout amendment (review D2b v5):** field 20,
+/// `receipt_debt_up_to: u64`, is the highest APPLICATION payload
+/// sequence CONSUMED so far (this epoch); it is set only by
+/// `consume_inbound` (max of the current value and the consumed record's
+/// sender sequence). Receipts and other control payloads are never
+/// consumed application records, so receipt-only exchanges never raise
+/// it — receipt debt exists only where a user-visible body was consumed.
+/// A receipt is owed while both this debt and
+/// `highest_contiguous_received_seq` exceed the delivered marker (field
+/// 19) and no pending receipt already reports the current water.
+/// Validation: 0 (nothing consumed), or a value covered by the
+/// contiguous received high water or present in the out-of-order
+/// received set — nothing can have been consumed before it was
+/// received. The object declares 20 fields.
 pub(crate) struct ActiveSession {
     pub(crate) role: Role,
     /// Bounded canonical JSON (`SessionPickle`), secret-bearing.
@@ -414,6 +428,9 @@ pub(crate) struct ActiveSession {
     /// reported; 0 = none delivered (field 19). Never exceeds
     /// `highest_contiguous_received_seq`.
     pub(crate) last_delivered_receipt_high_water: u64,
+    /// Highest consumed application sender sequence; 0 = nothing
+    /// consumed (field 20). Never exceeds the received water coverage.
+    pub(crate) receipt_debt_up_to: u64,
 }
 
 impl ActiveSession {
@@ -445,6 +462,7 @@ impl ActiveSession {
         let received = parse_u64_set(object.field(17)?, MAX_RECEIVED_SET)?;
         let conversation_id = conversation_id(object.field(18)?)?;
         let last_delivered_receipt_high_water = u64_value(object.field(19)?)?;
+        let receipt_debt_up_to = u64_value(object.field(20)?)?;
         object.finish()?;
         Ok(Self {
             role,
@@ -462,6 +480,7 @@ impl ActiveSession {
             received_above_high_water: received,
             conversation_id,
             last_delivered_receipt_high_water,
+            receipt_debt_up_to,
         })
     }
 
@@ -483,6 +502,7 @@ impl ActiveSession {
         let received_bytes = encode_u64_set(&self.received_above_high_water, MAX_RECEIVED_SET)?;
         let last_delivered_receipt_high_water =
             self.last_delivered_receipt_high_water.to_be_bytes();
+        let receipt_debt_up_to = self.receipt_debt_up_to.to_be_bytes();
         let object = tlv::write_object(
             ACTIVE_SESSION_TYPE,
             &[
@@ -505,6 +525,7 @@ impl ActiveSession {
                 (17, &received_bytes),
                 (18, self.conversation_id.as_bytes()),
                 (19, &last_delivered_receipt_high_water),
+                (20, &receipt_debt_up_to),
             ],
         )?;
         Ok(Zeroizing::new(object))
