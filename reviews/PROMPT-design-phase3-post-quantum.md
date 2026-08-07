@@ -1,3 +1,13 @@
+> **SUPERSEDED.** Answered by the security architect; the ruling is
+> `docs/phase3-post-quantum-decision.md` (Route 1, pull MLS forward).
+>
+> **Three factual errors in this brief, corrected at review:** the
+> send-metadata design question it lists as outstanding was already
+> closed by `6d3922f`; `THREAT_MODEL.md` DOES exist — it is a Phase-0
+> draft that explicitly excludes post-quantum adversaries, so the
+> accurate blocker is "no PQ-inclusive threat model", not "no threat
+> model"; and `SECURITY_STATUS.md` has **14** unchecked blockers, not 13.
+
 # Design brief — post-quantum key agreement (secure-messenger-lab)
 
 **The decision is made: post-quantum is required.** This brief is not
