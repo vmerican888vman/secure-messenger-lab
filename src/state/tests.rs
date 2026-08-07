@@ -3729,3 +3729,71 @@ fn control_debt_in_the_out_of_order_set_round_trips() -> Result<(), Box<dyn Erro
     );
     Ok(())
 }
+
+/// Codec v10 (Sol's P1-2): the inner-message dedup identity must be
+/// unique across every retained record.
+///
+/// `message_digest` is declared THE dedup identity — the whole point of
+/// adding it was that the raw packet digest could not distinguish a
+/// `PreKey` packet from the same inner message re-serialized as `Normal`.
+/// But `check_dedup` never examined it, so two records with distinct
+/// message IDs, sequences and packet digests could share one inner Olm
+/// identity, letting a single ratchet encryption back two conflicting
+/// delivered records.
+///
+/// Both twins here are RETIRED-epoch with a fresh sequence, so neither
+/// the current-epoch sequence-uniqueness rule nor the receive-provenance
+/// rule can fire — the only thing that differs between the reject and
+/// accept arms is the digest, which is what makes this isolate the rule
+/// under test. The identity is variant- and epoch-independent by
+/// construction, which is precisely why it is trusted across a rekey.
+#[test]
+fn duplicate_inner_message_digest_is_rejected() -> Result<(), Box<dyn Error>> {
+    fn with_twin_digest(twin_digest: [u8; 32]) -> Result<Fixture, Box<dyn Error>> {
+        let mut fixture = populated_fixture()?;
+        let (message_id, queue_id, expires_at) = {
+            let first = fixture.state.dedup.first().ok_or("no dedup record")?;
+            (first.message_id, first.queue_id, first.expires_at)
+        };
+        let mut raw = *message_id.as_bytes();
+        raw[0] ^= 0xFF;
+        fixture.state.dedup.push(DedupRecord {
+            message_id: MessageId::from_slice(&raw).ok_or("bad twin id")?,
+            epoch_id: digest(b"retired-epoch"),
+            sequence: 4,
+            queue_id,
+            packet_digest: digest(b"a-different-packet"),
+            expires_at,
+            state: DedupState::Acked,
+            message_digest: twin_digest,
+        });
+        fixture
+            .state
+            .dedup
+            .sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+        Ok(fixture)
+    }
+
+    // Accept arm first: an otherwise identical twin with its OWN
+    // identity must encode, proving the reject arm below isolates the
+    // digest rule rather than the extra record.
+    assert!(
+        with_twin_digest(digest(b"a-different-inner-message"))?
+            .state
+            .encode()
+            .is_ok(),
+        "a distinct inner-message identity was rejected"
+    );
+
+    // Reject arm: the same inner-message identity twice.
+    let shared = {
+        let fixture = populated_fixture()?;
+        let first = fixture.state.dedup.first().ok_or("no dedup record")?;
+        first.message_digest
+    };
+    assert!(
+        with_twin_digest(shared)?.state.encode().is_err(),
+        "two records shared one inner-message identity"
+    );
+    Ok(())
+}

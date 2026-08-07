@@ -943,6 +943,22 @@ fn check_dedup(state: &ClientStateV1, current: Option<(&ActiveSession, &Session)
     // unique across the dedup records of the current epoch (review
     // blocker). Retired-epoch records are exempt — different epoch,
     // different ratchet.
+    // The inner-message digest is the DEDUP IDENTITY (records.rs field
+    // 8), so it must be unique across every retained record — current
+    // and retired epoch alike (codec v10, Sol's P1-2). Without this, two
+    // records with distinct message IDs, sequences, packet digests,
+    // inbound bodies and ACK intents could share one inner Olm identity,
+    // so a single ratchet encryption would back two conflicting
+    // delivered records. Retired-epoch records are NOT exempt here: the
+    // identity is variant- and epoch-independent by construction, which
+    // is exactly why it can be trusted across a rekey.
+    let mut digests: Vec<&[u8; 32]> = Vec::with_capacity(state.dedup.len());
+    for record in &state.dedup {
+        if digests.contains(&&record.message_digest) {
+            return Err(LabError::Storage);
+        }
+        digests.push(&record.message_digest);
+    }
     let mut current_epoch_sequences: Vec<u64> = Vec::new();
     for record in &state.dedup {
         if record.queue_id != state.mailbox_queue_id || record.sequence == 0 {
