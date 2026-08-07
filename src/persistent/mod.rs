@@ -1675,6 +1675,10 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                     packet_digest: None,
                     kind: record.kind,
                     receipt_high_water: record.receipt_high_water,
+                    // Reconstruction for byte-equality only: the
+                    // commitment is computed once at staging and never
+                    // refreshed, so it is carried, not recomputed.
+                    metadata_commitment: record.metadata_commitment,
                 };
                 if digest(&presented.encode()?) != digest(&record.encode()?) {
                     return Err(LabError::Unauthorized);
@@ -1709,10 +1713,15 @@ impl<P: StateKeyProtector> PersistentClient<P> {
                 record.packet = None;
                 record.send_signature = None;
                 record.packet_digest = Some(packet_digest);
-                // Terminal arms carry no high water (codec: field 11 is
-                // present only on a full-arm receipt); the marker above
-                // has already captured the delivered value.
-                record.receipt_high_water = None;
+                // §3 as amended for codec v10 P1-1: a receipt RETAINS
+                // its original high water through terminalization, as
+                // historical origin evidence that the record was staged
+                // as a receipt. Clearing it erased the only typed trace
+                // distinguishing a terminal receipt from a terminal
+                // application. The retained value is evidence only — the
+                // delivered marker was already captured above, on this
+                // successful transition, and nothing else advances it
+                // from this field.
                 if let Some(active) = candidate.state.active_session.as_mut() {
                     if let Some(high_water) = delivered_receipt_hw {
                         // Monotone: an older receipt finishing after a
@@ -1961,11 +1970,11 @@ fn sweep_expired_sends(candidate: &mut Candidate, now: u64) -> Result<()> {
             record.packet = None;
             record.send_signature = None;
             record.packet_digest = Some(packet_digest);
-            // Terminal arms carry no high water (codec: field 11 is
-            // present only on a full-arm receipt); an expired receipt
-            // never delivered, so the marker does not move and the owed
-            // rule re-arms automatically.
-            record.receipt_high_water = None;
+            // §3 as amended for codec v10 P1-1: the high water is
+            // RETAINED here too. An expired receipt never delivered, so
+            // the marker still does not move and the owed rule re-arms
+            // automatically — the retained value is origin evidence, not
+            // a delivery claim.
         }
     }
     Ok(())
@@ -2204,7 +2213,7 @@ fn admit_application_send(
         expires_at,
         signature,
     };
-    candidate.state.sends.push(SendRecord {
+    let mut record = SendRecord {
         message_id,
         state: SendState::Pending,
         epoch_id,
@@ -2216,7 +2225,15 @@ fn admit_application_send(
         packet_digest: None,
         kind: SendKind::Application,
         receipt_high_water: None,
-    });
+        metadata_commitment: [0_u8; 32],
+    };
+    // Computed EXACTLY ONCE, here, where the pending record is staged
+    // (§3 as amended for codec v10 P1-1). There is deliberately no
+    // refresh path and no encode-time repair: a commitment that could be
+    // recomputed later would re-bless whatever the metadata had drifted
+    // to, which is the mutation it exists to catch.
+    record.metadata_commitment = record.compute_metadata_commitment()?;
+    candidate.state.sends.push(record);
     candidate
         .state
         .sends
@@ -3011,7 +3028,7 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
         &packet.digest(),
         expires_at,
     ));
-    candidate.state.sends.push(SendRecord {
+    let mut record = SendRecord {
         message_id,
         state: SendState::Pending,
         epoch_id,
@@ -3023,7 +3040,15 @@ fn stage_receipt(candidate: &mut Candidate, high_water: u64, now: u64) -> Result
         packet_digest: None,
         kind: SendKind::Receipt,
         receipt_high_water: Some(high_water),
-    });
+        metadata_commitment: [0_u8; 32],
+    };
+    // Computed EXACTLY ONCE, here, where the pending record is staged
+    // (§3 as amended for codec v10 P1-1). There is deliberately no
+    // refresh path and no encode-time repair: a commitment that could be
+    // recomputed later would re-bless whatever the metadata had drifted
+    // to, which is the mutation it exists to catch.
+    record.metadata_commitment = record.compute_metadata_commitment()?;
+    candidate.state.sends.push(record);
     candidate
         .state
         .sends

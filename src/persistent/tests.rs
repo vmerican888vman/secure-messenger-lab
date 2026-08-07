@@ -1453,7 +1453,7 @@ fn fill_outbox(
     };
     receipt.signature = b.account.sign(super::receipt_signing_bytes(&receipt));
     for sequence in 1..=32_u64 {
-        a.state.sends.push(crate::state::SendRecord {
+        let mut record = crate::state::SendRecord {
             message_id: MessageId::random(),
             state: crate::state::SendState::Stored,
             epoch_id,
@@ -1465,7 +1465,12 @@ fn fill_outbox(
             packet_digest: Some(crate::capability::digest(&sequence.to_be_bytes())),
             kind: crate::state::SendKind::Application,
             receipt_high_water: None,
-        });
+            metadata_commitment: [0_u8; 32],
+        };
+        // Seal it the way `admit_application_send` would: the §3
+        // metadata commitment is computed once, at construction.
+        record.metadata_commitment = record.compute_metadata_commitment()?;
+        a.state.sends.push(record);
     }
     a.state
         .sends
@@ -2320,6 +2325,12 @@ fn owed_receipt_does_not_compete_for_application_slots() -> std::result::Result<
             32 => record.expires_at = NOW + 3_600 + 100,
             _ => record.expires_at = NOW + 90 * 24 * 60 * 60,
         }
+        // `expires_at` is COMMITTED (§3 field 12), so re-seal: this
+        // fixture is simulating records that were STAGED with these
+        // expiries, not records whose expiry was later mutated. A test
+        // that skipped this would be asserting the commitment rather
+        // than the slot behaviour it is named for.
+        record.metadata_commitment = record.compute_metadata_commitment()?;
     }
     let t1 = NOW + 3_600 + 7 * 24 * 60 * 60 + 1;
 

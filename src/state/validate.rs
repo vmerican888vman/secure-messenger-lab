@@ -165,6 +165,14 @@ fn check_structure(state: &ClientStateV1) -> Result<()> {
         if !send.arms_consistent() {
             return Err(LabError::Storage);
         }
+        // Codec v10 P1-1: recompute the §3 metadata commitment on the
+        // ENCODE path too, BEFORE anything relies on `kind` — the
+        // per-lane quotas and the application ledger both key on it.
+        // Decode checks this in `SendRecord::parse`; without the same
+        // check here, `encode` serialized a relabelled record happily.
+        if send.metadata_commitment != send.compute_metadata_commitment()? {
+            return Err(LabError::Storage);
+        }
         if let Some(packet) = &send.packet {
             let length = packet.as_bytes().len();
             if length == 0 || length > MAX_PACKET {
@@ -866,6 +874,16 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
             return Err(LabError::Storage);
         }
         sequences.push(record.sequence);
+        // A receipt may not report a high water the session has never
+        // received (review D2b v4), checked on BOTH arms since codec v10
+        // P1-1 — a terminal receipt now retains its original water, so
+        // the rule must follow it there.
+        if record.kind == SendKind::Receipt
+            && record.receipt_high_water.ok_or(LabError::Storage)?
+                > active.highest_contiguous_received_seq
+        {
+            return Err(LabError::Storage);
+        }
         if record.state.carries_full_arm() {
             // Pending sends need the peer binding: the queue must be the
             // peer's mailbox and the send signature must verify under the
@@ -879,14 +897,6 @@ fn check_sends(state: &ClientStateV1, active: &ActiveSession) -> Result<()> {
                 return Err(LabError::Storage);
             };
             if queue_id != binding.queue_id {
-                return Err(LabError::Storage);
-            }
-            // A full-arm receipt may not report a high water the session
-            // has never received (review D2b v4 codec amendment).
-            if record.kind == SendKind::Receipt
-                && record.receipt_high_water.ok_or(LabError::Storage)?
-                    > active.highest_contiguous_received_seq
-            {
                 return Err(LabError::Storage);
             }
             verify(

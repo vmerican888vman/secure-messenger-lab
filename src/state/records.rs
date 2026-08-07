@@ -20,6 +20,7 @@ use super::{
     MAX_APPLICATION_OUTSTANDING, MAX_BODY, MAX_KEYPAIR_JSON, MAX_PACKET, MAX_RECEIVED_SET,
     MAX_SESSION_PICKLE,
 };
+use crate::capability::digest;
 use crate::ids::{ConversationId, MessageId, Nonce, QueueId};
 use crate::{EncryptedPacket, LabError, Result};
 
@@ -31,6 +32,11 @@ pub(crate) const INBOUND_TYPE: u16 = 0x0006;
 pub(crate) const SEND_TYPE: u16 = 0x0007;
 pub(crate) const ACK_TYPE: u16 = 0x0008;
 pub(crate) const DEDUP_TYPE: u16 = 0x0009;
+
+/// Domain separator for the §3 send-record metadata commitment (field
+/// 12). Literal ASCII, no terminator; every following component is
+/// fixed-width.
+const SEND_METADATA_DOMAIN: &[u8] = b"secure-messenger-lab/state/send-record-metadata/v1";
 
 fn ed25519_key(bytes: &[u8]) -> Result<Ed25519PublicKey> {
     Ed25519PublicKey::from_slice(&tlv::fixed::<32>(bytes)?).map_err(|_| LabError::Storage)
@@ -756,8 +762,16 @@ pub(crate) struct SendRecord {
     pub(crate) send_signature: Option<Ed25519Signature>,
     pub(crate) packet_digest: Option<[u8; 32]>,
     pub(crate) kind: SendKind,
-    /// Present (>= 1) only on a full-arm receipt record (field 11).
+    /// Present (>= 1) on a RECEIPT record in every state; absent on
+    /// application records (field 11). Amended by the §3 send-record
+    /// wording authorised for codec v10 P1-1: a receipt keeps its
+    /// original high water through terminalization as historical origin
+    /// evidence, so the record's staging-time kind stays checkable.
     pub(crate) receipt_high_water: Option<u64>,
+    /// Local metadata commitment (field 12): unkeyed SHA-256 over the
+    /// record's immutable identity and typed metadata. See
+    /// [`SendRecord::metadata_commitment`].
+    pub(crate) metadata_commitment: [u8; 32],
 }
 
 impl SendRecord {
@@ -788,12 +802,73 @@ impl SendRecord {
                 _ => return Err(LabError::Storage),
             },
             receipt_high_water: optional(object.field(11)?, u64_value)?,
+            metadata_commitment: tlv::fixed::<32>(object.field(12)?)?,
         };
         object.finish()?;
         if !record.arms_consistent() {
             return Err(LabError::Storage);
         }
+        // Recompute BEFORE anything relies on `kind` (codec v10 P1-1).
+        if record.metadata_commitment != record.compute_metadata_commitment()? {
+            return Err(LabError::Storage);
+        }
         Ok(record)
+    }
+
+    /// The §3 local metadata commitment (field 12), authorised as the
+    /// closure for codec v10 P1-1.
+    ///
+    /// `send_signature` authenticates only
+    /// `{queue_id, message_id, packet_digest, expires_at}`, so `epoch_id`,
+    /// `sequence`, `kind` and `receipt_high_water` were unauthenticated
+    /// local metadata. Because the application-ledger exemption keys on
+    /// `kind`, relabelling a genuine application record as `Receipt` and
+    /// dropping its ledger entry produced a state that `encode` accepted
+    /// — letting application traffic occupy control slots with no
+    /// application-budget accounting.
+    ///
+    /// This is an UNKEYED consistency check inside the §1 authenticated
+    /// state boundary — not a wire signature, not a MAC, and not
+    /// protection against an actor who can coherently rewrite
+    /// authenticated state. It exists to preserve the record's
+    /// staging-time kind across later façade mutations, which is
+    /// historical evidence a snapshot cannot otherwise establish.
+    ///
+    /// Committed: the record's immutable identity and typed metadata.
+    /// NOT committed: `state`, `queue_id`, the packet bytes, or
+    /// `send_signature` — all of which legitimately change or disappear
+    /// during terminalization. `message_id` and `expires_at` are
+    /// included beyond the four mutable fields so a commitment cannot be
+    /// transplanted between records.
+    pub(crate) fn compute_metadata_commitment(&self) -> Result<[u8; 32]> {
+        // Pending/full-arm records commit the digest of the exact
+        // retained packet; terminal records commit field 9.
+        let packet_digest = match (&self.packet, self.packet_digest) {
+            (Some(packet), None) => packet.digest(),
+            (None, Some(digest)) => digest,
+            _ => return Err(LabError::Storage),
+        };
+        let (receipt_present, high_water) = match self.receipt_high_water {
+            None => (0_u8, 0_u64),
+            Some(hw) => {
+                if hw == 0 {
+                    return Err(LabError::Storage);
+                }
+                (1, hw)
+            }
+        };
+        let mut input =
+            Vec::with_capacity(SEND_METADATA_DOMAIN.len() + 16 + 32 + 32 + 8 + 1 + 1 + 8 + 8);
+        input.extend_from_slice(SEND_METADATA_DOMAIN);
+        input.extend_from_slice(self.message_id.as_bytes());
+        input.extend_from_slice(&packet_digest);
+        input.extend_from_slice(&self.epoch_id);
+        input.extend_from_slice(&self.sequence.to_be_bytes());
+        input.push(self.kind as u8);
+        input.push(receipt_present);
+        input.extend_from_slice(&high_water.to_be_bytes());
+        input.extend_from_slice(&self.expires_at.to_be_bytes());
+        Ok(digest(&input))
     }
 
     /// The optional fields must match the state arm and kind exactly.
@@ -809,11 +884,14 @@ impl SendRecord {
                 && self.send_signature.is_none()
                 && self.packet_digest.is_some()
         };
-        let kind_ok = match (self.state.carries_full_arm(), self.kind) {
-            (true, SendKind::Receipt) => self.receipt_high_water.is_some_and(|hw| hw >= 1),
-            // Full-arm application records and every terminal record
-            // carry no high water.
-            (true, SendKind::Application) | (false, _) => self.receipt_high_water.is_none(),
+        // Codec v10 P1-1: the high water is now keyed on KIND alone, in
+        // every state. A receipt keeps it through terminalization so its
+        // staging-time kind remains evidenced; an application never has
+        // one. Previously terminal receipts dropped it, which erased the
+        // only typed trace distinguishing them.
+        let kind_ok = match self.kind {
+            SendKind::Receipt => self.receipt_high_water.is_some_and(|hw| hw >= 1),
+            SendKind::Application => self.receipt_high_water.is_none(),
         };
         arm_ok && kind_ok
     }
@@ -853,6 +931,7 @@ impl SendRecord {
                 (9, &digest),
                 (10, &kind),
                 (11, &high_water),
+                (12, &self.metadata_commitment),
             ],
         )?;
         Ok(Zeroizing::new(object))

@@ -136,7 +136,7 @@ fn make_send_records(
             &packet.digest(),
             expires_at,
         ));
-        sends.push(SendRecord {
+        sends.push(sealed(SendRecord {
             message_id: *message_id,
             state: SendState::Pending,
             epoch_id,
@@ -148,9 +148,10 @@ fn make_send_records(
             packet_digest: None,
             kind: SendKind::Application,
             receipt_high_water: None,
-        });
+            metadata_commitment: [0_u8; 32],
+        })?);
     }
-    sends.push(SendRecord {
+    sends.push(sealed(SendRecord {
         message_id: send_ids[2],
         state: SendState::Stored,
         epoch_id,
@@ -162,7 +163,8 @@ fn make_send_records(
         packet_digest: Some(digest(b"stored-packet")),
         kind: SendKind::Application,
         receipt_high_water: None,
-    });
+        metadata_commitment: [0_u8; 32],
+    })?);
     Ok(sends)
 }
 
@@ -323,6 +325,16 @@ fn make_active_session(
         receipt_debt_up_to: 0,
         control_debt_up_to: 0,
     })
+}
+
+/// Seal a fixture send record the way `admit_application_send` /
+/// `stage_receipt` do — compute the §3 metadata commitment once, at
+/// construction. Fixtures that deliberately corrupt metadata AFTER
+/// sealing are testing the commitment; fixtures that need a valid record
+/// must seal.
+fn sealed(mut record: SendRecord) -> Result<SendRecord, Box<dyn Error>> {
+    record.metadata_commitment = record.compute_metadata_commitment()?;
+    Ok(record)
 }
 
 /// A fully populated valid state: pending prekey, peer binding, outbound
@@ -2152,7 +2164,16 @@ fn delivery_unknown_transition_uses_digest_arm_and_round_trips() -> Result<(), B
         packet_digest: Some(packet_digest),
         kind: SendKind::Application,
         receipt_high_water: None,
+        metadata_commitment: [0_u8; 32],
     };
+    // The transition preserves every committed component, so sealing
+    // here yields exactly the pending record's commitment — which is the
+    // property that lets the commitment survive terminalization.
+    let transitioned = sealed(transitioned)?;
+    assert_eq!(
+        transitioned.metadata_commitment, fixture.state.sends[0].metadata_commitment,
+        "terminalization changed the metadata commitment"
+    );
     fixture.state.sends[0] = transitioned;
     let encoded = fixture.state.encode()?;
     let decoded = ClientStateV1::decode(&encoded)?;
@@ -2222,7 +2243,7 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
         } else {
             SendState::Stored
         };
-        fixture.state.sends.push(SendRecord {
+        fixture.state.sends.push(sealed(SendRecord {
             message_id,
             state,
             epoch_id,
@@ -2234,10 +2255,11 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
             packet_digest: Some(digest(b"packet")),
             kind: SendKind::Application,
             receipt_high_water: None,
-        });
+            metadata_commitment: [0_u8; 32],
+        })?);
     }
     // Re-add a terminal record at sequence 3 and sort by message ID.
-    fixture.state.sends.push(SendRecord {
+    fixture.state.sends.push(sealed(SendRecord {
         message_id: MessageId::from_slice(&[0x01; 16]).ok_or("bad test id")?,
         state: SendState::Stored,
         epoch_id,
@@ -2249,7 +2271,8 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
         packet_digest: Some(digest(b"stored-packet")),
         kind: SendKind::Application,
         receipt_high_water: None,
-    });
+        metadata_commitment: [0_u8; 32],
+    })?);
     fixture
         .state
         .sends
@@ -2259,7 +2282,7 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
     ClientStateV1::decode(&encoded)?;
 
     // A 33rd record exceeds the bound regardless of arm.
-    fixture.state.sends.push(SendRecord {
+    fixture.state.sends.push(sealed(SendRecord {
         message_id: MessageId::from_slice(&[0xF0; 16]).ok_or("bad test id")?,
         state: SendState::DeliveryUnknown,
         epoch_id,
@@ -2271,7 +2294,8 @@ fn send_bound_accounting_across_mixed_arms() -> Result<(), Box<dyn Error>> {
         packet_digest: Some(digest(b"another")),
         kind: SendKind::Application,
         receipt_high_water: None,
-    });
+        metadata_commitment: [0_u8; 32],
+    })?);
     assert!(fixture.state.encode().is_err());
     Ok(())
 }
@@ -3129,99 +3153,100 @@ fn decode_with_spliced_send(kind: u8, hw: Option<u64>) -> Result<bool, Box<dyn E
     Ok(ClientStateV1::decode(&bytes).is_ok())
 }
 
-/// Fields 10 (`kind`) and 11 (`receipt_high_water`): the kind matrix holds
-/// on both paths. Full-arm receipt records must carry `hw >= 1` and not
-/// above the received high water; application records must not carry it;
-/// terminal records never carry it; invalid kind bytes reject.
+/// Codec v10 P1-1: relabelling a send record must be REJECTED, and the
+/// receipt high-water arm rules now key on kind alone.
+///
+/// `send_signature` authenticates only
+/// `{queue_id, message_id, packet_digest, expires_at}`, so `kind` was
+/// unauthenticated local metadata — and since the application-ledger
+/// exemption keys on `kind`, relabelling a genuine application record as
+/// `Receipt` and dropping its ledger entry produced a state `encode`
+/// accepted, letting application traffic occupy control slots with no
+/// application-budget accounting. The §3 metadata commitment closes it.
+///
+/// This covers BOTH arms: a pending record and a terminal one, since a
+/// receipt now retains its high water through terminalization precisely
+/// so its staging-time kind stays evidenced.
 #[test]
-fn send_record_kind_arm_rules() -> Result<(), Box<dyn Error>> {
-    /// §4 control-lane split: retyping an application record as a
-    /// receipt must also drop its sequence from the application ledger —
-    /// control costs no application capacity, and the validator enforces
-    /// exactly that. Without this the fixture would be testing the
-    /// ledger rule rather than the high-water arm rules.
-    fn retype_send_as_receipt(fixture: &mut Fixture, index: usize) -> Result<(), Box<dyn Error>> {
+fn send_record_relabelling_is_rejected() -> Result<(), Box<dyn Error>> {
+    for index in [0_usize, 2] {
+        let mut fixture = populated_fixture()?;
         let sequence = fixture
             .state
             .sends
             .get(index)
             .ok_or("no send record")?
             .sequence;
-        fixture
-            .state
-            .sends
-            .get_mut(index)
-            .ok_or("no send record")?
-            .kind = SendKind::Receipt;
+        {
+            let record = fixture.state.sends.get_mut(index).ok_or("no send record")?;
+            assert_eq!(record.kind, SendKind::Application, "fixture changed shape");
+            // The exact mutation P1-1 describes: relabel, give it a
+            // plausible high water, and drop its ledger entry.
+            record.kind = SendKind::Receipt;
+            record.receipt_high_water = Some(1);
+        }
         let active = fixture.state.active_session.as_mut().ok_or("no session")?;
         active
             .unreceipted_application_send_seqs
             .retain(|listed| *listed != sequence);
-        Ok(())
+        assert!(
+            fixture.state.encode().is_err(),
+            "a relabelled send record was accepted (index {index})"
+        );
     }
 
-    // Encode path (the fixture's sends[0] is Pending, sends[2] terminal
-    // Stored; the received high water is 1).
-    for (hw, valid) in [
-        (Some(1_u64), true),
-        (Some(0), false),
-        (Some(2), false),
-        (None, false),
+    // A GENUINE receipt of the same shape is accepted, so the rejections
+    // above are the commitment and not the relabel's side effects.
+    let mut fixture = populated_fixture()?;
+    let sequence = fixture.state.sends[0].sequence;
+    {
+        let record = &mut fixture.state.sends[0];
+        record.kind = SendKind::Receipt;
+        record.receipt_high_water = Some(1);
+        record.metadata_commitment = record.compute_metadata_commitment()?;
+    }
+    let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+    active
+        .unreceipted_application_send_seqs
+        .retain(|listed| *listed != sequence);
+    assert!(
+        fixture.state.encode().is_ok(),
+        "a coherently re-sealed receipt was rejected, so the test proves nothing"
+    );
+
+    // The high-water arm rules, now keyed on kind in every state.
+    for (state, hw, valid) in [
+        (SendState::Pending, Some(1_u64), true),
+        (SendState::Pending, Some(0), false),
+        (SendState::Pending, Some(2), false),
+        (SendState::Pending, None, false),
+        (SendState::Stored, Some(1), true),
+        (SendState::Stored, None, false),
     ] {
         let mut fixture = populated_fixture()?;
-        retype_send_as_receipt(&mut fixture, 0)?;
-        let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
-        record.receipt_high_water = hw;
-        assert_eq!(fixture.state.encode().is_ok(), valid, "receipt hw {hw:?}");
-    }
-    // A valid full-arm receipt round-trips byte-identically.
-    let mut fixture = populated_fixture()?;
-    {
-        retype_send_as_receipt(&mut fixture, 0)?;
-        let record = fixture.state.sends.get_mut(0).ok_or("no pending send")?;
-        record.receipt_high_water = Some(1);
-    }
-    let encoded = fixture.state.encode()?;
-    let decoded = ClientStateV1::decode(&encoded)?;
-    assert_eq!(&encoded[..], &decoded.encode()?[..]);
-    // An application record may not carry a high water.
-    let mut fixture = populated_fixture()?;
-    fixture
-        .state
-        .sends
-        .get_mut(0)
-        .ok_or("no pending send")?
-        .receipt_high_water = Some(1);
-    assert!(fixture.state.encode().is_err());
-    // A terminal record may be receipt-kind with the water absent...
-    let mut fixture = populated_fixture()?;
-    retype_send_as_receipt(&mut fixture, 2)?;
-    let encoded = fixture.state.encode()?;
-    let decoded = ClientStateV1::decode(&encoded)?;
-    assert_eq!(&encoded[..], &decoded.encode()?[..]);
-    // ...but never with a high water.
-    fixture
-        .state
-        .sends
-        .get_mut(2)
-        .ok_or("no terminal send")?
-        .receipt_high_water = Some(1);
-    assert!(fixture.state.encode().is_err());
-
-    // Decode path: hand-crafted array elements spliced into the genuine
-    // encoding — invalid kind byte, receipt with hw 0, receipt with hw
-    // above the received water all reject; a valid full-arm receipt
-    // (hw == hcr) decodes.
-    for (kind, hw, valid) in [
-        (3_u8, Option::<u64>::None, false),
-        (2, Some(0), false),
-        (2, Some(9), false),
-        (2, Some(1), true),
-    ] {
+        let sequence = fixture.state.sends[0].sequence;
+        {
+            let record = &mut fixture.state.sends[0];
+            if state == SendState::Stored {
+                let digest_value = record.packet.as_ref().ok_or("no packet")?.digest();
+                record.state = SendState::Stored;
+                record.queue_id = None;
+                record.packet = None;
+                record.send_signature = None;
+                record.packet_digest = Some(digest_value);
+            }
+            record.kind = SendKind::Receipt;
+            record.receipt_high_water = hw;
+            record.metadata_commitment = record.compute_metadata_commitment().unwrap_or([0_u8; 32]);
+        }
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active
+            .unreceipted_application_send_seqs
+            .retain(|listed| *listed != sequence);
         assert_eq!(
-            decode_with_spliced_send(kind, hw)?,
+            fixture.state.encode().is_ok(),
             valid,
-            "kind {kind} hw {hw:?}"
+            "receipt {state:?} hw {hw:?}"
         );
     }
     Ok(())
@@ -3511,7 +3536,10 @@ fn aliased_otk_fails_after_genuine_inbound_session() -> Result<(), Box<dyn Error
 #[test]
 fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
     fn build(applications: usize, controls: usize) -> Result<Fixture, Box<dyn Error>> {
-        let mut fixture = send_only_fixture()?;
+        // `populated_fixture`, not `send_only_fixture`: a receipt record
+        // now carries a high water >= 1 in every state, and that water
+        // must be covered by a session that has actually received.
+        let mut fixture = populated_fixture()?;
         fixture.state.inbound.clear();
         fixture.state.acks.clear();
         for record in &mut fixture.state.dedup {
@@ -3523,7 +3551,7 @@ fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
         let mut sends = Vec::with_capacity(total);
         for (index, message_id) in ids.into_iter().enumerate() {
             let application = index < applications;
-            sends.push(SendRecord {
+            sends.push(sealed(SendRecord {
                 message_id,
                 // Terminal so no unresolved-control bound is tripped:
                 // this test is about STORAGE quotas.
@@ -3540,8 +3568,11 @@ fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
                 } else {
                     SendKind::Receipt
                 },
-                receipt_high_water: None,
-            });
+                // §3 as amended for codec v10 P1-1: a receipt carries its
+                // high water in EVERY state, terminal included.
+                receipt_high_water: if application { None } else { Some(1) },
+                metadata_commitment: [0_u8; 32],
+            })?);
         }
         sends.sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
         fixture.state.sends = sends;
@@ -3554,7 +3585,10 @@ fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
             SessionMode::Ready,
         )?;
         let active = fixture.state.active_session.as_mut().ok_or("no session")?;
-        active.highest_contiguous_received_seq = 0;
+        // The control records carry high water 1, and a receipt's water
+        // is now validated on the terminal arm too, so the session must
+        // actually have received that far.
+        active.highest_contiguous_received_seq = 1;
         active.last_delivered_receipt_high_water = 0;
         active.received_above_high_water.clear();
         Ok(fixture)

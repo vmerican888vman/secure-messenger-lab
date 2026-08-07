@@ -23,6 +23,69 @@ the frozen design that is not documented as a deviation.
   invariants it cites.
 - `src/state/tests.rs` — 87 tests, including fixtures built from real vodozemac operations.
 
+## Remediation history (v11)
+
+Version 10 (head `745d957`): Fable PASS, Sol RETURN with two P1s. Both
+were mine; both are now closed.
+
+**P1-2 — the dedup identity was never checked.** `message_digest` is
+declared THE dedup identity, but `check_dedup` never examined it, so two
+records with distinct message IDs, sequences and packet digests could
+share one inner Olm identity. Uniqueness is now enforced across every
+retained record, current and retired epoch alike. Regression
+`duplicate_inner_message_digest_is_rejected` uses retired-epoch twins
+with a fresh sequence so only the digest differs between its accept and
+reject arms.
+
+**P1-1 — send-record metadata was unbound.** The architect authorised
+option 3, a local unkeyed SHA-256 consistency commitment, and specified
+it exactly. Implemented as given:
+
+- `SendRecord` gains mandatory 32-byte field 12, `metadata_commitment`,
+  making object `0x0007` an exact twelve-field object. The construction
+  is the specified domain-separated SHA-256 over
+  `message_id ‖ packet_digest ‖ epoch_id ‖ sequence ‖ kind ‖
+  receipt_present ‖ receipt_high_water ‖ expires_at`, all fixed-width.
+  `state`, `queue_id`, packet bytes and `send_signature` are deliberately
+  NOT committed — they legitimately change or disappear at
+  terminalization.
+- Computed EXACTLY ONCE, where `admit_application_send` and
+  `stage_receipt` construct the pending record. There is no refresh path
+  and no encode-time repair.
+- Recomputed and compared on BOTH decode (`SendRecord::parse`) and encode
+  (`check_structure`), in each case BEFORE anything relies on `kind` —
+  the per-lane quotas and the application ledger both key on it. The
+  encode-side check was initially missed, and the new relabelling test
+  caught it.
+- **The kind matrix changed:** `Receipt => Some(hw >= 1)` and
+  `Application => None` on BOTH arms. A receipt now RETAINS its original
+  high water through terminalization as historical origin evidence, where
+  previously terminal records dropped it — which had erased the only
+  typed trace distinguishing a terminal receipt from a terminal
+  application. The retained value is evidence only; the delivered marker
+  still advances solely on the existing successful `Stored`/`Duplicate`
+  transition. The receipt-water-versus-received-water rule now applies on
+  both arms too.
+- Mismatch behaviour is as specified: `LabError::Storage` on decode
+  (existing invalid-state path locks the profile), and candidate
+  rejection under the existing pre-commit rules on encode, so no
+  malformed durable state is installed.
+
+Regression `send_record_relabelling_is_rejected` performs the exact
+mutation the finding describes — relabel to `Receipt`, add a plausible
+high water, drop the ledger entry — on BOTH a pending and a terminal
+record, and requires rejection. Its accept arm re-seals the same shape
+coherently and requires acceptance, so the rejections are the commitment
+rather than the relabel's side effects. It also pins the amended
+high-water arm rules across both states.
+
+Note for reviewers: this is a codec consistency check inside the §1
+authenticated-state boundary — not a wire signature, not a MAC, and not
+protection against an actor able to coherently rewrite authenticated
+state. It preserves the record's staging-time kind across later façade
+mutations, which is historical evidence a snapshot cannot otherwise
+establish.
+
 ## Remediation history (v9 — RE-PINNED after façade drift)
 
 **Read this first: the previously circulated codec head `11a32aa` is
