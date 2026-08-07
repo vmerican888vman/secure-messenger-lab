@@ -3571,9 +3571,16 @@ fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
         build(33, 7)?.state.encode().is_err(),
         "33 application records accepted — control slots were borrowed"
     );
+    // 31+9 totals 40, so this isolates the EIGHT-control limit rather
+    // than being rejected by the total (review D2b v16, Sol's precision
+    // note: the earlier 32+9 case totalled 41 and proved only the total).
     assert!(
-        build(32, 9)?.state.encode().is_err(),
-        "9 control records accepted"
+        build(31, 9)?.state.encode().is_err(),
+        "9 control records accepted within the 40 total"
+    );
+    assert!(
+        build(31, 8)?.state.encode().is_ok(),
+        "31 application + 8 control rejected, so the case above proves nothing"
     );
     assert!(
         build(40, 0)?.state.encode().is_err(),
