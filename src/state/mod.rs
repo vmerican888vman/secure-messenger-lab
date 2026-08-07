@@ -56,6 +56,12 @@ pub(crate) const MAGIC: &[u8; 8] = b"SMSLCSV1";
 /// Top-level object type; `ClientStateV1` appears at the top level only.
 pub(crate) const CLIENT_STATE_TYPE: u16 = 0x0001;
 /// State schema version (field 1).
+/// Version discipline (codec v9): the layout has changed several times
+/// while this codec has never been passed by review and no production state
+/// exists, so exactly one layout will ever appear under version 1 — the
+/// one that freezes at PASS. From the first PASS onward, ANY wire change
+/// — including an in-place retype or a field-position reuse, both of
+/// which are tolerable only pre-PASS — must bump this.
 pub(crate) const SCHEMA_VERSION: u16 = 1;
 /// Exact pinned vodozemac version string (field 6). Must match the
 /// `=0.10.0` pin in Cargo.toml.

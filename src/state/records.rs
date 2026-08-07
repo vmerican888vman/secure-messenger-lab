@@ -464,6 +464,14 @@ impl HighWaterReceipt {
 /// results, expiry, `DeliveryUnknown` consumption and record pruning
 /// never remove application budget.
 ///
+/// This wire position previously held a different `u64` field,
+/// `control_signal_response_at`, added at v12 and reverted at v13 when
+/// the reciprocity bound it served was found to deadlock an honest peer.
+/// Reusing the position is safe only because the codec is pre-PASS, and
+/// the two shapes cannot be confused in any case: the old occupant was a
+/// bare 8-byte value, while this field is `count:u32be` followed by
+/// `8 × count` bytes, and no 8-byte input parses as a valid set.
+///
 /// Field 23, `control_send_not_before: u64`, is the durable one-per-
 /// second control cooldown boundary; staging a receipt sets it to
 /// `checked(now + 1)`. It is a refillable LOCAL rate bound, never a

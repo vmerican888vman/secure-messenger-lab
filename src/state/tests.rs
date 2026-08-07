@@ -3588,3 +3588,144 @@ fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+/// Codec v9 (Fable's blocker): `encode` must reject a field-22 ledger
+/// that `decode` would refuse.
+///
+/// `parse_u64_set` enforces strictly-increasing, duplicate-free entries
+/// on decode, and `check_structure` re-checks exactly that for the
+/// sibling set (field 17) — but not for field 22. So an out-of-order or
+/// duplicated ledger encoded cleanly and then failed to load: the
+/// snapshot committed durably and the profile bricked at next open,
+/// which is strictly worse than refusing the write. It also broke both
+/// contracts `mod.rs` states: that no invalid state can be serialized,
+/// and that `decode(encode(state))` round-trips.
+#[test]
+fn non_canonical_application_ledger_is_rejected_on_encode() -> Result<(), Box<dyn Error>> {
+    for ledger in [vec![3_u64, 2], vec![2, 3, 3], vec![3, 3]] {
+        let mut fixture = populated_fixture()?;
+        {
+            let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+            active.peer_contiguous_high_water = 1;
+            active.last_assigned_send_seq = 4;
+            active.unreceipted_application_send_seqs = ledger.clone();
+        }
+        assert!(
+            fixture.state.encode().is_err(),
+            "encode accepted a non-canonical ledger {ledger:?}"
+        );
+    }
+    // The canonical form of the same entries still round-trips, so the
+    // rejection above is the ORDERING rule and not the values.
+    let mut fixture = populated_fixture()?;
+    {
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active.peer_contiguous_high_water = 1;
+        active.last_assigned_send_seq = 4;
+        active.unreceipted_application_send_seqs = vec![2, 3];
+    }
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+    Ok(())
+}
+
+/// Codec v9 (Fable's Q2): the retired `ReceiptLocked` discriminant must
+/// be rejected on the wire.
+///
+/// Rust cannot construct mode 3 in memory any more, so splicing the
+/// persisted byte is the only possible direct proof that a stored 3 —
+/// or any other stray value — cannot alias a live mode.
+#[test]
+fn retired_session_mode_discriminant_is_rejected() -> Result<(), Box<dyn Error>> {
+    /// Byte offset of a field's value inside an encoded object:
+    /// `object_type:u16, field_count:u16, [id:u16, len:u32, value]*`.
+    fn field_value_offset(object: &[u8], wanted: u16) -> Result<usize, Box<dyn Error>> {
+        let mut cursor = 4;
+        loop {
+            let id = u16::from_be_bytes(
+                object
+                    .get(cursor..cursor + 2)
+                    .ok_or("field id")?
+                    .try_into()?,
+            );
+            let length = usize::try_from(u32::from_be_bytes(
+                object
+                    .get(cursor + 2..cursor + 6)
+                    .ok_or("field len")?
+                    .try_into()?,
+            ))?;
+            if id == wanted {
+                return Ok(cursor + 6);
+            }
+            cursor += 6 + length;
+        }
+    }
+
+    let fixture = populated_fixture()?;
+    let encoded = fixture.state.encode()?;
+    let (session_start, session_end) = field_value_span(&encoded, 14)?;
+    let session = encoded.get(session_start..session_end).ok_or("session")?;
+    // Field 15 of `ActiveSession` is the mode enum.
+    let mode_offset = session_start + field_value_offset(session, 15)?;
+    assert_eq!(
+        encoded.get(mode_offset).copied(),
+        Some(SessionMode::Ready as u8),
+        "the located byte is not the mode"
+    );
+
+    // The RETIRED discriminant and every other stray value must reject;
+    // only the three live variants may decode.
+    for value in [0_u8, 3, 5, 6, 255] {
+        let mut mutated = encoded.to_vec();
+        *mutated.get_mut(mode_offset).ok_or("mode byte")? = value;
+        assert!(
+            ClientStateV1::decode(&mutated).is_err(),
+            "stored session mode {value} was accepted"
+        );
+    }
+    // `RekeyRequired` (4) is live and dominates, so it must still decode
+    // against this fixture's ledger.
+    let mut mutated = encoded.to_vec();
+    *mutated.get_mut(mode_offset).ok_or("mode byte")? = SessionMode::RekeyRequired as u8;
+    assert!(
+        ClientStateV1::decode(&mutated).is_ok(),
+        "a live mode was rejected, so the splice is hitting the wrong byte"
+    );
+    Ok(())
+}
+
+/// Codec v9 (Fable's Q6, carried P3): the ACCEPT direction of the
+/// relaxed `control_debt_up_to` rule, pinned directly at the codec layer
+/// rather than only through persistent-layer commits.
+///
+/// A debt water may legitimately sit ABOVE the contiguous received water
+/// while the signalling packet waits in the out-of-order set, because
+/// the peer-signalled arm binds debt to that packet's sequence.
+#[test]
+fn control_debt_in_the_out_of_order_set_round_trips() -> Result<(), Box<dyn Error>> {
+    let mut fixture = populated_fixture()?;
+    {
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active.highest_contiguous_received_seq = 1;
+        active.received_above_high_water = vec![3];
+        active.control_debt_up_to = 3;
+    }
+    let encoded = fixture.state.encode()?;
+    let decoded = ClientStateV1::decode(&encoded)?;
+    assert_eq!(&encoded[..], &decoded.encode()?[..]);
+
+    // The reject direction still holds: a water never received at all.
+    let mut fixture = populated_fixture()?;
+    {
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active.highest_contiguous_received_seq = 1;
+        active.received_above_high_water = vec![3];
+        active.control_debt_up_to = 2;
+    }
+    assert!(
+        fixture.state.encode().is_err(),
+        "a debt water that was never received was accepted"
+    );
+    Ok(())
+}

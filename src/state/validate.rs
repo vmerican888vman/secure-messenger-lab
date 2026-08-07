@@ -207,6 +207,24 @@ fn check_structure(state: &ClientStateV1) -> Result<()> {
                 return Err(LabError::Storage);
             }
         }
+        // Field 22 is a canonical u64 SET exactly like field 17, and
+        // `parse_u64_set` rejects non-ascending or duplicated entries on
+        // decode — so the encode path must reject them too (codec v9,
+        // Fable). Without this, `encode` accepted a ledger its own
+        // `decode` refused: the snapshot committed durably and the
+        // profile then failed to load, which is worse than refusing the
+        // write. It also broke the two contracts `mod.rs` states —
+        // "no invalid state can be serialized" and
+        // "decode(encode(state)) round-trips".
+        let ledger = &active.unreceipted_application_send_seqs;
+        if ledger.len() > MAX_APPLICATION_OUTSTANDING {
+            return Err(LabError::Storage);
+        }
+        for pair in ledger.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(LabError::Storage);
+            }
+        }
     }
     Ok(())
 }
