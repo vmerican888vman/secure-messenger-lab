@@ -1,5 +1,61 @@
 # Independent review — façade leg D2b: inbound path, receipts, ACKs
 
+## Remediation history (v16)
+
+Version 15 (head `5843bfa`): Fable PASS
+(`reviews/REVIEW-fable-facade-d2b-v15.md`), Sol RETURN with one P1 and
+one P2 (`reviews/REVIEW-sol-facade-d2b-v15.md`). Both are defects in my
+own work, not in the authorised design.
+
+**P1 — a blocked control tick still committed.** `control_work_pending`
+modelled the cooldown, mode and debt but not the unresolved-control
+guard, so a tick with eligible debt and a receipt in flight entered
+`mutate`, staged nothing, and still bumped the generation. Sol
+reproduced both arms (generation 8→9 with a `DeliveryUnknown` receipt,
+9→10 with a Pending one). Fable had flagged the same window as
+non-blocking at v15; Sol escalated it with reproductions, which is the
+right call — it reopens exactly the `ReconcileRequired` hazard the
+short-circuit exists to close.
+
+The guard is now a single shared predicate, `active_has_unresolved_control`,
+used by BOTH the staging decision and the pre-flight, so the two cannot
+drift apart again — drifting apart is what caused this. Regression:
+`blocked_control_tick_does_not_commit`, asserting unchanged generation
+across both arms and across five successive ticks, then asserting that
+clearing the unresolved record unblocks the lane and only then commits.
+Confirmed to fail against the previous pre-flight.
+
+**P2 — seven holes in the test migration**, all fixed:
+
+- `over_signaling_cannot_lock_the_victim` made each cycle's response
+  optional, so answering once and ignoring 31 cycles passed. Every cycle
+  must now answer.
+- The eight-cycle churn loop could `break` on the first iteration. The
+  escape hatch is gone; it must execute all eight.
+- The 40-record total quota was never exercised. New codec test
+  `split_send_quotas_are_enforced` pins 32 application + 8 control = 40
+  accepted, and rejects 33+7, 32+9 and 40+0 — so a regression that
+  collapsed the total back to 32, or that let applications borrow the
+  control lane's slots, now fails. Confirmed to fail with `MAX_SENDS`
+  reverted to 32.
+- Same-second cooldown deferral was never asserted before the wake; it
+  now is, together with the debt being held rather than lost.
+- The missing debt substitution was added.
+- The field-19 byte-flip offset was stale after fields 22/23, so the test
+  passed on a structural rejection. The offset is now DERIVED from the
+  actual ledger length, plus a companion assertion that builds the same
+  invalid state directly — proving the rejection is the marker rule and
+  not incidental damage.
+- The v15 dedup test's drain leg accepted at `NOW` and permitted
+  failure. It now accepts a fresh envelope at `past` with no escape
+  hatch, and additionally asserts the referenced application record is
+  NOT reclaimed.
+
+Sol's rulings on the two flagged items match Fable's independently:
+neither blocks, the shared-distance one must not be fixed with anything
+that gates control encryption, and `SCHEMA_VERSION` should be bumped
+before store compatibility is promised.
+
 ## Remediation history (v15)
 
 Version 14 (head `6d4c922`): Fable RETURN with one blocking finding

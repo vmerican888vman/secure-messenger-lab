@@ -1621,6 +1621,17 @@ fn receipt_staging_never_blocks_consume() -> std::result::Result<(), Box<dyn Err
         .filter(|record| record.kind == crate::state::SendKind::Receipt)
         .count();
     assert_eq!(control_records, 1, "a second unresolved receipt staged");
+    // Deferred, not dropped — the substitution the brief promises
+    // wherever a receipt-count assertion stands in for coalescing.
+    assert_eq!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .receipt_debt_up_to,
+        2,
+        "the second consume's debt was lost"
+    );
     assert_eq!(delivered_marker(&a)?, 0);
     Ok(())
 }
@@ -2098,6 +2109,22 @@ fn receipt_marker_advances_only_on_delivered_terminal() -> std::result::Result<(
     // receipt's one-second cooldown, so the owed receipt stages at the
     // next second via the local wake.
     accept_and_consume(&mut a, &mut relay, 1, "m2")?;
+    // The deferral itself is the property: within the same second the
+    // owed receipt must NOT stage (review D2b v15, Sol's P2 — asserting
+    // only the post-wake state left the cooldown untested).
+    assert!(
+        pending_receipts(&a).is_empty(),
+        "the cooldown did not defer the owed receipt"
+    );
+    assert!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .receipt_debt_up_to
+            > delivered_marker(&a)?,
+        "the deferred debt was lost rather than held"
+    );
     a.flush_control(NOW + 1)?;
     let action = a
         .pending_send_actions()?
@@ -3511,9 +3538,11 @@ fn control_churn_is_budget_neutral_and_the_local_arm_survives()
     // the shared sequence and costs ZERO application capacity.
     let mut now = NOW;
     for cycle in 0..8_u64 {
-        let Ok(action) = newest_receipt_action(&a) else {
-            break;
-        };
+        // No `break` escape hatch (review D2b v15, Sol's P2): the loop
+        // must genuinely execute all eight cycles or the churn it claims
+        // to exercise never happens.
+        let action = newest_receipt_action(&a)
+            .map_err(|error| format!("no receipt to churn at cycle {cycle}: {error}"))?;
         a.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
         now += 1;
         a.consume_delivery_unknown(action.request.message_id, now)?;
@@ -3830,9 +3859,18 @@ fn over_signaling_cannot_lock_the_victim() -> std::result::Result<(), Box<dyn Er
 
         // Complete the cycle: drive whatever staged all the way to
         // Stored, so the next signal faces a clean control lane.
+        // Every cycle MUST answer (review D2b v15, Sol's P2): making the
+        // response optional let a run that answered once and ignored the
+        // other 31 cycles pass, which is exactly the amplification shape
+        // this test exists to bound.
         let pending = pending_receipts(&a);
-        assert!(pending.len() <= 1, "more than one unresolved control send");
-        if let Some(view) = pending.first() {
+        assert_eq!(
+            pending.len(),
+            1,
+            "the victim did not answer at cycle {cycle}"
+        );
+        {
+            let view = &pending[0];
             let action = a
                 .pending_send_actions()?
                 .into_iter()
@@ -4890,22 +4928,113 @@ fn receipt_dedup_records_are_reclaimable() -> std::result::Result<(), Box<dyn Er
         "receipt dedup records never became reclaimable"
     );
 
-    // A real accept at that clock drains them, and service continues.
-    let outcomes = deliver(&mut a, &mut relay, &[1])?;
-    let accepted_expired = outcomes.iter().all(Result::is_ok);
-    a.flush_control(past)?;
+    // A real accept AT THAT CLOCK drains them and service continues.
+    // No escape hatch (review D2b v15, Sol's P2): the earlier version
+    // accepted at `NOW`, hit `DuplicateMessage`, and passed through an
+    // `|| !accepted` clause without ever exercising the drain.
+    let (message_id, packet, signature, expires_at) =
+        forge_receipt_envelope(&mut b, &a, 0, 10, past, 0)?;
+    let outcome = a.accept_envelope(queue_id, message_id, packet, expires_at, signature, past)?;
+    assert_eq!(outcome, AcceptOutcome::ReceiptIdempotent);
     assert!(
-        a.state.dedup.len() < with_receipts || !accepted_expired,
-        "the reclaimable receipt records were not drained"
+        a.state.dedup.len() < with_receipts,
+        "the reclaimable receipt records were not drained: {} records",
+        a.state.dedup.len()
     );
 
-    // The application record for the live inbound is NOT reclaimable: it
-    // is still referenced, so applications keep their old protection.
-    let live_referenced = a
-        .state
-        .dedup
-        .iter()
-        .any(|record| record.state == crate::state::DedupState::Accepted);
-    assert!(live_referenced || a.pending_inbound()?.is_empty());
+    // The application record for the still-live inbound is NOT
+    // reclaimable — it is referenced, so applications keep exactly the
+    // protection the two-path rule gave them.
+    assert!(!a.pending_inbound()?.is_empty(), "no live inbound to pin");
+    let live_inbound_id = a.pending_inbound()?[0].message_id;
+    assert!(
+        a.state
+            .dedup
+            .iter()
+            .any(|record| record.message_id == live_inbound_id),
+        "the referenced application record was reclaimed"
+    );
+    Ok(())
+}
+
+/// Sol's D2b v15 P1: a BLOCKED control tick must not commit.
+///
+/// `flush_control`'s pre-flight has to mirror `maybe_stage_owed_receipt`
+/// exactly. When it omitted the unresolved-control guard, a tick with
+/// eligible debt but an unresolved receipt in flight entered `mutate`,
+/// staged nothing, and still bumped the persisted generation — so a
+/// transient commit failure could take a healthy client to
+/// `ReconcileRequired`, which is the hazard the short-circuit exists to
+/// close. With a stuck `DeliveryUnknown` that is up to seven days of
+/// pointless snapshot rewrites.
+///
+/// Both arms Sol reproduced are asserted here.
+#[test]
+fn blocked_control_tick_does_not_commit() -> std::result::Result<(), Box<dyn Error>> {
+    let (_a_dir, _b_dir, mut a, mut relay) = {
+        let (a_dir, b_dir, a, _b, relay) = conversation_fixture()?;
+        (a_dir, b_dir, a, relay)
+    };
+
+    // Consume two messages so debt stands above the delivered marker,
+    // and one receipt is staged and left Pending.
+    accept_and_consume(&mut a, &mut relay, 0, "m1")?;
+    accept_and_consume(&mut a, &mut relay, 1, "m2")?;
+    let staged = pending_receipts(&a);
+    assert_eq!(staged.len(), 1);
+    assert!(
+        a.state
+            .active_session
+            .as_ref()
+            .ok_or("no session")?
+            .receipt_debt_up_to
+            > delivered_marker(&a)?,
+        "no eligible debt, so this would not test the blocked path"
+    );
+
+    // Arm 1 — a PENDING older receipt with newer debt standing.
+    let generation = a.store.generation()?;
+    assert!(
+        !a.flush_control(NOW + 1)?,
+        "a blocked tick claimed to stage"
+    );
+    assert_eq!(
+        a.store.generation()?,
+        generation,
+        "a blocked control tick committed (Pending arm)"
+    );
+
+    // Arm 2 — the receipt goes DeliveryUnknown and is left unconsumed.
+    let action = a
+        .pending_send_actions()?
+        .into_iter()
+        .find(|action| action.request.message_id == staged[0].message_id)
+        .ok_or("no receipt action")?;
+    a.record_send_result(&action, SendOutcome::DeliveryUnknown)?;
+    let generation = a.store.generation()?;
+    for tick in 1..=5_u64 {
+        assert!(
+            !a.flush_control(NOW + tick)?,
+            "a blocked tick claimed to stage at {tick}"
+        );
+        assert_eq!(
+            a.store.generation()?,
+            generation,
+            "a blocked control tick committed (DeliveryUnknown arm, tick {tick})"
+        );
+    }
+
+    // Clearing the unresolved record unblocks the lane: the tick now
+    // does real work, and only then does it commit.
+    a.consume_delivery_unknown(action.request.message_id, NOW + 6)?;
+    assert_eq!(
+        pending_receipts(&a).len(),
+        1,
+        "the debt did not re-stage once the lane was free"
+    );
+    assert!(
+        a.store.generation()? > generation,
+        "real work did not commit"
+    );
     Ok(())
 }

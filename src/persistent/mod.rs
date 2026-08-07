@@ -1285,7 +1285,8 @@ impl<P: StateKeyProtector> PersistentClient<P> {
     ///
     /// Returns whether a receipt staged. Idempotent and safe to call on
     /// a timer: with nothing owed, nothing eligible, or the cooldown
-    /// still closed it stages nothing AND commits nothing.
+    /// still closed, or an unresolved control send in flight, it stages
+    /// nothing AND commits nothing.
     ///
     /// **Caller liveness obligation (review D2b v14, Fable).** Control
     /// allows at most one UNRESOLVED send, and `DeliveryUnknown` counts
@@ -1359,9 +1360,26 @@ impl<P: StateKeyProtector> PersistentClient<P> {
         if active.mode == SessionMode::RekeyRequired || now < active.control_send_not_before {
             return false;
         }
+        // Mirror `maybe_stage_owed_receipt`'s guards exactly (review D2b
+        // v15, Sol's P1). Omitting the unresolved-control guard here let
+        // a BLOCKED tick enter `mutate`, stage nothing, and still bump
+        // the generation — reopening the transient-commit-failure →
+        // `ReconcileRequired` hazard this short-circuit exists to close.
+        // With a stuck `DeliveryUnknown` receipt that window is up to
+        // seven days of pointless snapshot rewrites.
+        if active_has_unresolved_control(&self.state) {
+            return false;
+        }
         let marker = active.last_delivered_receipt_high_water;
-        let owed = active.receipt_debt_up_to > marker || active.control_debt_up_to > marker;
-        owed && active.highest_contiguous_received_seq > marker
+        let high_water = active.highest_contiguous_received_seq;
+        let hcr_receipt_pending = self.state.sends.iter().any(|record| {
+            record.state == SendState::Pending
+                && record.kind == SendKind::Receipt
+                && record.receipt_high_water == Some(high_water)
+        });
+        let debt_owed = active.receipt_debt_up_to > marker && !hcr_receipt_pending;
+        let control_owed = active.control_debt_up_to > marker;
+        (debt_owed || control_owed) && high_water > marker
     }
 
     /// Consume one accepted inbound record: remove it, create the ACK
@@ -3103,13 +3121,7 @@ fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<bool>
     });
     // At most ONE unresolved control send, where unresolved means
     // `Pending` OR `DeliveryUnknown`.
-    let any_receipt_unresolved = candidate.state.sends.iter().any(|record| {
-        record.kind == SendKind::Receipt
-            && matches!(
-                record.state,
-                SendState::Pending | SendState::DeliveryUnknown
-            )
-    });
+    let any_receipt_unresolved = active_has_unresolved_control(&candidate.state);
     let debt_owed = active.receipt_debt_up_to > marker && !hcr_receipt_pending;
     let control_owed = active.control_debt_up_to > marker;
     if !(debt_owed || control_owed) || !fresh || !mode_allows {
@@ -3126,6 +3138,20 @@ fn maybe_stage_owed_receipt(candidate: &mut Candidate, now: u64) -> Result<bool>
     }
     stage_receipt(candidate, high_water, now)?;
     Ok(true)
+}
+
+/// Whether any control send is UNRESOLVED (`Pending` or
+/// `DeliveryUnknown`). Shared by the staging decision and
+/// `flush_control`'s pre-flight so the two cannot drift apart — they did
+/// in v15, and the result was a committing no-op tick.
+fn active_has_unresolved_control(state: &ClientStateV1) -> bool {
+    state.sends.iter().any(|record| {
+        record.kind == SendKind::Receipt
+            && matches!(
+                record.state,
+                SendState::Pending | SendState::DeliveryUnknown
+            )
+    })
 }
 
 /// Make room for one more control record within `MAX_CONTROL_SENDS`.

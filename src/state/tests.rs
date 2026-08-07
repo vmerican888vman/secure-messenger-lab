@@ -1212,6 +1212,8 @@ fn byte_flip_in_each_cross_checked_field_fails() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
+    /// A TLV field block header: 2-byte id + 4-byte length.
+    const FIELD_HEADER: usize = 6;
     let fixture = populated_fixture()?;
     let encoded = fixture.state.encode()?;
     // The last byte of each of these fields sits inside a signature, a
@@ -1231,12 +1233,45 @@ fn byte_flip_in_signature_positions_fails() -> Result<(), Box<dyn Error>> {
             "last-byte flip in field {index} accepted"
         );
     }
+    // The offset back to field 19's value is DERIVED, not hardcoded
+    // (review D2b v15, Sol's P2): a literal went stale when fields 22
+    // and 23 were appended, and the flip then landed outside the object,
+    // so the test passed on a structural rejection instead of the
+    // invariant it names.
+    let ledger = fixture
+        .state
+        .active_session
+        .as_ref()
+        .ok_or("no session")?
+        .unreceipted_application_send_seqs
+        .len();
+    let field_20 = FIELD_HEADER + 8;
+    let field_21 = FIELD_HEADER + 8;
+    let field_22 = FIELD_HEADER + 4 + 8 * ledger;
+    let field_23 = FIELD_HEADER + 8;
+    let back_to_field_19_value = field_20 + field_21 + field_22 + field_23 + 8;
     let (_, end) = field_value_span(&encoded, 14)?;
     let mut mutated = encoded.to_vec();
-    *mutated.get_mut(end - 36).ok_or("field 19 high byte")? ^= 0x01;
+    *mutated
+        .get_mut(end - back_to_field_19_value)
+        .ok_or("field 19 high byte")? ^= 0x01;
     assert!(
         ClientStateV1::decode(&mutated).is_err(),
         "field-19 high-byte flip accepted"
+    );
+    // Companion check proving the rejection above is the MARKER rule and
+    // not incidental structural damage: the same logical state, built
+    // directly, must also be refused.
+    let mut direct = populated_fixture()?;
+    direct
+        .state
+        .active_session
+        .as_mut()
+        .ok_or("no session")?
+        .last_delivered_receipt_high_water = u64::MAX / 2;
+    assert!(
+        direct.state.encode().is_err(),
+        "an enormous delivered marker was accepted"
     );
     Ok(())
 }
@@ -3462,5 +3497,87 @@ fn aliased_otk_fails_after_genuine_inbound_session() -> Result<(), Box<dyn Error
         .our_account
         .sign(prekey_signing_bytes(&prekey.bundle()));
     assert!(fixture.state.encode().is_err());
+    Ok(())
+}
+
+/// Sol's D2b v15 P2: the SPLIT send quotas must actually be exercised.
+///
+/// The existing bound test builds 32 application records only, so a
+/// regression that collapsed the total cap back to 32 — losing the
+/// control lane's dedicated 8 slots, which is the whole point of the
+/// split — would pass unnoticed. This pins all three numbers: 32
+/// application, 8 control, 40 together, and one more of either kind
+/// rejected.
+#[test]
+fn split_send_quotas_are_enforced() -> Result<(), Box<dyn Error>> {
+    fn build(applications: usize, controls: usize) -> Result<Fixture, Box<dyn Error>> {
+        let mut fixture = send_only_fixture()?;
+        fixture.state.inbound.clear();
+        fixture.state.acks.clear();
+        for record in &mut fixture.state.dedup {
+            record.epoch_id = digest(b"retired-epoch");
+        }
+        let total = applications + controls;
+        let epoch_id = fixture.state.sends[0].epoch_id;
+        let ids = sorted_message_ids(total);
+        let mut sends = Vec::with_capacity(total);
+        for (index, message_id) in ids.into_iter().enumerate() {
+            let application = index < applications;
+            sends.push(SendRecord {
+                message_id,
+                // Terminal so no unresolved-control bound is tripped:
+                // this test is about STORAGE quotas.
+                state: SendState::Stored,
+                epoch_id,
+                sequence: u64::try_from(index)? + 1,
+                queue_id: None,
+                packet: None,
+                expires_at: NOW + 3_600,
+                send_signature: None,
+                packet_digest: Some(digest(&index.to_be_bytes())),
+                kind: if application {
+                    SendKind::Application
+                } else {
+                    SendKind::Receipt
+                },
+                receipt_high_water: None,
+            });
+        }
+        sends.sort_by(|a, b| a.message_id.as_bytes().cmp(b.message_id.as_bytes()));
+        fixture.state.sends = sends;
+        // Every application sequence sits at or below the peer high
+        // water, so the ledger stays empty and the mode stays Ready.
+        set_water(
+            &mut fixture,
+            u64::try_from(total)?,
+            u64::try_from(total)?,
+            SessionMode::Ready,
+        )?;
+        let active = fixture.state.active_session.as_mut().ok_or("no session")?;
+        active.highest_contiguous_received_seq = 0;
+        active.last_delivered_receipt_high_water = 0;
+        active.received_above_high_water.clear();
+        Ok(fixture)
+    }
+
+    // The full split allocation is accepted: 32 + 8 = 40.
+    assert!(
+        build(32, 8)?.state.encode().is_ok(),
+        "the full 32 application + 8 control allocation was rejected"
+    );
+    // One more of either kind is refused, and the control lane's slots
+    // are NOT available to applications.
+    assert!(
+        build(33, 7)?.state.encode().is_err(),
+        "33 application records accepted — control slots were borrowed"
+    );
+    assert!(
+        build(32, 9)?.state.encode().is_err(),
+        "9 control records accepted"
+    );
+    assert!(
+        build(40, 0)?.state.encode().is_err(),
+        "40 application records accepted — the lanes are not separate"
+    );
     Ok(())
 }
