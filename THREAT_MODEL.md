@@ -110,22 +110,28 @@ pre-shared key, out-of-band secret, or ceremony entropy mixed in.
 The horizon is *how long a given message must remain confidential*. It is a product decision, not a
 cryptographic one.
 
-**It has not been made.** Until it is, this document adopts a **fail-closed default: the horizon for
-message plaintext is INDEFINITE.** Under that default, classical-only key agreement is insufficient
-by definition, and the ruling's hold-shipment consequence applies.
+**It has not been made, and this document does not make it.** The governing ruling requires the
+horizon to be stated; it does not select a value, and this threat model has no authority to pick one.
+An earlier revision adopted an INDEFINITE default here — that was policy the ruling does not contain,
+and it has been withdrawn.
 
 | Asset | Horizon | Notes |
 |---|---|---|
-| Message plaintext | **Indefinite (fail-closed default; not yet decided)** | The default stands until a horizon is explicitly set per content class AND approved. |
+| Message plaintext | **UNDECIDED (fail-closed)** | Requires an authorized product/architect decision. Adopting a standing default — indefinite, lifetime, or a fixed term — would require the governing ruling to be amended, not merely this document edited. |
 | Contact graph and other metadata | Out of scope for this work | See "Metadata" below — PQ key agreement is not a metadata control. |
 | Long-term identity keys | Separate decision | Ed25519 remains classical under the chosen suite; see "Claim language". |
 
 Time-to-CRQC is not predictable from within this project, and this document sets **no threshold** of
 its own — inventing one would be policy the governing ruling does not contain.
 
-**Horizon approval is a prerequisite for both shipment and any public claim.** A concrete per-content-
-class horizon must be frozen, or the indefinite default explicitly retained, before either gate can
-open.
+**What follows from UNDECIDED, stated as consequence rather than as a new gate:** the ruling's
+hold-shipment rule is conditional on PQ being a shipping requirement. While the horizon is undecided,
+**the project cannot evaluate whether that condition is met**, and therefore cannot determine whether
+the hold applies. That is a factual gap in sequencing step 1, not an additional prerequisite invented
+here — no public claim is available regardless, because the prerequisites below are independently
+unmet.
+
+**Sequencing step 1 is therefore INCOMPLETE until the horizon is decided by the authorized owner.**
 
 ### Retention, and what "recorded" means
 
@@ -219,13 +225,21 @@ From the ruling: a finalized MLS PQ ciphersuite, a matching reviewed OpenMLS rel
 validation, interoperability vectors, downgrade and fallback rejection tests, and human cryptographer
 sign-off.
 
-Additionally required before any public claim:
+Additionally required before any public claim, **conjunctively** — every item, not any:
 
-- A **reviewed, deployed** MLS and Delivery Service path — not a spike.
-- An **actual authenticated migration** performed, not merely specified.
+- **Full compliance with sequencing steps 2 through 6 of the governing ruling.** The list below
+  elaborates but does not replace them; where this document and the ruling differ, the ruling
+  governs.
+- A **reviewed, deployed** MLS and Delivery Service path — not a spike — covering **both 1:1 and
+  groups**, since the ruling adopts MLS for both.
+- A **separate `ClientStateV2` path.** `ClientStateV1` fields must not be reinterpreted.
+- **No V1→V2 secret-state migration.** There is no production state, so none is to be invented.
+- **Rebootstrap through the verified contact ceremony into FRESH MLS groups** — an authenticated
+  in-place conversion of existing Olm sessions does not satisfy this and is prohibited.
+- **No negotiation down to Olm when PQ is required**, and downgrade/fallback rejection tested.
 - **Persistence and restart proof** for the deployed path.
 - A **specified and verified endpoint-secret erasure lifecycle** (see above).
-- A **frozen or explicitly-retained confidentiality horizon** (see above).
+- A **confidentiality horizon decided by its authorized owner** (see above).
 - **Global clearance in `SECURITY_STATUS.md`**, which independently blocks *any* public-security
   claim on work broader than post-quantum — including the contact ceremony, formal threat model, and
   external audit.
