@@ -12,7 +12,7 @@ The product owner decided on 2026-08-08 that the confidentiality horizon for mes
 
 The security architect decided on 2026-08-08 that this acceptance creates only the narrow, conditional exception stated below. It does not amend any other launch, security, migration, or claim gate.
 
-The product owner owns the confidentiality objective and risk acceptance. The security architect owns the acceptance's security consequence and any concurrence required to activate or reactivate the exception. Original architect text remains authoritative except for the amended Status paragraph, the in-place amendments to sequencing steps 1 and 5, and text labelled **Architect amendment — 2026-08-08**, which expressly qualify it.
+The product owner owns the confidentiality objective and risk acceptance. The security architect owns the acceptance's security consequence and any concurrence required to activate or reactivate the exception. Original architect text remains authoritative except for the amended Status paragraph, this Authority record, the in-place amendments to sequencing steps 1 and 5, the sections headed **Architect amendment — conditional pre-migration exception (2026-08-08)** and **Architect amendment — pre-migration V1 production state (2026-08-08)**, and paragraphs labelled **Architect amendment — 2026-08-08**, all of which expressly qualify it.
 
 ## Ruling
 
@@ -38,7 +38,7 @@ The acceptance is conditional on all of the following:
 3. Before any migration-capable release ships, users must be able to determine that pre-migration traffic does not have the new protection. That distinction must remain available thereafter; the upgrade must not imply that earlier history is covered.
 4. Once authenticated PQ migration is offered or attempted for a conversation, a failed or blocked migration must be prominently surfaced to the user; the client must not silently continue creating Olm or other classical-only ciphertext for that conversation.
 
-Conditions 1 and 2 apply continuously. Condition 3 becomes a hard release gate before any migration-capable release ships. Condition 4 applies continuously to each conversation from the first time authenticated PQ migration is offered or attempted for that conversation.
+Conditions 1 and 2 apply continuously. Condition 3 becomes a hard release gate before any migration-capable release ships. Condition 4 applies continuously to each conversation from the first time authenticated PQ migration is offered or attempted for that conversation. Its prominent-surfacing requirement remains binding whether or not reliance on this exception is claimed, suspended, or lapsed; its prohibition on classical-only continuation is additionally enforced by the governing fail-closed rule whenever PQ is required.
 
 The security architect must record suspension whenever an applicable condition is unverified. The security architect may restore reliance after verifying and recording proof of uninterrupted compliance. Evidence that an applicable condition was violated makes the acceptance LAPSED from the earliest affected time. Correction does not automatically revive a lapsed acceptance and cannot retroactively authorize traffic created during the breach. Reactivation requires a new dated product-owner acceptance and security-architect concurrence.
 
