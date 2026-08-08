@@ -1,8 +1,9 @@
 # Threat model and metadata budget
 
 Status: Phase 0 draft, 2026-08-04; amended 2026-08-07 to model the harvest-now-decrypt-later
-adversary (see "Post-quantum" below). Everything outside that section still describes only the
-executable local harness in this repository.
+adversary, and 2026-08-08 to record the product owner's confidentiality horizon, the conditional
+pre-migration risk acceptance and its disclosure obligation (see "Post-quantum" below). Everything
+outside that section still describes only the executable local harness in this repository.
 
 ## Assets
 
@@ -129,15 +130,9 @@ its own — inventing one would be policy the governing ruling does not contain.
 
 Derived from the governing ruling, not added by this document:
 
-1. An indefinite horizon **exceeds any plausible time-to-CRQC by construction.** Classical-only key
-   agreement is therefore insufficient for message plaintext by definition, not by estimate.
-2. Post-quantum protection is consequently a **shipping requirement**, which activates the ruling's
-   rule: *if PQ is a shipping requirement, shipment waits for the production gate rather than
-   silently falling back to a classical suite.*
-3. Because PQ confidentiality applies only to traffic sent after an authenticated migration, any
-   message sent before that migration **cannot ever satisfy the stated horizon.** Shipping
-   pre-migration would knowingly produce traffic that fails the project's own confidentiality
-   objective from the moment it is sent.
+1. An indefinite horizon **exceeds any plausible time-to-CRQC by construction.** Classical-only key agreement is therefore insufficient for message plaintext by definition, not by estimate.
+2. Absent an authorized acceptance of the pre-migration gap, PQ is consequently a shipping requirement and shipment waits for the PQ production-and-claim gate rather than silently falling back to a classical suite.
+3. The recorded acceptance below creates a conditional exception to that shipment consequence; it does not make pre-migration traffic satisfy the horizon. Any message sent before authenticated PQ migration remains permanently outside the stated objective.
 
 ### Recorded risk acceptance for pre-migration traffic
 
@@ -150,12 +145,8 @@ Concretely:
 - Traffic sent before the migration is classically protected. If recorded and retained, it is
   harvestable and becomes decryptable once the modelled CRQC exists. This is permanent for that
   traffic; migration does not repair it.
-- **Post-quantum gates the CLAIM, not the launch.** PQ is therefore not, by itself, a reason to hold
-  shipment. Every other prerequisite in "What must be true before the claim is available" still
-  applies unchanged.
-- This acceptance covers the post-quantum gap **only**. It licenses nothing about the contact
-  ceremony, identity binding, endpoint compromise, metadata, or any other open blocker in
-  `SECURITY_STATUS.md`.
+- While the acceptance remains in force, PQ is not by itself a reason to hold shipment. This is not launch authorization: every unchecked blocker in `SECURITY_STATUS.md` remains independently controlling.
+- This acceptance covers the post-quantum gap **only**. It licenses nothing about the contact ceremony, identity binding, endpoint compromise, metadata, or any other launch or security blocker.
 
 This is the same posture the established messengers took: both Signal and SimpleX shipped for years
 on classical key agreement and migrated later, and traffic sent before their migrations remains
@@ -163,29 +154,20 @@ harvestable. The posture is defensible **because it is disclosed**, not because 
 
 ### Disclosure obligation — the condition that makes the acceptance honest
 
-An accepted risk that users are not told about is not an accepted risk; it is an undisclosed one.
-The acceptance above is therefore **conditional on all of the following**, and lapses if any is not
-met:
+An accepted risk that users are not told about is not an accepted risk; it is an undisclosed one. The acceptance above is therefore **conditional on all of the following**.
 
-1. **No product surface — UI, store listing, marketing, or documentation — may state or imply
-   post-quantum protection before the migration.** The forbidden terms in "Claim language" apply to
-   every surface, not only to formal security documentation.
-2. Any user-facing description of the encryption must be accurate about what it is. Describing it as
-   end-to-end encrypted is correct; describing or implying that it resists future quantum
-   decryption is not.
-3. When the migration ships, users must be able to determine that traffic predating it does not carry
-   the new protection. Silently upgrading and letting users infer that all their history is covered
-   would convert an honest gap into a misleading one.
+At each release or migration gate, every condition applicable at that gate must be affirmatively verified. An applicable condition that is unverified suspends reliance on the acceptance. Evidence of a violation makes the acceptance LAPSED and invokes the governing ruling's fail-closed consequence. Correction does not automatically revive a lapsed acceptance; reactivation requires a new dated product-owner acceptance and security-architect concurrence.
+
+1. **No product surface — UI, store listing, marketing, or documentation — may state or imply post-quantum protection before the migration.** After migration, no such claim is permitted until every post-quantum claim prerequisite has passed.
+2. Every user-facing encryption description must accurately describe the protection actually provided, but this document does not authorize any public-security claim while `SECURITY_STATUS.md` remains NO-GO. If and when that file authorizes such claims, "end-to-end encrypted" may describe the classical scheme; language stating or implying resistance to future quantum decryption remains forbidden until the post-quantum claim gate passes.
+3. Before migration ships, users must be able to determine that traffic predating it does not carry the new protection. That distinction must remain available thereafter. Silently upgrading and letting users infer that all their history is covered would convert an honest gap into a misleading one.
 
 The project's stated goal is that the app be secure, trusted, and confidential. **Trust here is
 produced by the accuracy of what is said, not by the strength of what is claimed** — and an
 overstated claim that is later corrected costs more trust than an accurate limitation disclosed up
 front.
 
-**Amendment required:** `docs/phase3-post-quantum-decision.md` should record the horizon decision,
-this risk acceptance, and the disclosure obligation. Until the architect amends it, this section is
-the only place they are written down, and the ruling remains the governing document where the two
-differ.
+**Amendment recorded:** On 2026-08-08 the security architect amended `docs/phase3-post-quantum-decision.md` to incorporate the product-owner horizon decision, conditional risk acceptance, disclosure obligation, and their security consequences. The governing ruling controls wherever the documents differ.
 
 ### Retention, and what "recorded" means
 
@@ -293,9 +275,7 @@ Additionally required before any public claim, **conjunctively** — every item,
 - **No negotiation down to Olm when PQ is required**, and downgrade/fallback rejection tested.
 - **Persistence and restart proof** for the deployed path.
 - A **specified and verified endpoint-secret erasure lifecycle** (see above).
-- The **INDEFINITE confidentiality horizon** honoured for the traffic being claimed about. Per the
-  recorded risk acceptance, PQ gates this claim rather than the launch — but the claim itself is
-  available only for post-migration traffic, and only once every other item here is met.
+- The **INDEFINITE confidentiality horizon** honoured for the traffic being claimed about. Under the incorporated conditional acceptance, PQ is not by itself a launch gate only while that acceptance remains in force; the claim remains available only for post-migration traffic, and only once every other item here is met.
 - **Global clearance in `SECURITY_STATUS.md`**, which independently blocks *any* public-security
   claim on work broader than post-quantum — including the contact ceremony, formal threat model, and
   external audit.
