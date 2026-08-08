@@ -278,7 +278,7 @@ Additionally required before any public claim, **conjunctively** — every item,
 - **No negotiation down to Olm when PQ is required**, and downgrade/fallback rejection tested.
 - **Persistence and restart proof** for the deployed path.
 - A **specified and verified endpoint-secret erasure lifecycle** (see above).
-- The **INDEFINITE confidentiality horizon** honoured for the traffic being claimed about. Under the incorporated conditional acceptance, PQ is not by itself a launch gate only while that acceptance remains in force; the claim remains available only for post-migration traffic and only once every other item here is met.
+- The **INDEFINITE confidentiality horizon** honoured for the traffic being claimed about. Under the incorporated conditional acceptance, PQ is not by itself a launch gate only while that acceptance remains in force and reliance on the exception is not suspended; the claim remains available only for post-migration traffic and only once every other item here is met.
 - **Global clearance in `SECURITY_STATUS.md`**, which independently blocks *any* public-security
   claim on work broader than post-quantum — including the contact ceremony, formal threat model, and
   external audit.
