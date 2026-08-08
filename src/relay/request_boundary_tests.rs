@@ -95,5 +95,21 @@ fn message_retention_expiry_bounds_fail_closed() -> Result<(), Box<dyn Error>> {
         ));
     }
     assert_eq!(relay.queued_message_count_at(NOW)?, 0);
+
+    // Accept arm. Without it the rejections above are unfalsifiable: a
+    // regression that rejected every expiry would satisfy both the loop and
+    // the zero-count assertion, and the zero count would in fact be
+    // guaranteed. The exact maximum must be ACCEPTED, because the bound is
+    // `expires_at > now + MAX` — strictly greater — so flipping it to `>=`
+    // must fail this test. This mirrors the boundary discipline the sibling
+    // `signed_request_time_boundaries_fail_closed_for_every_command` already
+    // applies at `NOW + 300`.
+    let at_maximum = sender.authorize(
+        MessageId::random(),
+        EncryptedPacket::from_untrusted(b"synthetic-ciphertext".to_vec()),
+        NOW + MAX_MESSAGE_TTL_SECONDS,
+    );
+    relay.enqueue(&at_maximum, NOW)?;
+    assert_eq!(relay.queued_message_count_at(NOW)?, 1);
     Ok(())
 }
