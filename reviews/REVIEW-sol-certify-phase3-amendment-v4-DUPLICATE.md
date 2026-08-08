@@ -75,23 +75,57 @@ working tree before this note was written. B1 and B2 — the only two items
 the round-5 brief asked about — are not mentioned, and both were verified
 still open.
 
-## Diagnosis and mitigation
+## Diagnosis — first attempt, and its CORRECTION
 
-Two stale verdicts in a row is a process defect, not chance. Contributing
-condition found: **all four Sol review worktrees from this leg are still
-on disk and registered** —
-`/private/tmp/sml-certify-sol-6917bcb`, `sml-certify2-sol-4e5637b`,
-`sml-certify3-sol-e751a9e`, `sml-certify4-sol-1a30f1d`. A stale tree
-that still exists is a tree that can be reviewed by mistake, and
-`git worktree add` fails when its target path already exists, which
-invites falling back to the existing directory.
+**First diagnosis, now known to be wrong.** It was recorded here that the
+contributing condition was the four stale Sol worktrees still being on
+disk and registered, on the reasoning that `git worktree add` fails when
+its target path exists and so invites falling back into an old
+directory.
 
-Mitigation added to the round-5 brief, which does not depend on the
-worktrees being cleaned up: a **verification challenge**. The reviewer
-must quote two strings that exist only at `ddf5d34` before reviewing. A
-reply regenerated from stale context cannot produce them, so a third
-duplicate is detectable from the verdict's first lines rather than by
+**Evidence contradicting it.** After the four stale worktrees were
+removed with the user's approval, inspection showed that
+`/private/tmp/sml-certify5-sol-ddf5d34` **already existed, was
+registered, was detached at exactly**
+`ddf5d3468da4aa6885d50db121006e396d3e234b`, **and was clean.** The
+round-5 worktree had been created correctly. The correct tree was present
+and readable at the moment the round-4 verdict was returned.
+
+So the stale worktrees were not the cause, and removing them would not
+have prevented either duplicate. The verdict was produced without reading
+the tree that was in front of it — a reply regenerated from conversational
+context rather than from a fresh read.
+
+That distinction matters for the process: **worktree hygiene is not a
+control against this failure.** The only control that works is one that
+requires evidence of a read.
+
+## Mitigation
+
+A **verification challenge** in the round-5 brief: the reviewer must
+quote, verbatim and before reviewing, two strings that exist only at
+`ddf5d34`. Both were introduced by the round-4 fixes and are absent from
+`e751a9e` and `1a30f1d`. Confirmed retrievable from the round-5 worktree:
+
+1. "Its prominent-surfacing requirement remains binding whether or not
+   reliance on this exception is claimed, suspended, or lapsed; its
+   prohibition on classical-only continuation is additionally enforced by
+   the governing fail-closed rule whenever PQ is required."
+2. "…except for the amended Status paragraph, this Authority record, the
+   in-place amendments to sequencing steps 1 and 5, …"
+
+A reply regenerated from stale context cannot produce these, so a third
+duplicate is detectable from the verdict's opening lines rather than by
 diffing its findings against history.
 
-Removal of the four stale worktrees is **pending the user's approval**
-and has not been performed.
+## Worktree removal
+
+Performed with the user's approval: the four stale Sol worktrees from
+this leg were removed after each was verified detached, clean, and
+stash-free. Count 51 → 47. All four SHAs remain reachable in branch
+history and every verdict is recorded under `reviews/`. The 37
+pre-existing `sml-review-*` worktrees were **not** touched and remain at
+37. `/private/tmp/sml-certify5-sol-ddf5d34` was deliberately kept — it is
+the current round's tree and is correct.
+
+This removal was housekeeping, not mitigation. See the correction above.
