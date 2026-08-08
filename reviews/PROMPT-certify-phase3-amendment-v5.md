@@ -2,8 +2,38 @@
 
 # ⚠ REVIEW SHA IS `ddf5d3468da4aa6885d50db121006e396d3e234b` — run `git rev-parse HEAD` and report it
 
-Full SHA below. Do not reuse `/tmp/sml-certify3-sol-e751a9e` or
-`/tmp/sml-certify4-sol-1a30f1d`; both are stale.
+## ⚠ TWO STALE VERDICTS HAVE NOW BEEN RETURNED IN A ROW — READ THIS FIRST
+
+The last two relays were re-deliveries of already-applied verdicts, not
+new reviews:
+
+- One reviewed `e751a9e` from `/tmp/sml-certify3-sol-e751a9e`.
+- One reviewed `1a30f1d` from `/tmp/sml-certify4-sol-1a30f1d`.
+
+Both were byte-identical to verdicts already recorded and applied, and
+neither addressed the items actually asked. Both were rejected without
+being applied.
+
+**Those worktree directories still exist on disk.** Do not `cd` into one,
+and do not reuse a previous command. `git worktree add` will fail if the
+target path already exists — if that happens, use a fresh path rather
+than falling back to an existing directory.
+
+### Mandatory verification challenge — answer before reviewing
+
+Two strings below exist **only** at `ddf5d34`. They did not exist at
+`e751a9e` or `1a30f1d`. Quote both verbatim from your worktree, at the
+top of your reply:
+
+1. From `docs/phase3-post-quantum-decision.md`, the **final sentence** of
+   the paragraph beginning "Conditions 1 and 2 apply continuously".
+2. From `docs/phase3-post-quantum-decision.md`, the words that appear in
+   the Authority record's last sentence **immediately after** "except for
+   the amended Status paragraph,".
+
+If you cannot produce both from the tree in front of you, you are not at
+the right SHA — stop and re-create the worktree rather than answering
+from context.
 
 Your round-4 replacements are applied and verified byte-exact: the
 surfacing requirement now binds whether or not reliance is claimed,

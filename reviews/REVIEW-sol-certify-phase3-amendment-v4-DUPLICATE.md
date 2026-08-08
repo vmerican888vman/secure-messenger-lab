@@ -51,3 +51,47 @@ check.
 
 **Round 4 remains open.** `reviews/PROMPT-certify-phase3-amendment-v4.md`
 needs to be relayed against `1a30f1d`.
+
+---
+
+# Second duplicate — round-4 verdict relayed as round 5, rejected, not applied
+
+A second stale verdict was relayed, this time in response to
+`reviews/PROMPT-certify-phase3-amendment-v5.md`. It is a re-delivery of
+the **round-4** verdict recorded in
+`reviews/REVIEW-sol-certify-phase3-amendment-v4.md` and already applied
+at `ddf5d34`. **Not applied.** Round 5 remains open.
+
+## Evidence
+
+| Marker | Relayed verdict | Round-5 brief specified |
+|---|---|---|
+| SHA reviewed | `1a30f1da733b10e79bd7c9e77aa26fb821220d5d` | `ddf5d3468da4aa6885d50db121006e396d3e234b` |
+| Worktree cited | `/tmp/sml-certify4-sol-1a30f1d` | `/tmp/sml-certify5-sol-ddf5d34` |
+| Findings | P2-1, P2-2, P3-1, P3-2 — identical text to round 4 | — |
+
+All four "required replacements" were verified **already present** in the
+working tree before this note was written. B1 and B2 — the only two items
+the round-5 brief asked about — are not mentioned, and both were verified
+still open.
+
+## Diagnosis and mitigation
+
+Two stale verdicts in a row is a process defect, not chance. Contributing
+condition found: **all four Sol review worktrees from this leg are still
+on disk and registered** —
+`/private/tmp/sml-certify-sol-6917bcb`, `sml-certify2-sol-4e5637b`,
+`sml-certify3-sol-e751a9e`, `sml-certify4-sol-1a30f1d`. A stale tree
+that still exists is a tree that can be reviewed by mistake, and
+`git worktree add` fails when its target path already exists, which
+invites falling back to the existing directory.
+
+Mitigation added to the round-5 brief, which does not depend on the
+worktrees being cleaned up: a **verification challenge**. The reviewer
+must quote two strings that exist only at `ddf5d34` before reviewing. A
+reply regenerated from stale context cannot produce them, so a third
+duplicate is detectable from the verdict's first lines rather than by
+diffing its findings against history.
+
+Removal of the four stale worktrees is **pending the user's approval**
+and has not been performed.
