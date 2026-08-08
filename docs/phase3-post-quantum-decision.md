@@ -27,7 +27,7 @@ gate** rather than silently falling back to a classical suite.
 
 The product owner accepts that traffic sent before authenticated PQ migration is classically protected, harvestable, and never acquires post-quantum protection retroactively. The acceptance covers only this PQ gap and clears no other blocker.
 
-At each release or migration gate, the product owner must supply evidence for every disclosure condition applicable at that gate, and the security architect must affirmatively verify and record compliance.
+At each release or migration gate, the product owner must supply evidence for every disclosure condition applicable at that gate. An independently acting security architect who is not the product owner must affirmatively verify and record compliance. If no such security architect is available, the gate remains closed and no reliance on the exception is permitted.
 
 While — and only while — the product-owner acceptance remains in force and the security architect has recorded every applicable disclosure condition as verified, the pre-migration PQ gap does not independently hold shipment. This is not launch authorization: every unchecked blocker in `SECURITY_STATUS.md` remains independently launch-blocking.
 
@@ -36,14 +36,15 @@ The acceptance is conditional on all of the following:
 1. No product surface — UI, store listing, marketing, or documentation — may state or imply post-quantum protection before authenticated PQ migration. After migration, no such claim is permitted until every PQ claim gate has passed.
 2. Every user-facing encryption description must accurately describe the protection actually provided. This ruling does not authorize any public-security claim while `SECURITY_STATUS.md` remains NO-GO. If and when that file authorizes such claims, "end-to-end encrypted" may accurately describe the classical scheme; language stating or implying resistance to future quantum decryption remains forbidden until the PQ claim gate passes.
 3. Before any migration-capable release ships, users must be able to determine that pre-migration traffic does not have the new protection. That distinction must remain available thereafter; the upgrade must not imply that earlier history is covered.
+4. Once authenticated PQ migration is offered or attempted for a conversation, a failed or blocked migration must be prominently surfaced to the user; the client must not silently continue creating Olm or other classical-only ciphertext for that conversation.
 
-Conditions 1 and 2 apply continuously. Condition 3 becomes a hard release gate before any migration-capable release ships.
+Conditions 1 and 2 apply continuously. Condition 3 becomes a hard release gate before any migration-capable release ships. Condition 4 applies continuously to each conversation from the first time authenticated PQ migration is offered or attempted for that conversation.
 
 The security architect must record suspension whenever an applicable condition is unverified. The security architect may restore reliance after verifying and recording proof of uninterrupted compliance. Evidence that an applicable condition was violated makes the acceptance LAPSED from the earliest affected time. Correction does not automatically revive a lapsed acceptance and cannot retroactively authorize traffic created during the breach. Reactivation requires a new dated product-owner acceptance and security-architect concurrence.
 
 If reliance is suspended or the acceptance lapses after a pre-PQ launch, no new release, onboarding, or creation of pre-migration message ciphertext may proceed under this exception until reliance is restored or reauthorized. Existing user data must remain accessible, and affected users must receive an accurate corrective disclosure. A pre-PQ launch is not authorized unless this operational hold can be enforced.
 
-Pre-migration Olm operation under this exception is expressly classical and is not a fallback from PQ. Whenever PQ is required — including whenever this exception is not in force and after authenticated PQ migration — failure of the production-gated hybrid-PQ MLS path must fail closed. The client must never silently negotiate down to, continue on, or resume Olm or another classical-only suite. Once authenticated PQ migration is offered or attempted for a conversation, a failed or blocked migration must be prominently surfaced to the user; the client must not silently continue creating Olm or other classical-only ciphertext for that conversation.
+Pre-migration Olm operation under this exception is expressly classical and is not a fallback from PQ. Whenever PQ is required — including whenever this exception is not in force and after authenticated PQ migration — failure of the production-gated hybrid-PQ MLS path must fail closed. The client must never silently negotiate down to, continue on, or resume Olm or another classical-only suite.
 
 ## OpenMLS readiness — the deciding input
 
