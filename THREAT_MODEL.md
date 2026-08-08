@@ -113,7 +113,7 @@ cryptographic one.
 
 **Decided by the product owner on 2026-08-08: INDEFINITE for message plaintext.** An earlier
 revision of this document adopted that value on its own initiative; that was policy the governing
-ruling does not contain and it was correctly withdrawn. The value below is not this document's
+ruling did not then contain and it was correctly withdrawn. The value below is not this document's
 choice — it is a recorded decision by the authorized owner, which is what the ruling asked the threat
 model to state.
 
@@ -156,11 +156,12 @@ harvestable. The posture is defensible **because it is disclosed**, not because 
 
 An accepted risk that users are not told about is not an accepted risk; it is an undisclosed one. The acceptance above is therefore **conditional on all of the following**.
 
-At each release or migration gate, every condition applicable at that gate must be affirmatively verified. An applicable condition that is unverified suspends reliance on the acceptance. Evidence of a violation makes the acceptance LAPSED and invokes the governing ruling's fail-closed consequence. Correction does not automatically revive a lapsed acceptance; reactivation requires a new dated product-owner acceptance and security-architect concurrence.
+At each release or migration gate, the product owner must supply evidence for every condition applicable at that gate, and the security architect must affirmatively verify and record compliance. The security architect must record suspension whenever an applicable condition is unverified and may restore reliance after verifying and recording proof of uninterrupted compliance. Evidence of a violation makes the acceptance LAPSED and invokes the governing ruling's fail-closed consequence. Correction does not automatically revive a lapsed acceptance; reactivation requires a new dated product-owner acceptance and security-architect concurrence.
 
 1. **No product surface — UI, store listing, marketing, or documentation — may state or imply post-quantum protection before the migration.** After migration, no such claim is permitted until every post-quantum claim prerequisite has passed.
 2. Every user-facing encryption description must accurately describe the protection actually provided, but this document does not authorize any public-security claim while `SECURITY_STATUS.md` remains NO-GO. If and when that file authorizes such claims, "end-to-end encrypted" may describe the classical scheme; language stating or implying resistance to future quantum decryption remains forbidden until the post-quantum claim gate passes.
-3. Before migration ships, users must be able to determine that traffic predating it does not carry the new protection. That distinction must remain available thereafter. Silently upgrading and letting users infer that all their history is covered would convert an honest gap into a misleading one.
+3. Before any migration-capable release ships, users must be able to determine that traffic predating authenticated PQ migration does not carry the new protection. That distinction must remain available thereafter. Silently upgrading and letting users infer that all their history is covered would convert an honest gap into a misleading one.
+4. Once authenticated PQ migration is offered or attempted for a conversation, a failed or blocked migration must be prominently surfaced to the user; the client must not silently continue creating Olm or other classical-only ciphertext for that conversation.
 
 The project's stated goal is that the app be secure, trusted, and confidential. **Trust here is
 produced by the accuracy of what is said, not by the strength of what is claimed** — and an
@@ -269,7 +270,7 @@ Additionally required before any public claim, **conjunctively** — every item,
 - A **reviewed, deployed** MLS and Delivery Service path — not a spike — covering **both 1:1 and
   groups**, since the ruling adopts MLS for both.
 - A **separate `ClientStateV2` path.** `ClientStateV1` fields must not be reinterpreted.
-- **No V1→V2 secret-state migration.** There is no production state, so none is to be invented.
+- **No V1→V2 secret-state migration.** There is no production state at the date of the governing ruling. If a pre-PQ launch is separately cleared, the ruling's V1 production-lifecycle and retirement amendment governs; migration of V1/Olm cryptographic or session state into V2 remains prohibited regardless.
 - **Rebootstrap through the verified contact ceremony into FRESH MLS groups** — an authenticated
   in-place conversion of existing Olm sessions does not satisfy this and is prohibited.
 - **No negotiation down to Olm when PQ is required**, and downgrade/fallback rejection tested.
