@@ -110,28 +110,43 @@ pre-shared key, out-of-band secret, or ceremony entropy mixed in.
 The horizon is *how long a given message must remain confidential*. It is a product decision, not a
 cryptographic one.
 
-**It has not been made, and this document does not make it.** The governing ruling requires the
-horizon to be stated; it does not select a value, and this threat model has no authority to pick one.
-An earlier revision adopted an INDEFINITE default here — that was policy the ruling does not contain,
-and it has been withdrawn.
+**Decided by the product owner on 2026-08-08: INDEFINITE for message plaintext.** An earlier
+revision of this document adopted that value on its own initiative; that was policy the governing
+ruling does not contain and it was correctly withdrawn. The value below is not this document's
+choice — it is a recorded decision by the authorized owner, which is what the ruling asked the threat
+model to state.
 
 | Asset | Horizon | Notes |
 |---|---|---|
-| Message plaintext | **UNDECIDED (fail-closed)** | Requires an authorized product/architect decision. Adopting a standing default — indefinite, lifetime, or a fixed term — would require the governing ruling to be amended, not merely this document edited. |
+| Message plaintext | **INDEFINITE** (product owner, 2026-08-08) | Messages must remain confidential without a time limit. |
 | Contact graph and other metadata | Out of scope for this work | See "Metadata" below — PQ key agreement is not a metadata control. |
 | Long-term identity keys | Separate decision | Ed25519 remains classical under the chosen suite; see "Claim language". |
 
 Time-to-CRQC is not predictable from within this project, and this document sets **no threshold** of
 its own — inventing one would be policy the governing ruling does not contain.
 
-**What follows from UNDECIDED, stated as consequence rather than as a new gate:** the ruling's
-hold-shipment rule is conditional on PQ being a shipping requirement. While the horizon is undecided,
-**the project cannot evaluate whether that condition is met**, and therefore cannot determine whether
-the hold applies. That is a factual gap in sequencing step 1, not an additional prerequisite invented
-here — no public claim is available regardless, because the prerequisites below are independently
-unmet.
+### What the indefinite horizon entails
 
-**Sequencing step 1 is therefore INCOMPLETE until the horizon is decided by the authorized owner.**
+Derived from the governing ruling, not added by this document:
+
+1. An indefinite horizon **exceeds any plausible time-to-CRQC by construction.** Classical-only key
+   agreement is therefore insufficient for message plaintext by definition, not by estimate.
+2. Post-quantum protection is consequently a **shipping requirement**, which activates the ruling's
+   rule: *if PQ is a shipping requirement, shipment waits for the production gate rather than
+   silently falling back to a classical suite.*
+3. Because PQ confidentiality applies only to traffic sent after an authenticated migration, any
+   message sent before that migration **cannot ever satisfy the stated horizon.** Shipping
+   pre-migration would knowingly produce traffic that fails the project's own confidentiality
+   objective from the moment it is sent.
+
+**This is a hold on shipment, not merely on the public claim.** The only way to ship earlier without
+contradicting the horizon is for the owner to explicitly narrow it — for example by setting a shorter
+horizon for some content class, or by explicitly accepting the risk for pre-migration traffic. Either
+would be a further recorded decision, not an inference this document may make.
+
+**Amendment required:** `docs/phase3-post-quantum-decision.md` should record this decision and its
+shipment consequence. Until the architect amends it, this section is the only place the decision is
+written down, and the ruling remains the governing document where the two differ.
 
 ### Retention, and what "recorded" means
 
@@ -239,7 +254,8 @@ Additionally required before any public claim, **conjunctively** — every item,
 - **No negotiation down to Olm when PQ is required**, and downgrade/fallback rejection tested.
 - **Persistence and restart proof** for the deployed path.
 - A **specified and verified endpoint-secret erasure lifecycle** (see above).
-- A **confidentiality horizon decided by its authorized owner** (see above).
+- The **INDEFINITE confidentiality horizon** honoured (see above) — which, per that section, is a
+  hold on shipment and not only on the claim.
 - **Global clearance in `SECURITY_STATUS.md`**, which independently blocks *any* public-security
   claim on work broader than post-quantum — including the contact ceremony, formal threat model, and
   external audit.
