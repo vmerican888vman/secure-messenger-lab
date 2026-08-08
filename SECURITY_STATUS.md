@@ -74,6 +74,7 @@ unaudited, and unsuitable for sensitive or production messaging.
 - [ ] Recovery, revocation, and multi-device decision.
 - [ ] Abuse reporting, blocking, rate limits/proof of work, moderation operations, and store compliance.
 - [ ] Reproducible Android build, dependency/SBOM/provenance pipeline, external audit, and incident plan.
+- [ ] Conditional pre-migration PQ exception governance and operational hold: before any pre-PQ launch, verify every disclosure condition applicable at that gate and prove that suspension or lapse blocks new releases, onboarding, and creation of pre-migration message ciphertext while preserving existing user-data access and enabling accurate corrective disclosure. Re-verify applicable conditions at every release or migration gate; after a violation, require a new dated product-owner acceptance and security-architect concurrence before reactivation.
 
 ## Dependency note
 
