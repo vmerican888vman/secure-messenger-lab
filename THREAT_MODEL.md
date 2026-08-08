@@ -73,9 +73,9 @@ executable local harness in this repository.
 
 ## Post-quantum: the harvest-now-decrypt-later adversary
 
-Added 2026-08-07 as sequencing step 1 of `docs/phase3-post-quantum-decision.md`. **Modelling this
-adversary does not mitigate it.** No head in this repository provides any post-quantum protection,
-and none is claimed.
+Added 2026-08-07 as sequencing step 1 of `docs/phase3-post-quantum-decision.md`; revised after
+independent review. **Modelling this adversary does not mitigate it.** No head in this repository
+provides any post-quantum protection, and none is claimed.
 
 ### The adversary
 
@@ -85,8 +85,9 @@ it today, retains it, and decrypts it years later once a cryptographically relev
 
 What makes it different from every other adversary in this document:
 
-- **It needs no compromise, no interaction, and no privilege.** Everything it requires — the
-  ciphertext and the handshake public keys — is already on the wire by design.
+- **It needs no compromise, no interaction, and no privilege.** Its inputs are the ciphertext, the
+  handshake public keys carried in pre-key and ratchet messages, and the peer's long-term identity
+  public key distributed in the contact bundle — all public by design.
 - **It is undetectable.** Recording leaves no trace at either endpoint or at the relay.
 - **It is retroactive.** The decision to defend has to be made before the traffic is sent; there is
   no remediation afterwards.
@@ -100,61 +101,104 @@ compromises that session's messages generally — not merely a window around a s
 Ratcheting bounds the damage from a stolen key; it does not bound the damage from a broken
 primitive.
 
+This was verified against the vendored schedule rather than asserted: the Olm root and chain
+derivation is a deterministic function of X25519 DH outputs plus public constants, with no
+pre-shared key, out-of-band secret, or ceremony entropy mixed in.
+
 ### Confidentiality horizon
 
 The horizon is *how long a given message must remain confidential*. It is a product decision, not a
-cryptographic one, and it must be stated per asset rather than assumed:
+cryptographic one.
+
+**It has not been made.** Until it is, this document adopts a **fail-closed default: the horizon for
+message plaintext is INDEFINITE.** Under that default, classical-only key agreement is insufficient
+by definition, and the ruling's hold-shipment consequence applies.
 
 | Asset | Horizon | Notes |
 |---|---|---|
-| Message plaintext | **Not yet decided** | Must be set explicitly. If the horizon exceeds time-to-CRQC, classical-only key agreement is insufficient by definition. |
-| Contact graph / metadata | Not addressed by post-quantum work at all | See "Metadata budget"; PQ key agreement protects content, never metadata. |
+| Message plaintext | **Indefinite (fail-closed default; not yet decided)** | The default stands until a horizon is explicitly set per content class AND approved. |
+| Contact graph and other metadata | Out of scope for this work | See "Metadata" below — PQ key agreement is not a metadata control. |
 | Long-term identity keys | Separate decision | Ed25519 remains classical under the chosen suite; see "Claim language". |
 
-Time-to-CRQC is unknown and not predictable from within this project. Any horizon longer than "a few
-years" should be treated as exceeding it, because the cost of being wrong is unbounded and
-unrecoverable while the cost of hybridising is bounded and known.
+Time-to-CRQC is not predictable from within this project, and this document sets **no threshold** of
+its own — inventing one would be policy the governing ruling does not contain.
+
+**Horizon approval is a prerequisite for both shipment and any public claim.** A concrete per-content-
+class horizon must be frozen, or the indefinite default explicitly retained, before either gate can
+open.
+
+### Retention, and what "recorded" means
+
+Four distinct retention notions are involved, and conflating them produces false comfort:
+
+| Notion | Bound |
+|---|---|
+| Signed acceptance TTL | Capped at seven days — this is the maximum a sender may request, not a deletion guarantee |
+| Live-row deletion timing | A valid ACK deletes in one transaction; otherwise removal waits for an expiry sweep, and an idle relay with no operation can retain an expired row **indefinitely** until the next sweep |
+| Logical ACK deletion | Removes the row from the current database file; see "Deletion semantics" — this is not forensic erasure |
+| Attacker copies, journals, snapshots, backups, packet captures | **Unbounded.** Nothing in this system constrains them |
+
+The last row is the adversary's actual input. Attacker-retained ciphertext is the **premise** of this
+threat model, not a failure of any key agreement.
 
 ### Compromise timing
 
-- **Recording window:** anything on the wire, plus anything the relay retains. The relay holds
-  ciphertext under a signed expiry capped at seven days, and "Deletion semantics" below already
-  states that deletion is logical rather than forensic. Ciphertext that survives in a journal block,
-  snapshot, backup or packet capture is exactly this adversary's input.
+- **Recording window:** anything on the wire, plus anything retained per the table above.
 - **Decryption event:** at CRQC availability, which may be long after every endpoint, key and
   operator involved is gone.
-- **Migration boundary:** post-quantum confidentiality can only ever apply to traffic sent *after* an
-  authenticated migration. **Everything sent before it stays classically protected forever.** This is
-  the single most important operational consequence: delay converts directly into permanently
-  exposed traffic.
+- **Migration boundary:** post-quantum confidentiality can only apply to traffic sent *after* an
+  authenticated migration. Earlier Olm ciphertext **never acquires PQ protection**; if it was
+  recorded and retained, it becomes decryptable once the modelled CRQC exists. Delay therefore
+  increases the volume of traffic in that category, and the effect is not reversible.
 
-### Erasure assumptions
+### Erasure and endpoint invariants
 
-A post-quantum confidentiality claim depends on assumptions this repository does not yet enforce:
+Three separate things were previously conflated here. They are not the same and do not belong to the
+same actor:
 
-- Endpoints actually erase key material at the points the protocol says they do. Device seizure with
-  retained keys defeats the strongest key agreement.
-- The relay's logical deletion is not forensic erasure (see "Deletion semantics"). Retained
-  ciphertext remains harvestable regardless of the key agreement used.
-- A recipient can always retain plaintext. No key agreement addresses that.
-
-Any claim must therefore be conditioned on correct key handling and erasure, not stated absolutely.
+1. **Attacker-retained ciphertext — the premise, not a defect.** Covered above. No key agreement
+   addresses it; it is why the adversary exists.
+2. **Endpoint-secret erasure — a testable invariant, currently UNSPECIFIED.** A post-quantum
+   confidentiality claim depends on endpoint secrets actually ceasing to exist when the protocol says
+   they do. This document cannot yet name which MLS secrets must disappear, at what point, how
+   delayed delivery extends their required lifetime, or how the existing storage semantics interact —
+   `docs/persistence-spike-design.md` explicitly permits authentic rollback and disclaims
+   backup/forensic erasure, so an authentic old endpoint snapshot could retain compromise-enabling
+   secrets while every other gate passes. **Specifying and enforcing that lifecycle is a gate
+   condition, not an assumption.**
+3. **Recipient and endpoint compromise — an exclusion, not an invariant.** A recipient can always
+   retain plaintext, and a compromised endpoint defeats any key agreement. These are outside the
+   claim, not conditions on it.
 
 ### Planned mitigation, and its exact limits
 
 Per `docs/phase3-post-quantum-decision.md`: hybrid-PQ MLS, provisionally
-`MLS_128_MLKEM768X25519_AES256GCM_SHA384_Ed25519`. Hybrid means an adversary must break **both**
-X25519 and ML-KEM-768; the classical half is retained deliberately so that a future break of the
-lattice assumption does not leave traffic unprotected.
+`MLS_128_MLKEM768X25519_AES256GCM_SHA384_Ed25519`.
 
-This provides post-quantum **confidentiality**. It does **not** provide post-quantum **authenticity**
-while Ed25519 remains the signature scheme — a CRQC could forge signatures, which matters for
-identity binding rather than for recorded-traffic confidentiality. PQ signatures are a separate suite
-and migration decision.
+The intended rationale for retaining the classical half is that key establishment should survive the
+failure of either assumption alone. **That property is conditional and must not be asserted as
+obtained:** it holds for the key-establishment component only, under a finalized robust combiner, a
+conforming implementation, and X25519 still being secure at the time of attack. An adversary with
+both a CRQC and a break of the lattice assumption defeats both halves. The combiner property will not
+be claimed before standardization and review.
+
+This targets post-quantum **confidentiality**. It does **not** provide post-quantum **authenticity**
+while Ed25519 remains the signature scheme. PQ signatures are a separate suite and migration
+decision.
+
+### Metadata
+
+PQ key agreement is not a metadata control. This migration makes **no claim** to reduce
+relay- or network-visible routing, size, timing, or contact-graph metadata. MLS can encrypt some
+protocol metadata, so the blanket statement that key agreement "never" protects metadata is too
+strong — but nothing in this work is designed or evaluated for that purpose.
+
+The "Metadata budget" table below describes the **Olm harness**, not the future MLS/Delivery Service
+design, and does not carry over to it.
 
 ### Claim language
 
-The only defensible public claim, once the production gate in the Phase 3 ruling has passed:
+The only defensible public claim, once every prerequisite below has been met:
 
 > Hybrid-PQ MLS provides post-quantum confidentiality against harvest-now-decrypt-later for messages
 > sent after an authenticated PQ migration, subject to correct key handling and erasure.
@@ -162,16 +206,32 @@ The only defensible public claim, once the production gate in the Phase 3 ruling
 It does **not** cover: earlier Olm ciphertext, metadata of any kind, compromised endpoints,
 present-day identity substitution, or post-quantum authenticity.
 
-**Until that gate passes, the correct statement is that this project has no post-quantum protection.**
-"Quantum-safe", "quantum-proof", or an unqualified "post-quantum secure" are all false here and would
-remain false even after migration, because the third is broader than the property actually obtained.
+**Until then, the correct statement is that this project has no post-quantum protection.**
+"Quantum-safe", "quantum-proof", and an unqualified "post-quantum secure" are all false here, and all
+three remain false after migration — because each asserts more than the property obtained, which is
+confidentiality only, forward-dated only, and conditional on erasure.
 
 ### What must be true before the claim is available
 
-Restating the ruling's gate so it is enforceable from this document: a finalized MLS PQ ciphersuite,
-a matching reviewed OpenMLS release, mobile/device validation, interoperability vectors, downgrade
-and fallback rejection tests, and human cryptographer sign-off. A PQ key agreement authenticated to a
-substituted identity provides nothing, so the contact ceremony must be frozen and verified first.
+**The Phase 3 gate is necessary but NOT sufficient.** Meeting it authorizes nothing on its own.
+
+From the ruling: a finalized MLS PQ ciphersuite, a matching reviewed OpenMLS release, mobile/device
+validation, interoperability vectors, downgrade and fallback rejection tests, and human cryptographer
+sign-off.
+
+Additionally required before any public claim:
+
+- A **reviewed, deployed** MLS and Delivery Service path — not a spike.
+- An **actual authenticated migration** performed, not merely specified.
+- **Persistence and restart proof** for the deployed path.
+- A **specified and verified endpoint-secret erasure lifecycle** (see above).
+- A **frozen or explicitly-retained confidentiality horizon** (see above).
+- **Global clearance in `SECURITY_STATUS.md`**, which independently blocks *any* public-security
+  claim on work broader than post-quantum — including the contact ceremony, formal threat model, and
+  external audit.
+
+A PQ key agreement authenticated to a substituted identity provides nothing, so the contact ceremony
+must be frozen and verified regardless.
 
 ## Metadata budget
 
